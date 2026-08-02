@@ -8,6 +8,14 @@ import {
 } from "../utils/sentryReporter.js";
 
 describe("sentryReporter", () => {
+  it("filters provider authentication failures from Sentry", () => {
+    expect(shouldReportToSentry(Object.assign(new Error("API Error 401"), {
+      code: "HTTP_401",
+      status: 401
+    }))).toBe(false);
+    expect(shouldReportToSentry(new Error("API Error 401: unauthorized"))).toBe(false);
+  });
+
   it("parses sentry dsn into envelope endpoint", () => {
     const parsed = parseSentryDsn("https://public123@example.ingest.sentry.io/456");
 
@@ -174,8 +182,7 @@ describe("sentryReporter", () => {
         model: "deepseek-chat",
         customBaseUrl: "https://api.example.com/v1",
         customProtocol: "claude",
-        prefMode: "efficiency",
-        segmentPromptVariant: "original"
+        prefMode: "efficiency"
       },
       new Error("boom"),
       { task: "summary" },
@@ -187,7 +194,6 @@ describe("sentryReporter", () => {
     expect(options.body).toContain('"provider_host":"api.example.com"');
     expect(options.body).toContain('"provider_api_protocol":"claude"');
     expect(options.body).toContain('"pref_mode":"efficiency"');
-    expect(options.body).toContain('"segment_variant":"original"');
   });
 
   it("keeps provider request location from error metadata", async () => {

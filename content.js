@@ -99,6 +99,10 @@ function dedupeDisplayedLineOnlyContentSegments(segments, cache = {}) {
 
 function getProviderModelOptions(providerKey) {
     const key = String(providerKey || "").toLowerCase();
+    const remoteModels = appState?.providers?.[key]?.models;
+    if (Array.isArray(remoteModels) && remoteModels.length) {
+        return [...new Set(remoteModels.map((model) => String(model || "").trim()).filter(Boolean))];
+    }
     const options = {
         modelscope: [
             "deepseek-ai/DeepSeek-V4-Flash",
@@ -493,6 +497,7 @@ const appState = {
     playInfo: null,
     playInfoUpdatedAt: 0,
     isPlayInfoReady: false,
+    playerApiDisabledLogKey: "",
     panelErrors: {}
 };
 globalThis.BilitatoAppState = appState;
@@ -5301,7 +5306,7 @@ function renderSettings(panel) {
     const currentCloudLabel = allCloudDisabledOn ? "本视频不拉取云端缓存（已由所有视频设置覆盖）" : "本视频不拉取云端缓存";
     const requestedAsrProvider = String(settings.asrProvider || "groq").toLowerCase();
     const asrProviderKey = ["groq", "siliconflow", "mimo"].includes(requestedAsrProvider) ? requestedAsrProvider : "groq";
-    const asrProviders = {
+    const asrProviderDefaults = {
         groq: {
             name: "Groq",
             note: "需科学上网",
@@ -5318,6 +5323,19 @@ function renderSettings(panel) {
             regUrl: "https://platform.xiaomimimo.com/"
         }
     };
+    const remoteAsrProviders = settings.remoteConfig?.asr && typeof settings.remoteConfig.asr === "object"
+        ? settings.remoteConfig.asr
+        : {};
+    const asrProviders = Object.fromEntries(Object.entries(asrProviderDefaults).map(([key, item]) => {
+        const remote = remoteAsrProviders[key] || {};
+        if (remote.enabled === false && key !== asrProviderKey) return null;
+        return [key, {
+            ...item,
+            ...(remote.name ? { name: remote.name } : {}),
+            ...(remote.regUrl ? { regUrl: remote.regUrl } : {}),
+            models: Array.isArray(remote.models) ? remote.models : []
+        }];
+    }).filter(Boolean));
     const asrProvider = asrProviders[asrProviderKey] || asrProviders.groq;
     const asrOptionsHtml = Object.entries(asrProviders).map(([key, item]) => {
         const isSelected = key === asrProviderKey;
@@ -5327,6 +5345,9 @@ function renderSettings(panel) {
     const groqModel = String(settings.groqModel || "whisper-large-v3-turbo");
     const groqBaseUrl = String(settings.groqBaseUrl || DEFAULT_GROQ_ASR_BASE_URL);
     const siliconFlowAsrModel = String(settings.siliconFlowAsrModel || "FunAudioLLM/SenseVoiceSmall");
+    const renderModelDatalist = (id, models) => Array.isArray(models) && models.length
+        ? `<datalist id="${escapeHtmlAttr(id)}">${models.map((model) => `<option value="${escapeHtmlAttr(model)}"></option>`).join("")}</datalist>`
+        : "";
     const customVisible = providerKey === "custom" ? "" : "settings-hidden";
     const groqVisible = asrProviderKey === "groq" ? "" : "settings-hidden";
     const siliconFlowVisible = asrProviderKey === "siliconflow" ? "" : "settings-hidden";
@@ -5409,14 +5430,16 @@ function renderSettings(panel) {
                     <label>Groq API Key</label>
                     ${renderSecretInput("settings-groq-api-key", settings.groqApiKey || "", "示例：gsk_xxxxx")}
                     <label>ASR 模型</label>
-                    <input id="settings-groq-model" type="text" value="${escapeHtml(groqModel)}" placeholder="示例：whisper-large-v3-turbo">
+                    <input id="settings-groq-model" type="text" list="settings-groq-model-options" value="${escapeHtml(groqModel)}" placeholder="示例：whisper-large-v3-turbo">
+                    ${renderModelDatalist("settings-groq-model-options", asrProviders.groq?.models)}
                 </div>
                 <div id="settings-asr-siliconflow-wrap" class="settings-asr-provider-fields ${siliconFlowVisible}">
                     <div class="settings-provider-url">${DEFAULT_SILICONFLOW_ASR_BASE_URL}</div>
                     <label>硅基流动 API Key</label>
                     ${renderSecretInput("settings-siliconflow-api-key", settings.siliconFlowApiKey || "", "示例：sk-xxxxx")}
                     <label>ASR 模型</label>
-                    <input id="settings-siliconflow-asr-model" type="text" value="${escapeHtml(siliconFlowAsrModel)}" placeholder="示例：FunAudioLLM/SenseVoiceSmall">
+                    <input id="settings-siliconflow-asr-model" type="text" list="settings-siliconflow-model-options" value="${escapeHtml(siliconFlowAsrModel)}" placeholder="示例：FunAudioLLM/SenseVoiceSmall">
+                    ${renderModelDatalist("settings-siliconflow-model-options", asrProviders.siliconflow?.models)}
                 </div>
                 <div id="settings-asr-mimo-wrap" class="settings-asr-provider-fields ${mimoVisible}">
                     <div class="settings-provider-url">${DEFAULT_MIMO_ASR_BASE_URL}</div>
@@ -5597,7 +5620,7 @@ function renderSettings(panel) {
                     renderSettings(panel);
 
                     // Trigger save
-                    saveSettingsFromPanel(true);
+                    saveSettingsFromPanel(true, { requestProviderPermission: true });
                 } else {
                     selectContainer.classList.remove("open");
                 }
@@ -5999,13 +6022,12 @@ function renderSubtitleEmptyDemoControls() {
     `;
 }
 
-function renderSegmentPromptDebugControls() {
-    const variant = String(appState.settings?.segmentPromptVariant || "test").toLowerCase() === "original" ? "original" : "test";
+function renderDebugSettingsControls() {
     const debugEnabled = !!appState.settings?.debugMode;
     return `
         <section class="debug-tool-card">
             <div class="debug-tool-card-head">
-                <div><strong>分段 Prompt 实验</strong><span>切换后重新生成分段生效</span></div>
+                <div><strong>调试日志</strong><span>控制开发者工具的诊断日志</span></div>
                 <span class="debug-risk-badge reversible">持久设置</span>
             </div>
             <label class="debug-field-label" for="debug-mode-inline">调试日志</label>
@@ -6013,13 +6035,7 @@ function renderSegmentPromptDebugControls() {
                 <option value="false" ${debugEnabled ? "" : "selected"}>关闭</option>
                 <option value="true" ${debugEnabled ? "selected" : ""}>开启</option>
             </select>
-            <div class="debug-field-help">关闭后开发者工具入口会隐藏并返回设置页。</div>
-            <label class="debug-field-label" for="debug-segment-prompt-variant">视频分段与广告识别 Prompt</label>
-            <select id="debug-segment-prompt-variant">
-                <option value="test" ${variant === "test" ? "selected" : ""}>测试版：简化分段 + 广告识别</option>
-                <option value="original" ${variant === "original" ? "selected" : ""}>原版：当前正式分段 Prompt</option>
-            </select>
-            <div class="debug-field-help">开启调试日志后会记录脱敏后的 Prompt 分块信息。</div>
+            <div class="debug-field-help">关闭后开发者工具入口会隐藏并返回设置页。开启后会记录脱敏后的 Prompt 分块信息。</div>
         </section>
     `;
 }
@@ -6032,6 +6048,7 @@ function renderTaskRetryDebugPanel() {
     const strategyMap = {
         merged: "省流联合请求",
         primary: "原 Prompt 重试",
+        expanded_tokens: "提高输出上限重试",
         compact: "保守 Prompt 重试"
     };
     const statusMap = {
@@ -6064,7 +6081,10 @@ function renderTaskRetryDebugPanel() {
                 <div><strong>分段自动重试</strong><span>真实调用模型并验证恢复策略</span></div>
                 <span class="debug-risk-badge network">真实请求 · 可能计费</span>
             </div>
-            <button type="button" class="panel-btn ghost" data-action="debug-run-segments-retry-test">触发分段自动重试测试</button>
+            <div class="debug-card-actions">
+                <button type="button" class="panel-btn ghost" data-action="debug-run-segments-retry-test">测试字段结构错误</button>
+                <button type="button" class="panel-btn ghost" data-action="debug-run-segments-truncation-retry-test">测试截断后提高至 8192</button>
+            </div>
             <div class="debug-state-grid">
                 <div><strong>任务状态：</strong>${escapeHtml(statusMap[taskStatus] || taskStatus)}</div>
                 <div><strong>运行阶段：</strong>${escapeHtml(statusMap[String(retryState?.status || "")] || String(retryState?.status || "未开始"))}</div>
@@ -6076,6 +6096,51 @@ function renderTaskRetryDebugPanel() {
                 <div><strong>当前文案：</strong>${escapeHtml(String(retryState?.message || "-"))}</div>
                 <div><strong>分段数量：</strong>${Number(retryState?.segmentCount || 0) || (Array.isArray(appState.cache?.segments) ? appState.cache.segments.length : 0)}</div>
                 <div><strong>最后更新：</strong>${escapeHtml(updatedText)}</div>
+            </div>
+            <details class="debug-details">
+                <summary>最近阶段事件</summary>
+                ${eventListHtml}
+            </details>
+        </section>
+    `;
+}
+
+function renderSummaryRetryDebugPanel() {
+    const retryState = appState.tabState?.taskRetryState?.summary || null;
+    const taskStatus = String(appState.tabState?.taskStatus?.summary || "idle");
+    const events = Array.isArray(retryState?.events) ? retryState.events : [];
+    const statusMap = {
+        idle: "空闲",
+        processing: "处理中",
+        done: "完成",
+        error: "失败",
+        timeout: "超时",
+        running: "运行中",
+        retrying: "重试中",
+        retry_failed: "重试失败",
+        recovered: "已恢复"
+    };
+    const eventListHtml = events.length
+        ? `<div class="debug-state-preview" style="margin-top:8px;">${events.map((item) => {
+            const at = Number(item?.at || 0);
+            const time = at ? new Date(at).toLocaleTimeString() : "--:--:--";
+            return `<div style="margin-bottom:6px;"><strong>${escapeHtml(time)}</strong> · ${escapeHtml(String(item?.text || ""))}</div>`;
+        }).join("")}</div>`
+        : `<div class="empty-text" style="margin-top:8px;">当前还没有总结重试事件。</div>`;
+    return `
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head">
+                <div><strong>总结空响应重试</strong><span>首轮完成后强制判空，再真实请求一次</span></div>
+                <span class="debug-risk-badge network">真实请求 · 可能计费</span>
+            </div>
+            <button type="button" class="panel-btn ghost" data-action="debug-run-summary-empty-retry-test">测试总结为空后重试</button>
+            <div class="debug-state-grid">
+                <div><strong>任务状态：</strong>${escapeHtml(statusMap[taskStatus] || taskStatus)}</div>
+                <div><strong>重试状态：</strong>${escapeHtml(statusMap[String(retryState?.status || "")] || String(retryState?.status || "未开始"))}</div>
+                <div><strong>内部阶段：</strong>${escapeHtml(String(retryState?.stage || "-"))}</div>
+                <div><strong>次数：</strong>${retryState ? `第 ${Number(retryState.attempt || 0)}/${Number(retryState.total || 1)} 次` : "-"}</div>
+                <div><strong>触发错误：</strong>${escapeHtml(String(retryState?.code || "-"))}</div>
+                <div><strong>当前文案：</strong>${escapeHtml(String(retryState?.message || "-"))}</div>
             </div>
             <details class="debug-details">
                 <summary>最近阶段事件</summary>
@@ -6237,10 +6302,11 @@ function renderDebugOverviewPanel() {
 function renderDebugScenariosPanel() {
     return `
         ${renderTaskRetryDebugPanel()}
+        ${renderSummaryRetryDebugPanel()}
         ${renderErrorDemoControls()}
         ${renderSubtitleEmptyDemoControls()}
         ${renderLifecycleDemoControls()}
-        ${renderSegmentPromptDebugControls()}
+        ${renderDebugSettingsControls()}
     `;
 }
 
@@ -6315,62 +6381,104 @@ function renderDebugStatePanel() {
 }
 
 function bindSegmentPromptDebugControls(panel) {
-    const retryTestBtn = panel?.querySelector('[data-action="debug-run-segments-retry-test"]');
-    if (retryTestBtn) {
-        retryTestBtn.addEventListener("click", async () => {
+    const liveRetryTests = [
+        {
+            selector: '[data-action="debug-run-segments-retry-test"]',
+            id: "segments_retry",
+            title: "分段字段结构错误重试",
+            tasks: ["segments"],
+            runtimeAction: "RUN_SEGMENTS_RETRY_TEST",
+            expected: "字段结构错误后采用原 Prompt 或保守 Prompt 恢复"
+        },
+        {
+            selector: '[data-action="debug-run-segments-truncation-retry-test"]',
+            id: "segments_truncation_retry",
+            title: "分段截断提高上限重试",
+            tasks: ["segments"],
+            runtimeAction: "RUN_SEGMENTS_TRUNCATION_RETRY_TEST",
+            expected: "截断后使用 8192 输出上限重试一次"
+        },
+        {
+            selector: '[data-action="debug-run-summary-empty-retry-test"]',
+            id: "summary_empty_retry",
+            title: "总结空响应重试",
+            tasks: ["summary"],
+            runtimeAction: "RUN_SUMMARY_EMPTY_RETRY_TEST",
+            expected: "首轮总结判空后自动补发一次总结请求"
+        }
+    ];
+    liveRetryTests.forEach((test) => {
+        const button = panel?.querySelector(test.selector);
+        if (!button) return;
+        button.addEventListener("click", async () => {
             const confirmed = window.confirm("该测试会真实调用当前 AI Provider，可能产生 API 费用。确定继续吗？");
             if (!confirmed) {
                 recordDebugScenarioResult({
-                    id: "segments_retry",
-                    title: "分段自动重试",
+                    id: test.id,
+                    title: test.title,
                     status: "cancelled",
-                    expected: "主请求失败后采用保守 Prompt 恢复",
+                    expected: test.expected,
                     actual: "已取消，未发起请求"
                 });
                 renderContent();
                 return;
             }
-            retryTestBtn.disabled = true;
+            button.disabled = true;
             const startedAt = Date.now();
-            const traceId = `debug_segments_retry_${startedAt.toString(36)}`;
+            const traceId = `debug_${test.id}_${startedAt.toString(36)}`;
             recordDebugScenarioResult({
-                id: "segments_retry",
-                title: "分段自动重试",
+                id: test.id,
+                title: test.title,
                 status: "running",
-                expected: "主请求失败后采用保守 Prompt 恢复",
+                expected: test.expected,
                 actual: "正在运行",
                 traceId
             });
             try {
                 clearPanelError("summary");
-                await runTasks(["segments"], { overrideAction: "RUN_SEGMENTS_RETRY_TEST" });
+                await runTasks(test.tasks, { overrideAction: test.runtimeAction });
+                await syncCacheFromBackground(resolveCurrentBvid(), {
+                    force: true,
+                    skipCloud: true,
+                    preserveCacheOnMiss: true
+                });
+                const finalStatuses = test.tasks.map((task) => ({
+                    task,
+                    status: getCurrentVideoTaskStatus(task)
+                }));
+                const passed = finalStatuses.every((item) => item.status === "done");
+                const failedItem = finalStatuses.find((item) => item.status !== "done");
+                const errorView = failedItem ? getCurrentVideoTaskErrorView(failedItem.task) : null;
+                const actual = passed
+                    ? `最终任务状态：${finalStatuses.map((item) => `${item.task}=done`).join("、")}`
+                    : (errorView?.message || `最终任务状态：${finalStatuses.map((item) => `${item.task}=${item.status}`).join("、")}`);
                 recordDebugScenarioResult({
-                    id: "segments_retry",
-                    title: "分段自动重试",
-                    status: "passed",
-                    expected: "主请求失败后采用保守 Prompt 恢复",
-                    actual: "测试请求已完成，请结合状态和日志确认恢复路径",
+                    id: test.id,
+                    title: test.title,
+                    status: passed ? "passed" : "failed",
+                    expected: test.expected,
+                    actual,
                     durationMs: Date.now() - startedAt,
                     traceId
                 });
-                showToast("已触发分段自动重试测试");
+                showToast(passed ? `${test.title}通过` : `${test.title}失败`);
             } catch (error) {
                 recordDebugScenarioResult({
-                    id: "segments_retry",
-                    title: "分段自动重试",
+                    id: test.id,
+                    title: test.title,
                     status: "failed",
-                    expected: "主请求失败后采用保守 Prompt 恢复",
+                    expected: test.expected,
                     actual: error?.message || "测试失败",
                     durationMs: Date.now() - startedAt,
                     traceId
                 });
                 showToast(error.message || "触发测试失败");
             } finally {
-                retryTestBtn.disabled = false;
+                button.disabled = false;
                 renderContent();
             }
         });
-    }
+    });
     const debugSelect = panel?.querySelector("#debug-mode-inline");
     if (debugSelect) {
         debugSelect.addEventListener("change", async () => {
@@ -6400,25 +6508,6 @@ function bindSegmentPromptDebugControls(panel) {
             }
         });
     }
-    const select = panel?.querySelector("#debug-segment-prompt-variant");
-    if (!select) return;
-    select.addEventListener("change", async () => {
-        const segmentPromptVariant = String(select.value || "test") === "original" ? "original" : "test";
-        const nextSettings = { ...(appState.settings || {}), segmentPromptVariant };
-        try {
-            const res = await chrome.runtime.sendMessage({ action: "SAVE_SETTINGS", settings: nextSettings });
-            if (!res?.ok) throw new Error(res?.error || "保存失败");
-            appState.settings = res.settings || nextSettings;
-            logUI.info("debug_segment_prompt_variant_changed", {
-                task: "debug",
-                detail: { segment_prompt_variant: segmentPromptVariant }
-            });
-            showToast(segmentPromptVariant === "original" ? "已切换为原版分段 Prompt" : "已切换为测试版分段 Prompt");
-        } catch (error) {
-            showToast(error.message || "切换失败");
-            select.value = String(appState.settings?.segmentPromptVariant || "test") === "original" ? "original" : "test";
-        }
-    });
 }
 
 function renderRealtimeLogPanel() {
@@ -6498,7 +6587,7 @@ async function runTasks(tasks, options = {}) {
             const synced = await syncCacheFromBackgroundWithRetry(currentBvid, 3, 120, { skipCloud: false });
             if (synced && canRunTasksWithCache(tasks, currentBvid, appState.cache)) {
                 setLocalPendingTasks(tasks, false);
-                return runTasks(tasks);
+                return runTasks(tasks, options);
             }
         }
         setLocalPendingTasks(tasks, false);
@@ -7839,6 +7928,19 @@ async function saveSettingsFromPanel(isAutoSave = false, options = {}) {
                     statusEl.className = "show syncing pulse";
                 }
             }
+        } else {
+            const providerBaseUrl = String(appState.providers?.[providerValue]?.baseUrl || "").trim();
+            if (providerBaseUrl) {
+                const permissionRes = await chrome.runtime.sendMessage({
+                    action: "ENSURE_OPTIONAL_ORIGIN_PERMISSION",
+                    baseUrl: providerBaseUrl,
+                    request: !!opts.requestProviderPermission
+                });
+                if (!permissionRes?.granted) {
+                    const grantedAfterPrompt = await requestCustomOriginPermissionFromSettings(providerBaseUrl, statusEl);
+                    if (!grantedAfterPrompt) throw new Error("请先授权访问该 Provider 域名");
+                }
+            }
         }
         if (payload.groqBaseUrl !== DEFAULT_GROQ_ASR_BASE_URL) {
             const permissionRes = await chrome.runtime.sendMessage({
@@ -8863,11 +8965,16 @@ function isStorageChangeStateDirty(changes, switched, routeMismatch, afterBvid) 
 }
 
 function logPlayerApiCaptureDisabled(bvid) {
+    if (!isDebugLoggingEnabled()) return;
+    const routeP = String(new URL(location.href).searchParams.get("p") || "");
+    const logKey = `${normalizeBvidCase(bvid || "").toLowerCase()}|${routeP}`;
+    if (appState.playerApiDisabledLogKey === logKey) return;
+    appState.playerApiDisabledLogKey = logKey;
     logSubtitleDiagnostic("source_disabled", {
         source: "player_api",
         reason: "disabled_for_inject_only_diagnosis",
         bvid,
-        routeP: String(new URL(location.href).searchParams.get("p") || "")
+        routeP
     });
 }
 
@@ -9544,7 +9651,12 @@ function isCacheForCurrentRouteVideo(cache, targetBvid = "") {
     const routeCid = getCurrentRouteCid();
     const cacheCid = Number(cache?.cid || 0);
     if (routeBvid && cacheBvid && routeBvid !== cacheBvid) return false;
-    if (!(routeCid > 0) || !(cacheCid > 0) || routeCid !== cacheCid) return false;
+    if (!(cacheCid > 0)) return false;
+    if (!(routeCid > 0)) {
+        const isConfirmedSinglePartVideo = !routeTid && getCurrentRoutePartCount() === 1;
+        return isConfirmedSinglePartVideo;
+    }
+    if (routeCid !== cacheCid) return false;
     if (!routeTid) return true;
 
     const cacheTid = String(cache?.tid || "").trim();
@@ -10615,7 +10727,7 @@ function onSidePanelMessage(message, sender, sendResponse) {
             const kind = String(message?.kind || "");
             const groupIndex = Number(message?.groupIndex || 0);
             const streamIndex = Number(message?.streamIndex || 0);
-            const info = await refreshPlayInfoNow(7000).catch(() => null);
+            const info = await refreshPlayInfoNow(7000, { force: true }).catch(() => null);
             const stream = kind === "video"
                 ? info?.video?.[groupIndex]?.streams?.[streamIndex]
                 : info?.audio?.[streamIndex];
@@ -10673,6 +10785,10 @@ function onSidePanelMessage(message, sender, sendResponse) {
 
 function onBackgroundMessage(message) {
     const action = String(message?.action || "");
+    if (action === "REMOTE_CONFIG_UPDATED") {
+        refreshRemoteConfigView().catch(() => {});
+        return false;
+    }
     if (action === "SHOW_TOAST") {
         const text = String(message?.text || message?.message || "").trim();
         if (text) showToast(text);
@@ -11056,6 +11172,15 @@ function renderExportMainMenu(menuContainer) {
     });
 }
 
+async function refreshRemoteConfigView() {
+    const response = await chrome.runtime.sendMessage({ action: "GET_SETTINGS" });
+    if (!response?.ok) return;
+    appState.settings = response.settings || appState.settings;
+    appState.providers = response.providers || appState.providers;
+    renderApp();
+    if (appState.activePage === "settings") showToast("远程模型与功能配置已更新");
+}
+
 function renderVideoDownloadModeMenu(menuContainer) {
     if (!menuContainer) return;
     menuContainer.dataset.streamLoading = "";
@@ -11088,7 +11213,7 @@ function renderVideoDownloadModeMenu(menuContainer) {
     menuContainer.querySelector('[data-download-mode="quality"]')?.addEventListener("click", async (event) => {
         event.stopPropagation();
         renderExportLoadingState(menuContainer, "video");
-        const info = await refreshPlayInfoNow(7000).catch(() => null);
+        const info = await refreshPlayInfoNow(7000, { force: true }).catch(() => null);
         const pageBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
         if (!hasUsablePlayInfoForBvid(info, pageBvid)) {
             showToast("暂未拿到可用高清视频流，请稍后重试");
@@ -11120,21 +11245,44 @@ async function probeUrlInPage(url) {
     }
 }
 
+async function requestStreamDownload(url, filename) {
+    const response = await chrome.runtime.sendMessage({
+        action: "DOWNLOAD_STREAM",
+        payload: { url, filename }
+    });
+    if (!response?.ok) throw new Error(response?.error || "创建下载任务失败");
+    return response;
+}
+
 function getStreamCandidateUrls(stream) {
     const urls = Array.isArray(stream?.urls) ? stream.urls : [];
     return [...urls, stream?.url]
         .map((item) => String(item || "").trim())
         .filter(Boolean)
-        .filter((item, index, list) => list.indexOf(item) === index);
+        .filter((item, index, list) => list.indexOf(item) === index)
+        .map((url, index) => ({ url, index, priority: getDirectDownloadHostPriority(url) }))
+        .sort((left, right) => left.priority - right.priority || left.index - right.index)
+        .map((item) => item.url);
+}
+
+function getDirectDownloadHostPriority(url) {
+    try {
+        const host = new URL(url).hostname.toLowerCase();
+        if (host.endsWith("akamaized.net") || host.includes("mirrorakam")) return 0;
+        if (host.includes("mirrorcosov")) return 2;
+    } catch (_) {}
+    return 1;
 }
 
 async function pickVerifiedDownloadUrl(stream) {
     const candidates = getStreamCandidateUrls(stream);
+    let unknownCandidate = "";
     for (const url of candidates) {
         const status = await probeUrlInPage(url);
         if (status === "ok") return url;
+        if (status === "unknown" && !unknownCandidate) unknownCandidate = url;
     }
-    return "";
+    return unknownCandidate;
 }
 
 function buildCompatIdentityPayload(type, qn) {
@@ -11249,10 +11397,7 @@ async function renderCompatQualityList(menuContainer, type) {
                         file_ext: "mp4"
                     }
                 });
-                await chrome.runtime.sendMessage({
-                    action: "DOWNLOAD_STREAM",
-                    payload: { url: urlToDownload, filename }
-                });
+                await requestStreamDownload(urlToDownload, filename);
                 showToast("下载已触发，请查看浏览器下载");
             } catch (error) {
                 logDownload.error("download_url_prepare_failed", {
@@ -11287,10 +11432,7 @@ async function renderCompatQualityList(menuContainer, type) {
                 const urlToDownload = await pickVerifiedDownloadUrl(stream) || stream.url;
                 const safeTitle = sanitizeDownloadFileName(cleanBilibiliTitle(document.title));
                 const filename = `${safeTitle}_${stream.desc || "音频"}.m4a`;
-                await chrome.runtime.sendMessage({
-                    action: "DOWNLOAD_STREAM",
-                    payload: { url: urlToDownload, filename }
-                });
+                await requestStreamDownload(urlToDownload, filename);
                 showToast("下载已触发，请查看浏览器下载");
             } catch (error) {
                 notifyMappedError(error, "下载失败: " + (error.message || ""));
@@ -11430,7 +11572,7 @@ function renderQualityList(menuContainer, type) {
         e.stopPropagation();
         menuContainer.dataset.expiredRefreshAttempted = "";
         renderExportLoadingState(menuContainer, type);
-        const info = await refreshPlayInfoNow(7000).catch(() => null);
+        const info = await refreshPlayInfoNow(7000, { force: true }).catch(() => null);
         const pageBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
         if (!hasUsablePlayInfoForBvid(info, pageBvid)) {
             showToast("暂未拿到可用视频流，请稍后重试");
@@ -11512,7 +11654,7 @@ function renderQualityList(menuContainer, type) {
         if (menuContainer.dataset.expiredRefreshAttempted === "1") return false;
         menuContainer.dataset.expiredRefreshAttempted = "1";
         try {
-            const info = await refreshPlayInfoNow(7000).catch(() => null);
+            const info = await refreshPlayInfoNow(7000, { force: true }).catch(() => null);
             const pageBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
             if (!hasUsablePlayInfoForBvid(info, pageBvid)) {
                 updateUnavailableNotice();
@@ -11710,7 +11852,7 @@ function renderQualityList(menuContainer, type) {
                     codec: stream.codecName || ""
                 }
             });
-            await refreshPlayInfoNow();
+            await refreshPlayInfoNow(7000, { force: true });
             // Re-find the matching stream from fresh data
             const freshGroups = appState.playInfo?.video || [];
             // Find group by quality
@@ -11740,14 +11882,12 @@ function renderQualityList(menuContainer, type) {
                     quality: freshGroup.desc || group.desc || "",
                     codec: freshStream.codecName || "",
                     has_url: !!urlToDownload,
+                    url_host: (() => { try { return new URL(urlToDownload).hostname; } catch (_) { return ""; } })(),
                     file_ext: "mp4"
                 }
             });
             
-            await chrome.runtime.sendMessage({
-                action: "DOWNLOAD_STREAM",
-                payload: { url: urlToDownload, filename }
-            });
+            await requestStreamDownload(urlToDownload, filename);
             showToast("下载已触发，请查看浏览器下载");
         } catch (err) {
             logDownload.error("download_url_prepare_failed", {
@@ -11828,7 +11968,7 @@ function renderQualityList(menuContainer, type) {
                             codec: stream.codecName || ""
                         }
                     });
-                    await refreshPlayInfoNow();
+                    await refreshPlayInfoNow(7000, { force: true });
                     const freshAudio = appState.playInfo?.audio || [];
                     const freshStream = freshAudio.find(a => a.id === stream.id) || freshAudio[index];
                     
@@ -11856,10 +11996,7 @@ function renderQualityList(menuContainer, type) {
                     
                     const urlToDownload = await pickVerifiedDownloadUrl(freshStream);
                     if (!urlToDownload) throw new Error("音频下载链接不可用，请刷新后重试");
-                    await chrome.runtime.sendMessage({
-                        action: "DOWNLOAD_STREAM",
-                        payload: { url: urlToDownload, filename }
-                    });
+                    await requestStreamDownload(urlToDownload, filename);
                     showToast("下载已触发，请查看浏览器下载");
                 } catch (err) {
                     logDownload.error("download_url_prepare_failed", {
@@ -11882,8 +12019,9 @@ function renderQualityList(menuContainer, type) {
     }
 }
 
-async function refreshPlayInfoNow(timeoutMs = 7000) {
+async function refreshPlayInfoNow(timeoutMs = 7000, options = {}) {
     const waitTimeoutMs = Math.max(6000, Number(timeoutMs) || 0);
+    const forceRefresh = options?.force === true;
     const pageBvid = window.location.href.match(/BV[a-zA-Z0-9]{10}/)?.[0] || "";
     const hasUsableStream =
         appState.playInfo &&
@@ -11893,7 +12031,7 @@ async function refreshPlayInfoNow(timeoutMs = 7000) {
             (Array.isArray(appState.playInfo.video) && appState.playInfo.video.length > 0)
         );
 
-    if (!hasUsableStream) {
+    if (forceRefresh || !hasUsableStream) {
         appState.playInfo = null;
         appState.isPlayInfoReady = false;
         logDownload.info("download_capture_start", {
@@ -11904,13 +12042,17 @@ async function refreshPlayInfoNow(timeoutMs = 7000) {
                 timeout_ms: waitTimeoutMs
             }
         });
-        window.postMessage({ type: "PLAYER_WAKE_UP" }, "*");
+        if (!forceRefresh) window.postMessage({ type: "PLAYER_WAKE_UP" }, "*");
         window.postMessage({ type: "REFRESH_PLAYINFO" }, "*");
 
         const startWait = Date.now();
         while (Date.now() - startWait < waitTimeoutMs) {
             const info = await requestFromInject(400);
-            if (hasUsablePlayInfoForBvid(info, pageBvid)) {
+            const isRequestedRefresh = !forceRefresh || (
+                String(info?._source || "") === "fresh_playurl"
+                && Number(info?._ts || 0) >= startWait
+            );
+            if (isRequestedRefresh && hasUsablePlayInfoForBvid(info, pageBvid)) {
                 appState.playInfo = normalizeIncomingPlayInfo(info);
                 appState.playInfoUpdatedAt = Date.now();
                 appState.isPlayInfoReady = true;

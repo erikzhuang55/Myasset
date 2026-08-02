@@ -11,6 +11,7 @@
     let capturedBvid = "";
     let capturedRouteKey = "";
     let latestPlayinfo = null; // 存储 XHR 拦截到的最新 dash 数据
+    let playinfoRefreshActive = false;
     let latestAudioProbe = null;
     let routeMonitorTimer = null;
     let silentDeadlineTs = Date.now() + 2000;
@@ -40,7 +41,7 @@
         if (event.data?.type === "GET_PLAY_INFO") {
             window.postMessage({
                 type: "SEND_PLAY_INFO",
-                data: latestPlayinfo
+                data: playinfoRefreshActive ? null : resolvePlayInfo()
             }, "*");
             return;
         }
@@ -72,7 +73,11 @@
             switchSubtitleLanguageByLabel(label, requestId);
             return;
         }
-        if (event.data && (event.data.type === "RE_EMIT_PLAYINFO" || event.data.type === "REFRESH_PLAYINFO" || event.data.type === "PLAYER_WAKE_UP")) {
+        if (event.data?.type === "REFRESH_PLAYINFO") {
+            refreshDashPlayInfo();
+            return;
+        }
+        if (event.data && (event.data.type === "RE_EMIT_PLAYINFO" || event.data.type === "PLAYER_WAKE_UP")) {
             emitPlayInfo();
         }
     });
@@ -735,6 +740,68 @@
         }
     }
 
+    async function refreshDashPlayInfo() {
+        if (playinfoRefreshActive) return;
+        playinfoRefreshActive = true;
+        latestPlayinfo = null;
+        const meta = resolveCurrentVideoMeta();
+        if (!meta.bvid || !(meta.cid > 0)) {
+            emitLog("playinfo_refresh_failed", { reason: "missing_bvid_or_cid", bvid: meta.bvid, cid: meta.cid });
+            playinfoRefreshActive = false;
+            return;
+        }
+        try {
+            const callbackName = `__bilitatoDashPlayurl_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+            const params = new URLSearchParams({
+                bvid: meta.bvid,
+                cid: String(meta.cid),
+                qn: "127",
+                fnver: "0",
+                fnval: "4048",
+                fourk: "1",
+                otype: "json",
+                callback: callbackName,
+                jsonp: "jsonp"
+            });
+            const json = await new Promise((resolve, reject) => {
+                const script = document.createElement("script");
+                const timeoutId = setTimeout(() => finish(new Error("playurl timeout")), 8000);
+                const finish = (error, value) => {
+                    clearTimeout(timeoutId);
+                    script.remove();
+                    try { delete window[callbackName]; } catch (_) { window[callbackName] = undefined; }
+                    if (error) reject(error);
+                    else resolve(value);
+                };
+                window[callbackName] = (value) => finish(null, value);
+                script.onerror = () => finish(new Error("playurl script failed"));
+                script.src = `https://api.bilibili.com/x/player/playurl?${params.toString()}`;
+                (document.head || document.documentElement).appendChild(script);
+            });
+            if (Number(json?.code || 0) !== 0) throw new Error(String(json?.message || "playurl failed"));
+            const playData = json?.data || json?.result || null;
+            if (!playData?.dash) throw new Error("dash missing");
+            latestPlayinfo = {
+                ...playData,
+                _bvid: meta.bvid,
+                _cid: meta.cid,
+                _ts: Date.now(),
+                _source: "fresh_playurl"
+            };
+            emitLog("playinfo_updated", { source: "fresh_playurl", bvid: meta.bvid, cid: meta.cid });
+            playinfoRefreshActive = false;
+            emitPlayInfo();
+        } catch (error) {
+            emitLog("playinfo_refresh_failed", {
+                reason: error?.message || "playurl request failed",
+                bvid: meta.bvid,
+                cid: meta.cid
+            });
+            playinfoRefreshActive = false;
+            window.postMessage({ type: "BILI_PLAYINFO_REFRESH_FAILED" }, "*");
+        }
+    }
+
     function resolvePlayInfo() {
         try {
             const data = latestPlayinfo || window.__playinfo__?.data || null;
@@ -862,7 +929,8 @@
                 _bvid: String(data._bvid || getBvidFromUrl(location.href) || "").trim(),
                 _cid: Number(data._cid || currentMeta.cid || 0),
                 _partCount: Number(currentMeta.partCount || 0),
-                _ts: Number(data._ts || 0)
+                _ts: Number(data._ts || 0),
+                _source: String(data._source || "")
             };
         } catch (e) {
             emitLog("playinfo_error", {

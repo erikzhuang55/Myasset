@@ -24,13 +24,13 @@ npm run build:firefox
 The resulting extension archive is:
 
 ```text
-dist/bilitato-firefox-v1.5.1.zip
+dist/bilitato-firefox-v1.6.0.zip
 ```
 
 The unpacked extension is written to:
 
 ```text
-dist/bilitato-firefox-v1.5.1/
+dist/bilitato-firefox-v1.6.0/
 ```
 
 Reviewers can compare that unpacked directory with the contents of the submitted add-on

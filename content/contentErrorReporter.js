@@ -31,7 +31,8 @@
         "CONFIG_REQUIRED",
         "VALIDATION_ERROR",
         "MISSING_API_KEY",
-        "MISSING_SUBTITLE"
+        "MISSING_SUBTITLE",
+        "HTTP_401"
     ]);
 
     function normalizeError(errorInput) {
@@ -65,9 +66,36 @@
     function shouldReportContentError(errorInput, context = {}) {
         const normalized = normalizeError(errorInput);
         const code = String(errorInput?.code || context?.code || "").trim().toUpperCase();
+        if (code === "HTTP_401" || normalized.status === 401 || /\b(?:HTTP|API Error)\s*401\b/i.test(normalized.message)) return false;
         if (IGNORED_ERROR_CODES.has(code)) return false;
         if (isClearlyThirdPartyExtensionError(normalized.stack, context)) return false;
+        if (isUnattributedBlobWorkerError(normalized, context)) return false;
         return !IGNORED_ERROR_PATTERNS.some((pattern) => pattern.test(normalized.message));
+    }
+
+    function isUnattributedBlobWorkerError(error, context = {}) {
+        const source = String(context?.source || "");
+        if (!["content_window_error", "content_unhandled_rejection"].includes(source)) return false;
+        if (!/importScripts.*WorkerGlobalScope|WorkerGlobalScope.*importScripts/i.test(String(error?.message || ""))) return false;
+        if (!/blob:/i.test(String(error?.message || ""))) return false;
+        return !hasBilitatoFunctionalStack(error?.stack);
+    }
+
+    function hasBilitatoFunctionalStack(stackInput) {
+        const runtime = globalThis.chrome?.runtime;
+        if (typeof runtime?.getURL !== "function") return false;
+        let ownOrigin = "";
+        try {
+            ownOrigin = String(runtime.getURL("")).replace(/\/$/, "").toLowerCase();
+        } catch (_) {
+            return false;
+        }
+        if (!ownOrigin) return false;
+        return String(stackInput || "").split("\n").some((line) => {
+            const normalizedLine = line.toLowerCase();
+            return normalizedLine.includes(ownOrigin)
+                && !/\/content\/contenterrorreporter\.js\b|\/utils\/sentryreporter\.js\b/i.test(normalizedLine);
+        });
     }
 
     function isClearlyThirdPartyExtensionError(stackInput, context = {}) {

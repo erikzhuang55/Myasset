@@ -1,12 +1,13 @@
 {
   "name": "bilitato",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build:release": "node scripts/build-release.js",
-    "build:firefox": "node scripts/build-release.js --target=firefox",
+    "build:release": "npm run build:vendor:realtime && node scripts/build-release.js",
+    "build:firefox": "npm run build:vendor:realtime && node scripts/build-release.js --target=firefox",
     "build:firefox:source": "node scripts/build-firefox-source.js",
+    "build:vendor:realtime": "esbuild scripts/remoteConfigRealtimeSource.js --bundle --format=esm --platform=browser --target=chrome116,firefox115 --outfile=vendor/remoteConfigRealtime.js",
     "commitlint": "commitlint --from HEAD~1 --to HEAD --verbose",
     "prepare": "husky",
     "test": "vitest run",
@@ -15,6 +16,8 @@
   "devDependencies": {
     "@commitlint/cli": "^21.0.1",
     "@commitlint/config-conventional": "^21.0.1",
+    "@supabase/realtime-js": "2.111.0",
+    "esbuild": "0.28.1",
     "fflate": "^0.8.2",
     "husky": "^9.1.7",
     "vitest": "^3.2.4"

@@ -62,6 +62,7 @@ const directories = [
   "assets",
   "content",
   "utils",
+  "vendor",
   "node_modules/@ffmpeg/ffmpeg/dist/esm",
   "node_modules/@ffmpeg/core/dist/esm"
 ];

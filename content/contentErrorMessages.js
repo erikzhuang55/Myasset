@@ -220,6 +220,15 @@
             action: "retry",
             presentation: "panel"
         },
+        PROVIDER_INVALID_RESPONSE: {
+            title: "Provider 地址返回的不是 API 数据",
+            message: "服务端返回了网页或非 JSON 内容。请检查自定义 Provider 的 Base URL 是否填写为兼容接口地址。",
+            actionText: "去设置",
+            action: "goto-setup-guide",
+            secondaryActionText: "重试",
+            secondaryAction: "retry",
+            presentation: "panel"
+        },
         FEEDBACK_SERVICE_UNAVAILABLE: {
             title: "反馈服务暂时不可用",
             message: "反馈中心当前无法连接到服务端，不影响总结、分段和转录功能。请稍后刷新再试。",
@@ -419,6 +428,7 @@
         if (/timeout|超时/i.test(message)) return "TIMEOUT";
         if (/feedback.*(?:failed to fetch|network|timeout|unavailable)|反馈服务暂时不可用|feedback_(?:select|mark_seen)_unavailable/i.test(message)) return "FEEDBACK_SERVICE_UNAVAILABLE";
         if (/模型服务连接失败|provider network error/i.test(message)) return "PROVIDER_NETWORK_ERROR";
+        if (/PROVIDER_INVALID_RESPONSE|模型服务返回了网页内容|内容不是有效 JSON|Provider 地址返回的不是 API 数据/i.test(message)) return "PROVIDER_INVALID_RESPONSE";
         if (/(?:provider|模型服务|上游|inference|chat_stream|summary|segments).*(?:failed to fetch|network error|网络请求失败)|(?:failed to fetch|network error).*(?:provider|模型服务|上游|inference|chat_stream|summary|segments)/i.test(message)) return "PROVIDER_NETWORK_ERROR";
         if (/network|failed to fetch|网络/i.test(message)) return "NETWORK_ERROR";
         if (/模型没有返回总结内容|总结生成为空|summary_empty|SUMMARY_EMPTY/i.test(message)) return "SUMMARY_EMPTY_RESPONSE";

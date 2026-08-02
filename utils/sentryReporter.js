@@ -48,12 +48,15 @@ const IGNORED_ERROR_CODES = new Set([
   "CONFIG_REQUIRED",
   "VALIDATION_ERROR",
   "MISSING_API_KEY",
-  "MISSING_SUBTITLE"
+  "MISSING_SUBTITLE",
+  "HTTP_401"
 ]);
 
 export function shouldReportToSentry(errorInput, context = {}) {
   const message = getErrorMessage(errorInput);
   const code = String(errorInput?.code || context?.code || "").trim().toUpperCase();
+  const status = Number(errorInput?.status || context?.status || 0);
+  if (code === "HTTP_401" || status === 401 || /\b(?:HTTP|API Error)\s*401\b/i.test(message)) return false;
   if (IGNORED_ERROR_CODES.has(code)) return false;
   return !IGNORED_ERROR_PATTERNS.some((pattern) => pattern.test(message));
 }
@@ -183,7 +186,6 @@ export async function reportToSentry(settings, errorInput, context = {}, runtime
     provider: context?.provider || settings?.provider || "",
     model: context?.model || settings?.model || "",
     pref_mode: context?.pref_mode || settings?.prefMode || "",
-    segment_variant: context?.segment_variant || context?.segment_prompt_variant || settings?.segmentPromptVariant || "",
     custom_protocol: context?.custom_protocol || settings?.customProtocol || "",
     ...providerTarget
   };

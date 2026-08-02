@@ -46,6 +46,20 @@ describe("contentErrorMessages", () => {
     });
   });
 
+  it("maps invalid custom provider responses to Base URL guidance", () => {
+    const view = messages.mapErrorToView({
+      code: "PROVIDER_INVALID_RESPONSE",
+      message: "模型服务返回了网页内容"
+    });
+
+    expect(view).toMatchObject({
+      title: "Provider 地址返回的不是 API 数据",
+      action: "goto-setup-guide",
+      secondaryAction: "retry",
+      presentation: "panel"
+    });
+  });
+
   it("maps generic 429 and 5xx to panel retry guidance", () => {
     expect(messages.mapErrorToView({ code: "HTTP_429", message: "API Error 429" })).toMatchObject({
       title: "请求太频繁",

@@ -82,6 +82,12 @@ export const PROVIDERS = {
 };
 
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [700, 1600];
+const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
+function resolveMaxOutputTokens(config = {}) {
+    const value = Math.floor(Number(config?.maxOutputTokens || 0));
+    return Number.isFinite(value) && value > 0 ? value : DEFAULT_MAX_OUTPUT_TOKENS;
+}
 
 function isDebugEnabled() {
     return !!globalThis.AIPluginLogger?.isDebugEnabled?.();
@@ -211,6 +217,51 @@ function extractOpenAIMessageText(data) {
 }
 
 const MAX_PROVIDER_RESPONSE_DEBUG_CHARS = 100000;
+const MAX_INVALID_RESPONSE_PREVIEW_CHARS = 300;
+
+function getResponseContentType(response) {
+    return String(response?.headers?.get?.("content-type") || "").toLowerCase();
+}
+
+function looksLikeHtmlResponse(value) {
+    return /^\s*(?:<!doctype\s+html\b|<html\b)/i.test(String(value || ""));
+}
+
+function createInvalidProviderResponseError(req, response, rawResponse = "", requestStream = false) {
+    const contentType = getResponseContentType(response);
+    const isHtml = contentType.includes("text/html") || looksLikeHtmlResponse(rawResponse);
+    const message = isHtml
+        ? "模型服务返回了网页内容，请检查自定义 Provider 的 Base URL 是否填写为 API 地址。"
+        : "模型服务返回的内容不是有效 JSON，请检查自定义 Provider 的接口兼容性。";
+    return createAppError("PROVIDER_INVALID_RESPONSE", message, {
+        provider: req?.isCustom ? "custom" : "",
+        model: req?.model || "",
+        status: Number(response?.status || 0) || undefined,
+        responseContentType: contentType,
+        responseKind: isHtml ? "html" : "invalid_json",
+        responsePreview: String(rawResponse || "").slice(0, MAX_INVALID_RESPONSE_PREVIEW_CHARS),
+        requestEndpoint: req?.finalUrl || "",
+        requestHost: safeUrlHost(req?.finalUrl),
+        requestProtocol: req?.protocol || "",
+        isCustomProvider: !!req?.isCustom,
+        requestStream: !!requestStream,
+        requestMethod: "POST",
+        requestEntry: requestStream ? "callAIStream" : "callAI",
+        requestPhase: "parse_response"
+    });
+}
+
+async function parseProviderJsonResponse(response, req, requestStream = false) {
+    const rawResponse = await response.text();
+    if (getResponseContentType(response).includes("text/html") || looksLikeHtmlResponse(rawResponse)) {
+        throw createInvalidProviderResponseError(req, response, rawResponse, requestStream);
+    }
+    try {
+        return JSON.parse(rawResponse);
+    } catch (_) {
+        throw createInvalidProviderResponseError(req, response, rawResponse, requestStream);
+    }
+}
 
 function serializeProviderResponseForDebug(data) {
     try {
@@ -293,7 +344,15 @@ function getSseDataPayloads(part) {
 }
 
 function resolveProviderRequest(providerKey, config, messages, streaming) {
-    const provider = PROVIDERS[providerKey] || PROVIDERS[config.provider] || PROVIDERS.modelscope || PROVIDERS.default;
+    const providerCatalog = config?.providerCatalog && typeof config.providerCatalog === "object"
+        ? config.providerCatalog
+        : {};
+    const provider = providerCatalog[providerKey]
+        || providerCatalog[config.provider]
+        || PROVIDERS[providerKey]
+        || PROVIDERS[config.provider]
+        || PROVIDERS.modelscope
+        || PROVIDERS.default;
     const isCustom = (providerKey || config.provider) === "custom";
     const protocol = String(config.customProtocol || "openai").toLowerCase() === "claude" ? "claude" : "openai";
     const baseUrl = isCustom
@@ -346,10 +405,12 @@ function resolveProviderRequest(providerKey, config, messages, streaming) {
         headers[provider.headerKey] = (provider.tokenPrefix || "") + apiKey;
     }
 
+    const maxOutputTokens = resolveMaxOutputTokens(config);
     let body = {};
     if (provider.type === "google") {
         body = {
-            contents: [{ parts: [{ text: messages[messages.length-1].content }] }]
+            contents: [{ parts: [{ text: messages[messages.length-1].content }] }],
+            generationConfig: { maxOutputTokens }
         };
         const urlObj = new URL(finalUrl);
         urlObj.searchParams.set('key', apiKey);
@@ -366,7 +427,7 @@ function resolveProviderRequest(providerKey, config, messages, streaming) {
     } else if (provider.type === "claude" || (isCustom && protocol === "claude")) {
         body = {
             model,
-            max_tokens: 4096,
+            max_tokens: maxOutputTokens,
             messages: (messages || []).map((item) => ({
                 role: item.role === "assistant" ? "assistant" : "user",
                 content: String(item.content || "")
@@ -391,7 +452,7 @@ function resolveProviderRequest(providerKey, config, messages, streaming) {
             model: model,
             messages: normalizedMessages,
             temperature: 0.3,
-            max_tokens: 4096,
+            max_tokens: maxOutputTokens,
             stream: !!streaming
         };
         if (isOpenRouter) {
@@ -473,6 +534,9 @@ export async function callAI(providerKey, config, messages, signal) {
     }
     if (!res.ok) {
         const errText = await res.text();
+        if (req.isCustom && (getResponseContentType(res).includes("text/html") || looksLikeHtmlResponse(errText))) {
+            throw createInvalidProviderResponseError(req, res, errText, false);
+        }
         throw createHttpError(res.status, `API Error ${res.status}: ${errText}`, {
             provider: providerKey,
             model: req.model || "",
@@ -486,7 +550,7 @@ export async function callAI(providerKey, config, messages, signal) {
             requestPhase: "initial_fetch"
         });
     }
-    const data = await res.json();
+    const data = await parseProviderJsonResponse(res, req, false);
     if (req.provider.type === "google") {
         const text = extractGeminiText(data);
         return {
@@ -554,6 +618,9 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
     }
     if (!res.ok) {
         const errText = await res.text();
+        if (req.isCustom && (getResponseContentType(res).includes("text/html") || looksLikeHtmlResponse(errText))) {
+            throw createInvalidProviderResponseError(req, res, errText, true);
+        }
         throw createHttpError(res.status, `API Error ${res.status}: ${errText}`, {
             provider: providerKey,
             model: req.model || "",
@@ -567,9 +634,13 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
             requestPhase: "initial_fetch"
         });
     }
+    if (getResponseContentType(res).includes("text/html")) {
+        const rawResponse = typeof res.text === "function" ? await res.text().catch(() => "") : "";
+        throw createInvalidProviderResponseError(req, res, rawResponse, true);
+    }
     const reader = res.body?.getReader?.();
     if (!reader) {
-        const data = await res.json();
+        const data = await parseProviderJsonResponse(res, req, true);
         let text = extractOpenAIMessageText(data);
         if (req.provider.type === "google") text = extractGeminiText(data);
         if (isClaudeRequest(req)) {
@@ -704,6 +775,9 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
             const { done, value } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
+            if (!fullText && looksLikeHtmlResponse(buffer)) {
+                throw createInvalidProviderResponseError(req, res, buffer, true);
+            }
             const { events, rest } = splitSseEvents(buffer);
             buffer = rest;
             for (const part of events) {

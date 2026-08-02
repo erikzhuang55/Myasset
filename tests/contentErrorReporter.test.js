@@ -51,7 +51,7 @@ describe("contentErrorReporter", () => {
     }));
   });
 
-  it("keeps error code metadata when forwarding", async () => {
+  it("filters provider authentication failures before forwarding", async () => {
     const sendMessage = vi.fn().mockResolvedValue({ ok: true });
     globalThis.chrome = {
       runtime: { sendMessage }
@@ -60,14 +60,10 @@ describe("contentErrorReporter", () => {
     error.code = "HTTP_401";
     error.status = 401;
 
-    await reporter.reportContentError(error, { task: "summary" });
+    const result = await reporter.reportContentError(error, { task: "summary" });
 
-    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
-      error: expect.objectContaining({
-        code: "HTTP_401",
-        status: 401
-      })
-    }));
+    expect(result).toMatchObject({ ignored: true });
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it("does not forward user configuration errors", async () => {
@@ -154,6 +150,32 @@ describe("contentErrorReporter", () => {
     };
     const error = new Error("Page script failed");
     error.stack = "handler@https://www.bilibili.com/video/BV1:1:1";
+
+    expect(reporter.shouldReportContentError(error, {
+      task: "global_error",
+      source: "content_window_error"
+    })).toBe(true);
+  });
+
+  it("ignores unattributed global Worker Blob import errors", () => {
+    globalThis.chrome = {
+      runtime: { getURL: () => "chrome-extension://bilitato-id/" }
+    };
+    const error = new Error("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at 'blob:https://www.bilibili.com/worker' failed to load.");
+    error.stack = "normalizeError@chrome-extension://bilitato-id/content/contentErrorReporter.js:40:20";
+
+    expect(reporter.shouldReportContentError(error, {
+      task: "global_error",
+      source: "content_window_error"
+    })).toBe(false);
+  });
+
+  it("keeps Worker Blob errors with a Bilitato functional stack", () => {
+    globalThis.chrome = {
+      runtime: { getURL: () => "chrome-extension://bilitato-id/" }
+    };
+    const error = new Error("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at 'blob:https://www.bilibili.com/worker' failed to load.");
+    error.stack = "startTranscriptionFromCapsule@chrome-extension://bilitato-id/content.js:6112:34";
 
     expect(reporter.shouldReportContentError(error, {
       task: "global_error",

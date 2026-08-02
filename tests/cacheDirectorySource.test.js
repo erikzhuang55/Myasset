@@ -20,11 +20,12 @@ describe("CID-scoped AI cache with legacy subtitle flow", () => {
     expect(contentSource).toContain('console.log("[CACHE_DIRECTORY]"');
   });
 
-  it("never treats the BVID top level as a subtitle result before CID is confirmed", () => {
+  it("only allows a missing route CID for a confirmed single-part video", () => {
     expect(backgroundSource).toContain("if (!(cid > 0)) return null");
     expect(backgroundSource).toContain('reason: "route_cid_pending"');
     expect(contentSource).toContain("return getCurrentRouteCid();");
-    expect(contentSource).toMatch(/if \(!\(routeCid > 0\) \|\| !\(cacheCid > 0\) \|\| routeCid !== cacheCid\) return false/);
+    expect(contentSource).toContain("const isConfirmedSinglePartVideo = !routeTid && getCurrentRoutePartCount() === 1");
+    expect(contentSource).toContain("if (routeCid !== cacheCid) return false");
   });
 
   it("keeps subtitle variants in the legacy top-level cache", () => {

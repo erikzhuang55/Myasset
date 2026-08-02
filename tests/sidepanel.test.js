@@ -30,6 +30,17 @@ describe("native side panel", () => {
     expect(buildScript).toContain('"sidepanel.html"');
     expect(buildScript).toContain('"sidepanel.css"');
     expect(buildScript).toContain('"sidepanel.js"');
+    expect(buildScript).toContain('"vendor"');
+  });
+
+  it("loads remote model configuration without interval polling", () => {
+    expect(background).toContain('SUPABASE_REMOTE_CONFIG_TABLE = "extension_remote_config"');
+    expect(background).toContain("createRemoteConfigRealtimeSubscription");
+    expect(background).toContain("segments_ai_json_repair");
+    expect(background).toContain('refreshRemoteConfig(settings, "service_worker_start")');
+    expect(background).toContain('status === "SUBSCRIBED"');
+    expect(content).toContain('action === "REMOTE_CONFIG_UPDATED"');
+    expect(content).toContain("appState?.providers?.[key]?.models");
   });
 
   it("connects opening, state reads, and page actions", () => {
@@ -57,7 +68,7 @@ describe("native side panel", () => {
   });
 
   it("checks database driven update availability without frequent polling", () => {
-    expect(manifest.version).toBe("1.5.1");
+    expect(manifest.version).toBe("1.6.0");
     expect(background).toContain('msg.action === "CHECK_LATEST_VERSION"');
     expect(background).toContain('msg.action === "OPEN_EXTENSION_MANAGEMENT"');
     expect(background).toContain("VERSION_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000");
@@ -78,20 +89,24 @@ describe("native side panel", () => {
     expect(sidepanel).not.toContain("有可用版本更新 v${latest}");
   });
 
-  it("ships the 1.5 release notice pages", () => {
-    expect(releaseNotice).toContain('"1.5.1"');
-    expect(releaseNotice).toContain("Bilitato 已更新至 v1.5.1");
+  it("ships the 1.6 release notice pages", () => {
+    expect(releaseNotice).toContain('"1.6.0"');
+    expect(releaseNotice).toContain("Bilitato 已更新至 v1.6");
+    expect(releaseNotice).toContain("AI 返回异常时自动恢复");
+    expect(releaseNotice).toContain("修复高清下载链接失效或变成网页");
+    expect(releaseNotice).toContain("高清下载模式");
+    expect(releaseNotice).toMatch(/title: "高清下载模式",[\s\S]*?highlight: true/);
+    expect(releaseNotice).toMatch(/title: "新增 MiMo 语音识别",[^}]*desc:[^}]*\},/);
+    expect(releaseNotice).not.toMatch(/title: "新增 MiMo 语音识别",[^}]*highlight: true/);
+    expect(releaseNotice).toContain('majorHistory.push("1.6.0", "1.5.x"');
+    expect(releaseNotice).toContain('"1.5.x"');
+    expect(releaseNotice).toContain("Bilitato v1.5 系列更新回顾");
     expect(releaseNotice).toContain("插件显示模式");
     expect(releaseNotice).toContain("修复分 P 视频内容串线");
-    expect(releaseNotice).toContain('majorHistory.push("1.5.1", "1.5.0"');
-    expect(releaseNotice).toContain('"1.5.0"');
-    expect(releaseNotice).toContain("Bilitato 已更新至 v1.5");
-    expect(releaseNotice).toContain("修复同一视频不同分 P 字幕串线");
-    expect(releaseNotice).toContain("修复字幕语言回切失败");
-    expect(releaseNotice).toContain("新增浏览器侧边栏模式");
+    expect(releaseNotice).toContain("浏览器侧边栏模式");
     expect(releaseNotice).toContain('"1.4.x"');
     expect(releaseNotice).toContain("Bilitato v1.4 系列更新回顾");
-    expect(releaseNotice).toContain('majorHistory.push("1.5.0", "1.4.x"');
+    expect(releaseNotice).toContain('majorHistory.push("1.5.x", "1.4.x"');
   });
 
   it("applies theme settings to release notice and setup guide overlays", () => {
@@ -312,6 +327,7 @@ describe("native side panel", () => {
     expect(content).toMatch(/function logSubtitleDiagnostic\(event, detail = \{\}\) \{\s*if \(!isDebugLoggingEnabled\(\)\) return;/);
     expect(content).toContain('window.postMessage({ type: "BILI_SET_DEBUG_MODE", enabled: isDebugLoggingEnabled() }, "*")');
     expect(content).toContain('logSubtitleDiagnostic("source_disabled"');
+    expect(content).toMatch(/function logPlayerApiCaptureDisabled\(bvid\) \{[\s\S]*?if \(appState\.playerApiDisabledLogKey === logKey\) return;[\s\S]*?appState\.playerApiDisabledLogKey = logKey;/);
     expect(inject).toContain("let subtitleDebugEnabled = false");
     expect(inject).toContain('event.data?.type === "BILI_SET_DEBUG_MODE"');
     expect(inject).toMatch(/function logSubtitleDiagnostic\(event, detail = \{\}\) \{\s*if \(!subtitleDebugEnabled\) return;/);

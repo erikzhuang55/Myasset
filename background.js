@@ -2,6 +2,18 @@ import SubtitleProcessor from "./utils/subtitleProcessor.js";
 import { robustJSONParse } from "./utils/jsonParse.js";
 import { callAI, callAIStream, PROVIDERS } from "./utils/providerAdapter.js";
 import {
+    DEFAULT_REMOTE_CONFIG,
+    buildEffectiveProviderCatalog,
+    isRemoteFeatureEnabled,
+    normalizeRemoteConfigRow
+} from "./utils/remoteConfig.js";
+import { createRemoteConfigRealtimeSubscription } from "./vendor/remoteConfigRealtime.js";
+import {
+    MAX_SEGMENTS_REPAIR_INPUT_CHARS,
+    buildSegmentsAIRepairPrompt,
+    shouldAttemptSegmentsAIRepair
+} from "./utils/segmentsRepair.js";
+import {
     buildGroqQuotaLine,
     buildGroqTranscriptionPrompt,
     parseGroqQuotaHeaders,
@@ -23,9 +35,7 @@ import {
 } from "./utils/mimoAsr.js";
 import {
     DEFAULT_PROMPT_SETTINGS,
-    SEGMENTS_AD_TEST_PROMPT,
     buildCompactSegmentsPrompt,
-    buildSegmentsAdTestPrompt,
     buildMergedSummarySegmentsPrompt,
     buildPrompt,
     extractFirstProtocolSection,
@@ -61,6 +71,7 @@ const MAX_ASR_BOUNDARY_DIAGNOSTICS = 8;
 const USAGE_EVENT_SESSION_ID = createUsageEventSessionId();
 const VERSION_CHECK_STORAGE_KEY = "latestVersionState";
 const VERSION_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const SEGMENTS_REPAIR_SOURCE = Symbol("segmentsRepairSource");
 
 function syncRuntimeDebugFlag(enabled) {
     IS_DEBUG_MODE = !!enabled;
@@ -73,6 +84,23 @@ async function captureBackgroundError(errorInput, context = {}) {
             return { sent: false, reason: "technical_data_permission_denied" };
         }
         const settings = await getResolvedSettings();
+        const errorCode = String(errorInput?.code || context?.code || "").trim().toUpperCase();
+        const errorStatus = Number(errorInput?.status || context?.status || 0);
+        const errorMessage = String(errorInput?.message || errorInput || "");
+        if (errorCode === "HTTP_401" || errorStatus === 401 || /\b(?:HTTP|API Error)\s*401\b/i.test(errorMessage)) {
+            await reportClientUsageEvent({
+                eventName: "provider_auth_failed",
+                featureName: String(context?.task || "provider"),
+                status: "failed",
+                errorCode: "HTTP_401",
+                provider: String(context?.provider || errorInput?.provider || settings?.provider || ""),
+                model: String(context?.model || errorInput?.model || settings?.model || ""),
+                bvid: String(context?.bvid || ""),
+                tabId: Number(context?.tabId || 0) || undefined,
+                metadata: { source: String(context?.source || "provider_request") }
+            }, settings);
+            return { sent: false, reason: "provider_auth_failed_metric" };
+        }
         const runtime = await getSentryRuntimeContext();
         return await reportToSentry(settings, errorInput, context, runtime);
     } catch (_) {
@@ -82,6 +110,14 @@ async function captureBackgroundError(errorInput, context = {}) {
 
 function attachSentryContext(errorInput, context = {}) {
     if (!errorInput || typeof errorInput !== "object") return errorInput;
+    const repairSource = context?.[SEGMENTS_REPAIR_SOURCE];
+    if (repairSource) {
+        Object.defineProperty(errorInput, SEGMENTS_REPAIR_SOURCE, {
+            value: repairSource,
+            configurable: true,
+            writable: true
+        });
+    }
     errorInput.sentryContext = {
         ...(errorInput.sentryContext && typeof errorInput.sentryContext === "object" ? errorInput.sentryContext : {}),
         ...(context && typeof context === "object" ? context : {})
@@ -131,7 +167,7 @@ function buildAIResponseSentryContext({
         const providerResponseSnapshot = !trimmedValue
             ? truncateSentryResponseText(String(responseMeta?.rawResponse || ""), 5000, 3000)
             : { text: "", truncated: false };
-        return {
+        const result = {
             task: "segments",
             bvid: String(bvid || ""),
             provider: String(provider || ""),
@@ -158,6 +194,10 @@ function buildAIResponseSentryContext({
             }],
             ...contextExtra
         };
+        if (responseValue && responseValue.length <= MAX_SEGMENTS_REPAIR_INPUT_CHARS) {
+            Object.defineProperty(result, SEGMENTS_REPAIR_SOURCE, { value: responseValue });
+        }
+        return result;
     }
     return {
         task: String(task || ""),
@@ -189,6 +229,7 @@ function truncateSentryResponseText(value, headChars, tailChars) {
 
 function resolveSegmentsAttemptStrategy(source, mode) {
     const value = String(source || "");
+    if (value.includes("ai_json_repair")) return "ai_json_repair";
     if (value.includes("compact_retry")) return "compact_retry";
     if (value.includes("primary_retry")) return "primary_retry";
     if (value.includes("merged_fallback")) return "fallback";
@@ -207,7 +248,7 @@ function mergeSegmentsResponseAttempts(nextError, previousError) {
         : [];
     if (!previousAttempts.length) return nextError;
     let attempts = [...previousAttempts, ...nextAttempts];
-    if (attempts.length > 3) attempts = [attempts[0], ...attempts.slice(-2)];
+    if (attempts.length > 4) attempts = [attempts[0], ...attempts.slice(-3)];
     attempts = attempts.map((attempt, index) => ({ ...attempt, attempt: index + 1 }));
     return attachSentryContext(nextError, { ai_response_attempts: attempts });
 }
@@ -239,7 +280,6 @@ function buildProviderRequestTelemetry(settings, timeoutMs, options = {}) {
         provider: String(settings?.provider || ""),
         model: String(settings?.model || ""),
         pref_mode: String(settings?.prefMode || ""),
-        segment_variant: String(settings?.segmentPromptVariant || ""),
         custom_protocol: String(settings?.customProtocol || ""),
         is_custom_provider: String(settings?.provider || "").toLowerCase() === "custom",
         timeout_ms: Number(timeoutMs || 0) || undefined,
@@ -423,7 +463,7 @@ async function getUsageUserHash() {
 function buildUsageEventMetadata(payload = {}) {
     return {
         ...(payload.metadata && typeof payload.metadata === "object" ? payload.metadata : {}),
-        event_schema_version: 1,
+        event_schema_version: 2,
         task_id: String(payload.taskId || "").trim() || undefined,
         tab_id: payload.tabId || undefined
     };
@@ -499,6 +539,100 @@ async function hasTechnicalDataConsent() {
     } catch (_) {
         return false;
     }
+}
+
+function getUsageRecoveryState(taskContext = {}, component = "task") {
+    if (!taskContext || typeof taskContext !== "object") return null;
+    if (!taskContext.usageRecoveryState || typeof taskContext.usageRecoveryState !== "object") {
+        taskContext.usageRecoveryState = {};
+    }
+    const key = String(component || "task").trim() || "task";
+    if (!taskContext.usageRecoveryState[key] || typeof taskContext.usageRecoveryState[key] !== "object") {
+        taskContext.usageRecoveryState[key] = {
+            initialFailed: false,
+            attempts: 0,
+            succeeded: false,
+            strategies: []
+        };
+    }
+    return taskContext.usageRecoveryState[key];
+}
+
+function buildTaskRecoveryMetadata(taskContext = {}) {
+    const states = taskContext?.usageRecoveryState && typeof taskContext.usageRecoveryState === "object"
+        ? Object.values(taskContext.usageRecoveryState)
+        : [];
+    const attempts = states.reduce((total, state) => total + Math.max(0, Number(state?.attempts || 0)), 0);
+    const strategies = [...new Set(states.flatMap((state) => Array.isArray(state?.strategies) ? state.strategies : []).filter(Boolean))];
+    return {
+        recovered: states.some((state) => state?.succeeded === true),
+        recovery_attempts: attempts,
+        recovery_strategies: strategies.join(",")
+    };
+}
+
+async function reportTaskInitialFailure({ settings, taskContext, component, bvid, error, durationMs = 0 } = {}) {
+    const state = getUsageRecoveryState(taskContext, component);
+    if (!state || state.initialFailed) return false;
+    state.initialFailed = true;
+    await reportClientUsageEvent({
+        eventName: "task_attempt_failed",
+        featureName: taskContext?.usageFeatureName || component || "task",
+        taskId: taskContext?.usageTaskId || "",
+        status: "failed",
+        errorCode: resolveUsageErrorCode(error),
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        bvid,
+        durationMs: Math.max(0, Number(durationMs || 0)),
+        tabId: taskContext?.tabId,
+        metadata: {
+            component: String(component || "task"),
+            attempt_no: 1,
+            is_initial: true
+        }
+    }, settings);
+    return true;
+}
+
+async function reportTaskRecoveryFinished({
+    settings,
+    taskContext,
+    component,
+    bvid,
+    strategy,
+    triggerError,
+    resultError = null,
+    success = false,
+    durationMs = 0,
+    metrics = {}
+} = {}) {
+    const state = getUsageRecoveryState(taskContext, component);
+    if (!state) return false;
+    state.attempts += 1;
+    state.succeeded = state.succeeded || success;
+    const normalizedStrategy = String(strategy || "unknown").trim() || "unknown";
+    if (!state.strategies.includes(normalizedStrategy)) state.strategies.push(normalizedStrategy);
+    await reportClientUsageEvent({
+        eventName: "task_recovery_finished",
+        featureName: taskContext?.usageFeatureName || component || "task",
+        taskId: taskContext?.usageTaskId || "",
+        status: success ? "success" : "failed",
+        errorCode: success ? "" : resolveUsageErrorCode(resultError || triggerError),
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        bvid,
+        durationMs: Math.max(0, Number(durationMs || 0)),
+        tokenCount: Math.max(0, Number(metrics?.tokens || 0)),
+        tabId: taskContext?.tabId,
+        metadata: {
+            component: String(component || "task"),
+            attempt_no: state.attempts + 1,
+            strategy: normalizedStrategy,
+            trigger_error_code: resolveUsageErrorCode(triggerError)
+        }
+    }, settings);
+    return true;
 }
 
 function isMeaningfulFeedbackText(value) {
@@ -654,6 +788,7 @@ const MAX_GLOBAL_CONCURRENCY = 1;
 const TASK_TIMEOUT_MS = 60000;
 const ASR_TASK_TIMEOUT_MS = 120000;
 const EFFICIENCY_TASK_TIMEOUT_MS = 120000;
+const EXPANDED_SEGMENTS_MAX_OUTPUT_TOKENS = 8192;
 const MAX_SUBTITLE_CHARS = 36000;
 const MAX_SEGMENTS_SUBTITLE_CHARS = 120000;
 const SILICONFLOW_AUDIO_TRANSCRIBE_URL = "https://api.siliconflow.cn/v1/audio/transcriptions";
@@ -662,11 +797,15 @@ const SILICONFLOW_MAX_AUDIO_BYTES = 50 * 1024 * 1024;
 const MIMO_MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 const GROQ_CONNECTIVITY_TIMEOUT_MS = 6000;
 const DOWNLOAD_HEADER_RULE_ID = 910001;
+const pendingDownloadFilenames = new Map();
 const BILI_PLAYURL_API = "https://api.bilibili.com/x/player/playurl";
 const SUPABASE_DEFAULT_VIDEO_CACHE_TABLE = "video_cache";
 const SUPABASE_DEFAULT_FEEDBACK_TABLE = "feedback";
 const SUPABASE_DEFAULT_USAGE_DAILY_RPC = "increment_feature_usage_daily";
 const SUPABASE_DEFAULT_VERSION_TABLE = "extension_versions";
+const SUPABASE_REMOTE_CONFIG_TABLE = "extension_remote_config";
+const REMOTE_CONFIG_STORAGE_KEY = "remoteConfigState";
+const REMOTE_CONFIG_KEY = "production";
 const DEFAULT_SENTRY_DSN = "https://440bce86f646672341586eb09c859631@o4511769099501568.ingest.de.sentry.io/4511769123029072";
 const LEGACY_SENTRY_DSNS = new Set([
     "https://04879b2bd5fc72eba741a402e26c4790@o4511384082055168.ingest.de.sentry.io/4511384299634768"
@@ -706,7 +845,6 @@ const DEFAULT_SETTINGS = {
     prefMode: "quality",
     pluginDisplayMode: "collapsed",
     pluginDisplayFeatureSeen: true,
-    segmentPromptVariant: "test",
     debugMode: false,
     sentryEnabled: true,
     sentryDsn: DEFAULT_SENTRY_DSN,
@@ -736,6 +874,11 @@ const cacheMemory = new Map();
 const VIDEO_CACHE_SCHEMA_VERSION = 3;
 const recentAsrAudioFingerprints = new Map();
 let currentDebugMode = false;
+let remoteConfigMemory = { ...DEFAULT_REMOTE_CONFIG };
+let remoteConfigLoaded = false;
+let remoteConfigLoadPromise = null;
+let remoteConfigRefreshPromise = null;
+let remoteConfigRealtimeSubscription = null;
 const fallbackLoggerFactory = {
     create() {
         return {
@@ -847,10 +990,6 @@ const logSubtitle = loggerFactory.create("subtitle", {
     }
 });
 
-function isSegmentPromptTestEnabled(settings = {}) {
-    return String(settings?.segmentPromptVariant || DEFAULT_SETTINGS.segmentPromptVariant || "test").toLowerCase() !== "original";
-}
-
 function createMissingSubtitleError(message = "无字幕可供分析") {
     return createAppError("MISSING_SUBTITLE", message);
 }
@@ -895,6 +1034,107 @@ function abortTabOperations(tabId, reason = "aborted") {
 }
 
 syncDebugModeFromStorage();
+initializeRemoteConfigSync().catch((error) => {
+    logBackground.warn("remote_config_init_failed", { error: error?.message || String(error) });
+});
+
+async function ensureRemoteConfigLoaded() {
+    if (remoteConfigLoaded) return remoteConfigMemory;
+    if (!remoteConfigLoadPromise) {
+        remoteConfigLoadPromise = chrome.storage.local.get([REMOTE_CONFIG_STORAGE_KEY])
+            .then((stored) => {
+                if (stored?.[REMOTE_CONFIG_STORAGE_KEY]) {
+                    remoteConfigMemory = normalizeRemoteConfigRow(stored[REMOTE_CONFIG_STORAGE_KEY]);
+                }
+                remoteConfigLoaded = true;
+                return remoteConfigMemory;
+            })
+            .catch(() => {
+                remoteConfigLoaded = true;
+                return remoteConfigMemory;
+            });
+    }
+    return remoteConfigLoadPromise;
+}
+
+async function notifyRemoteConfigUpdated(config) {
+    const tabs = await chrome.tabs.query({}).catch(() => []);
+    await Promise.all((tabs || []).map((tab) => {
+        if (!tab?.id) return Promise.resolve();
+        return chrome.tabs.sendMessage(tab.id, {
+            action: "REMOTE_CONFIG_UPDATED",
+            revision: Number(config?.revision || 0)
+        }).catch(() => {});
+    }));
+}
+
+async function applyRemoteConfigRow(row, source = "rest") {
+    const next = normalizeRemoteConfigRow(row);
+    if (next.configKey !== REMOTE_CONFIG_KEY) return remoteConfigMemory;
+    if (next.revision < Number(remoteConfigMemory?.revision || 0)) return remoteConfigMemory;
+    const changed = JSON.stringify(next) !== JSON.stringify(remoteConfigMemory);
+    remoteConfigMemory = next;
+    remoteConfigLoaded = true;
+    if (!changed) return remoteConfigMemory;
+    await chrome.storage.local.set({ [REMOTE_CONFIG_STORAGE_KEY]: next });
+    logBackground.info("remote_config_applied", {
+        source,
+        revision: next.revision,
+        provider_count: Object.keys(next.providers || {}).length
+    });
+    await notifyRemoteConfigUpdated(next);
+    return remoteConfigMemory;
+}
+
+async function refreshRemoteConfig(settingsInput = null, source = "rest") {
+    if (remoteConfigRefreshPromise) return remoteConfigRefreshPromise;
+    remoteConfigRefreshPromise = (async () => {
+        await ensureRemoteConfigLoaded();
+        const settings = settingsInput || normalizeSettings((await chrome.storage.local.get(["settings"])).settings);
+        if (!isSupabaseEnabled(settings)) return remoteConfigMemory;
+        const rows = await supabaseSelect(settings, SUPABASE_REMOTE_CONFIG_TABLE, {
+            select: "config_key,revision,enabled,payload,updated_at",
+            config_key: `eq.${REMOTE_CONFIG_KEY}`,
+            enabled: "eq.true",
+            limit: "1"
+        }, {
+            requestName: "supabase_select:extension_remote_config",
+            errorMessage: "远程配置暂不可用"
+        });
+        if (rows[0]) await applyRemoteConfigRow(rows[0], source);
+        return remoteConfigMemory;
+    })().catch((error) => {
+        logBackground.warn("remote_config_refresh_failed", { source, error: error?.message || String(error) });
+        return remoteConfigMemory;
+    }).finally(() => {
+        remoteConfigRefreshPromise = null;
+    });
+    return remoteConfigRefreshPromise;
+}
+
+async function initializeRemoteConfigSync() {
+    await ensureRemoteConfigLoaded();
+    const { settings: storedSettings } = await chrome.storage.local.get(["settings"]);
+    const settings = normalizeSettings(storedSettings);
+    await refreshRemoteConfig(settings, "service_worker_start");
+    if (!isSupabaseEnabled(settings) || remoteConfigRealtimeSubscription) return;
+    remoteConfigRealtimeSubscription = createRemoteConfigRealtimeSubscription({
+        supabaseUrl: settings.supabaseUrl,
+        anonKey: settings.supabaseAnonKey,
+        table: SUPABASE_REMOTE_CONFIG_TABLE,
+        configKey: REMOTE_CONFIG_KEY,
+        onChange: (row) => {
+            applyRemoteConfigRow(row, "realtime").catch(() => {});
+        },
+        onStatus: (status, error) => {
+            logBackground.debug("remote_config_realtime_status", {
+                status: String(status || ""),
+                error: error?.message || ""
+            });
+            if (status === "SUBSCRIBED") refreshRemoteConfig(settings, "realtime_subscribed").catch(() => {});
+        }
+    });
+}
 
 let latestModelScopeRateLimitInfo = null;
 
@@ -1100,6 +1340,16 @@ chrome.downloads.onChanged.addListener((delta) => {
     }
 });
 
+chrome.downloads.onDeterminingFilename?.addListener((item, suggest) => {
+    const matchedUrl = [item?.url, item?.finalUrl]
+        .map((value) => String(value || "").trim())
+        .find((value) => pendingDownloadFilenames.has(value));
+    if (!matchedUrl) return;
+    const filename = pendingDownloadFilenames.get(matchedUrl);
+    pendingDownloadFilenames.delete(matchedUrl);
+    suggest({ filename, conflictAction: "uniquify" });
+});
+
 async function handleMessage(msg, sender) {
     if (msg.action === "OPEN_SIDE_PANEL") {
         const tabId = Number(msg.tabId || sender?.tab?.id || 0);
@@ -1154,20 +1404,45 @@ async function handleMessage(msg, sender) {
             const status = tabId
                 ? await probeUrlStatusForTab(tabId, url)
                 : await probeUrlStatus(url);
-            if (status !== "ok") {
+            if (status === "expired") {
                 const error = createAppError(
                     "DOWNLOAD_URL_UNVERIFIED",
-                    status === "expired" ? "下载链接已失效，请刷新后重试" : "下载链接无法确认有效，请刷新后重试"
+                    "下载链接已失效，请刷新后重试"
                 );
                 error.status = status;
                 throw error;
             }
             await ensureDownloadHeaderRule(url);
-            const downloadId = await chrome.downloads.download({
-                url: url,
-                filename: filename || "download.mp4",
-                saveAs: true
-            });
+            const responseMeta = await probeDownloadContentType(url);
+            if (responseMeta && (
+                responseMeta.isHtml
+                || responseMeta.status === 401
+                || responseMeta.status === 403
+                || responseMeta.status >= 400
+            )) {
+                const error = createAppError(
+                    "DOWNLOAD_URL_EXPIRED",
+                    responseMeta.isHtml
+                        ? "下载地址返回了网页而不是媒体文件，请刷新后重试"
+                        : `下载地址请求失败：HTTP ${responseMeta.status}`
+                );
+                error.status = responseMeta.status;
+                throw error;
+            }
+            const requestedFilename = filename || "download.mp4";
+            pendingDownloadFilenames.set(url, requestedFilename);
+            let downloadId;
+            try {
+                downloadId = await chrome.downloads.download({
+                    url,
+                    filename: requestedFilename,
+                    conflictAction: "uniquify",
+                    saveAs: true
+                });
+            } catch (error) {
+                pendingDownloadFilenames.delete(url);
+                throw error;
+            }
             if (!downloadId && chrome.runtime.lastError) {
                 throw new Error(chrome.runtime.lastError.message);
             }
@@ -1391,7 +1666,7 @@ async function handleMessage(msg, sender) {
             selected: !!cache,
             ...(cache ? buildPartScopeCacheMeta(cache) : {})
         }, `bootstrap:${tabId}:${tabState?.activeBvid || ""}:${tabState?.activeCid || 0}`);
-        return { tabId, tabState, cache, settings, providers: PROVIDERS, feedback, cloudCachePrefs };
+        return { tabId, tabState, cache, settings, providers: settings.providerCatalog || PROVIDERS, feedback, cloudCachePrefs };
     }
     if (msg.action === "GET_CACHE") {
         const expected = normalizeBvid(msg.bvid);
@@ -1470,6 +1745,34 @@ async function handleMessage(msg, sender) {
         }, requestedBvid);
         return {};
     }
+    if (msg.action === "RUN_SEGMENTS_TRUNCATION_RETRY_TEST") {
+        if (!tabId) throw new Error("tabId 缺失");
+        const requestedBvid = normalizeBvid(msg.bvid);
+        logBackground.info("segments_truncation_retry_test_start", { tab_id: tabId, bvid: requestedBvid });
+        await runTasksForTab(tabId, ["segments"], true, {
+            ...normalizeTaskContext(msg.taskContext),
+            debugForceFirstSegmentsTruncation: true
+        }, requestedBvid);
+        return {};
+    }
+    if (msg.action === "RUN_SUMMARY_EMPTY_RETRY_TEST") {
+        if (!tabId) throw new Error("tabId 缺失");
+        const requestedBvid = normalizeBvid(msg.bvid);
+        logBackground.info("summary_empty_retry_test_start", { tab_id: tabId, bvid: requestedBvid });
+        await recordSummaryRetryDebugState(tabId, {
+            status: "running",
+            stage: "forced_empty",
+            attempt: 0,
+            total: 1,
+            code: "SUMMARY_EMPTY_RESPONSE",
+            message: "测试模式：等待首轮响应后模拟总结为空"
+        }, "测试模式：准备模拟首轮总结为空", { resetEvents: true });
+        await runTasksForTab(tabId, ["summary"], true, {
+            ...normalizeTaskContext(msg.taskContext),
+            debugForceFirstSummaryEmpty: true
+        }, requestedBvid);
+        return {};
+    }
     if (msg.action === "RUN_CHAT") {
         if (!tabId) throw new Error("tabId 缺失");
         const text = String(msg.text || "").trim();
@@ -1506,7 +1809,7 @@ async function handleMessage(msg, sender) {
     }
     if (msg.action === "GET_SETTINGS") {
         const settings = await getResolvedSettings();
-        return { settings, providers: PROVIDERS };
+        return { settings, providers: settings.providerCatalog || PROVIDERS };
     }
     if (msg.action === "ENSURE_OPTIONAL_ORIGIN_PERMISSION") {
         const baseUrl = String(msg?.baseUrl || "").trim();
@@ -2070,13 +2373,13 @@ async function probeDownloadContentType(url) {
         const res = await tryFetch("GET", { Range: "bytes=0-0" });
         if (res.type === "opaque") return null;
         const ct = String(res.headers.get("content-type") || "").toLowerCase();
-        return { isHtml: res.ok && ct.includes("text/html"), contentType: ct, status: res.status };
+        return { isHtml: ct.includes("text/html") || ct.includes("application/xhtml+xml"), contentType: ct, status: res.status };
     } catch (_) {
         try {
             const res = await tryFetch("HEAD");
             if (res.type === "opaque") return null;
             const ct = String(res.headers.get("content-type") || "").toLowerCase();
-            return { isHtml: res.ok && ct.includes("text/html"), contentType: ct, status: res.status };
+            return { isHtml: ct.includes("text/html") || ct.includes("application/xhtml+xml"), contentType: ct, status: res.status };
         } catch (_) {
             return null;
         }
@@ -2167,7 +2470,7 @@ async function mergeSettings(patch) {
     }
     await chrome.storage.local.set({ settings: merged });
     await chrome.storage.sync.set({ promptSettings: nextPromptSettings });
-    return withPromptSettings(merged, nextPromptSettings);
+    return getResolvedSettings();
 }
 
 class ContentProvider {
@@ -2178,8 +2481,7 @@ class ContentProvider {
         const cid = Number(payload?.cid || tabState?.activeCid || 0);
         const tid = payload?.tid || tabState?.activeTid || null;
         const title = String(payload?.title || "").trim();
-        const { settings } = await chrome.storage.local.get(["settings"]);
-        const normalizedSettings = normalizeSettings(settings);
+        const normalizedSettings = await getResolvedSettings();
         const requestedAsrProvider = String(normalizedSettings.asrProvider || "groq").toLowerCase();
         const asrProvider = ["groq", "siliconflow", "mimo"].includes(requestedAsrProvider) ? requestedAsrProvider : "groq";
         const asrApiKey = asrProvider === "siliconflow"
@@ -3738,6 +4040,14 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
     const key = `${identity.partKey || bvid}|${task}`;
     const startedAt = Date.now();
     const taskId = createUsageTaskId(task);
+    const usageTaskContext = {
+        ...taskContext,
+        ...identity,
+        tabId,
+        usageTaskId: taskId,
+        usageFeatureName: task,
+        usageRecoveryState: {}
+    };
     logBackground.info("task_start", { tab_id: tabId, bvid, task });
     await reportClientUsageEvent({
         eventName: "task_started",
@@ -3751,7 +4061,7 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
         tabId
     }, settings);
     try {
-        const result = await runWithDedup(key, () => requestTaskResult(bvid, task, settings, { ...taskContext, ...identity, tabId }));
+        const result = await runWithDedup(key, () => requestTaskResult(bvid, task, settings, usageTaskContext));
         await mergeCacheByBvid(bvid, {
             ...(identity.cid > 0 ? { cid: identity.cid } : {}),
             ...(identity.tid ? { tid: identity.tid } : {}),
@@ -3773,7 +4083,8 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
             bvid,
             title: cache?.title || "",
             durationMs: Date.now() - startedAt,
-            tabId
+            tabId,
+            metadata: buildTaskRecoveryMetadata(usageTaskContext)
         }, settings);
         return result;
     } catch (error) {
@@ -3803,7 +4114,10 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
             bvid,
             title: cache?.title || "",
             tabId,
-            ...buildUsageErrorPayload(error, { startedAt })
+            ...buildUsageErrorPayload(error, {
+                startedAt,
+                metadata: buildTaskRecoveryMetadata(usageTaskContext)
+            })
         }, settings);
         if (status === "timeout") {
             logBackground.error("task_timeout", buildFailureLog(error, { tab_id: tabId, bvid, task, code: error?.code || "TIMEOUT" }));
@@ -3841,6 +4155,14 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
     const key = `${identity.partKey || bvid}|summary_segments`;
     const startedAt = Date.now();
     const taskId = createUsageTaskId("summary_segments_merged");
+    const usageTaskContext = {
+        ...taskContext,
+        ...identity,
+        tabId,
+        usageTaskId: taskId,
+        usageFeatureName: "summary_segments_merged",
+        usageRecoveryState: {}
+    };
     logBackground.info("task_start", { tab_id: tabId, bvid, task: "summary_segments", mode: settings.prefMode });
     await reportClientUsageEvent({
         eventName: "task_started",
@@ -3855,8 +4177,8 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
         metadata: { pref_mode: settings?.prefMode || "" }
     }, settings);
     const runner = settings.prefMode === "efficiency"
-        ? () => runSummarySegmentsInEfficiency(tabId, bvid, force, settings, { ...taskContext, ...identity })
-        : () => runSummarySegmentsInQuality(tabId, bvid, force, settings, { ...taskContext, ...identity });
+        ? () => runSummarySegmentsInEfficiency(tabId, bvid, force, settings, usageTaskContext)
+        : () => runSummarySegmentsInQuality(tabId, bvid, force, settings, usageTaskContext);
     let results;
     try {
         results = await runWithDedup(key, runner);
@@ -3870,7 +4192,11 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
             bvid,
             title: cache?.title || "",
             tabId,
-            ...buildUsageErrorPayload(error, { startedAt, errorCode: "SUMMARY_SEGMENTS_FAILED" })
+            ...buildUsageErrorPayload(error, {
+                startedAt,
+                errorCode: "SUMMARY_SEGMENTS_FAILED",
+                metadata: buildTaskRecoveryMetadata(usageTaskContext)
+            })
         }, settings);
         throw error;
     }
@@ -3908,7 +4234,11 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
             bvid,
             title: cache?.title || "",
             tabId,
-            ...buildUsageErrorPayload(error, { startedAt, errorCode: "SUMMARY_SEGMENTS_FAILED" })
+            ...buildUsageErrorPayload(error, {
+                startedAt,
+                errorCode: "SUMMARY_SEGMENTS_FAILED",
+                metadata: buildTaskRecoveryMetadata(usageTaskContext)
+            })
         }, settings);
         throw error;
     }
@@ -3923,7 +4253,11 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
         title: cache?.title || "",
         durationMs: Date.now() - startedAt,
         tabId,
-        metadata: { summary_ok: summaryOk, segments_ok: segmentsOk }
+        metadata: {
+            summary_ok: summaryOk,
+            segments_ok: segmentsOk,
+            ...buildTaskRecoveryMetadata(usageTaskContext)
+        }
     }, settings);
     return results;
 }
@@ -4243,9 +4577,15 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
             mode: "single",
             message: segmentPromptPlan?.compact ? "保守 Prompt 主请求生成中" : "原 Prompt 主请求生成中"
         }, "开始分段主请求", { resetEvents: true });
-        if (consumeDebugForceFirstSegmentsFailure(taskContext)) {
+        const forcedSegmentsErrorCode = consumeDebugForceFirstSegmentsTruncation(taskContext)
+            ? "SEGMENTS_OUTPUT_TRUNCATED"
+            : (consumeDebugForceFirstSegmentsFailure(taskContext) ? "SEGMENTS_INVALID_SCHEMA" : "");
+        if (forcedSegmentsErrorCode) {
+            const forcedMessage = forcedSegmentsErrorCode === "SEGMENTS_OUTPUT_TRUNCATED"
+                ? "分段输出被截断"
+                : "分段字段不完整";
             const forcedError = attachSentryContext(
-                createAppError("SEGMENTS_INVALID_SCHEMA", "分段字段不完整"),
+                createAppError(forcedSegmentsErrorCode, forcedMessage),
                 buildAIResponseSentryContext({
                     task: "segments",
                     bvid,
@@ -4256,7 +4596,8 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                     responseText: "",
                     metrics: {},
                     extra: {
-                        debug_forced_failure: true
+                        debug_forced_failure: true,
+                        debug_forced_truncation: forcedSegmentsErrorCode === "SEGMENTS_OUTPUT_TRUNCATED"
                     }
                 })
             );
@@ -4265,8 +4606,12 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                 stage: "forced_failure",
                 mode: "single",
                 code: forcedError.code || "",
-                message: "测试模式：首轮主请求已强制失败"
-            }, "测试模式：首轮分段主请求强制失败，准备进入自动重试");
+                message: forcedSegmentsErrorCode === "SEGMENTS_OUTPUT_TRUNCATED"
+                    ? "测试模式：模拟输出截断"
+                    : "测试模式：首轮主请求已强制失败"
+            }, forcedSegmentsErrorCode === "SEGMENTS_OUTPUT_TRUNCATED"
+                ? "测试模式：模拟分段输出截断，准备提高输出上限"
+                : "测试模式：首轮分段主请求强制失败，准备进入自动重试");
             return await retrySegmentsWithAutoFallbacks({
                 tabId: taskContext?.tabId || null,
                 bvid,
@@ -4282,7 +4627,7 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
             });
         }
     }
-    const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: prompt }], TASK_TIMEOUT_MS, { tabId: taskContext.tabId });
+    let aiRes = await callAIWithTimeout(settings, [{ role: "user", content: prompt }], TASK_TIMEOUT_MS, { tabId: taskContext.tabId });
     logAI.info("ai_request_success", {
         bvid,
         task,
@@ -4299,10 +4644,39 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
         }
     });
     await appendMetrics(bvid, null, task, aiRes.metrics, taskContext);
-    await reportFeatureUsage(task, bvid, settings, aiRes.metrics);
+    if (task !== "summary") {
+        await reportFeatureUsage(task, bvid, settings, aiRes.metrics);
+    }
     if (task === "summary") {
-        const summaryText = sanitizeSummaryOutput(aiRes.text);
-        if (!summaryText) throw createSummaryEmptyError();
+        let summaryText = sanitizeSummaryOutput(aiRes.text);
+        if (consumeDebugForceFirstSummaryEmpty(taskContext)) {
+            summaryText = "";
+            await recordSummaryRetryDebugState(taskContext.tabId, {
+                status: "retrying",
+                stage: "empty_detected",
+                attempt: 0,
+                total: 1,
+                code: "SUMMARY_EMPTY_RESPONSE",
+                message: "测试模式：首轮总结已强制判定为空"
+            }, "测试模式：首轮总结判定为空，准备自动重试");
+        }
+        if (!summaryText) {
+            const retried = await retryEmptySummaryOnce({
+                settings,
+                prompt,
+                tabId: taskContext.tabId,
+                bvid,
+                mode: "single",
+                requestStream: false,
+                taskContext,
+                initialAIResponse: aiRes,
+                initialDurationMs: aiRes.metrics?.latencyMs || 0
+            });
+            aiRes = retried.aiRes;
+            summaryText = retried.summaryText;
+            await appendMetrics(bvid, null, task, aiRes.metrics, taskContext);
+        }
+        await reportFeatureUsage(task, bvid, settings, aiRes.metrics);
         return summaryText;
     }
     if (task === "segments") {
@@ -4312,14 +4686,16 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
             mode: "single",
             message: "主响应已返回，正在解析分段"
         }, "主响应已返回，开始解析分段");
-        const parsed = robustJSONParse(aiRes.text);
+        const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
+            ? null
+            : robustJSONParse(aiRes.text);
         let finalParsed = parsed;
         let compactRetryNormalized = null;
         if (finalParsed) {
             logBackground.info("json_parse_success", { task: "segments", bvid });
         } else {
             const parseError = attachSentryContext(
-                createSegmentsParseError(aiRes.text, aiRes.metrics),
+                createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
                 buildAIResponseSentryContext({
                     task: "segments",
                     bvid,
@@ -4352,7 +4728,8 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                 guided: settings.promptSettings?.guided || {},
                 customPrompts: settings.promptSettings?.custom || {},
                 mode: "single",
-                originalError: parseError
+                originalError: parseError,
+                initialDurationMs: aiRes.metrics?.latencyMs || 0
             });
         }
         const normalized = compactRetryNormalized || normalizeSegments(finalParsed, cache, { bvid, task: "segments", mode: "single", allowLineOnly: shouldUseCompactSegmentsFirst(settings) });
@@ -4383,7 +4760,8 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                 guided: settings.promptSettings?.guided || {},
                 customPrompts: settings.promptSettings?.custom || {},
                 mode: "single",
-                originalError: normalizeError
+                originalError: normalizeError,
+                initialDurationMs: aiRes.metrics?.latencyMs || 0
             });
         }
         await recordSegmentsDebugState(taskContext?.tabId || null, {
@@ -4459,10 +4837,17 @@ function isLikelyContextTooLongError(error) {
     return /context length|maximum context|max context|too many tokens|prompt too long|input too long|context_length_exceeded|上下文|提示词.*长|内容.*过长/i.test(message);
 }
 
-function isLikelyTruncatedSegmentOutput(text, metrics = {}) {
+function isOutputLengthFinishReason(responseMeta = {}) {
+    const reason = String(responseMeta?.finishReason || "").trim().toLowerCase();
+    return ["length", "max_tokens", "max_output_tokens", "max_tokens_reached", "token_limit"].includes(reason);
+}
+
+function isLikelyTruncatedSegmentOutput(text, metrics = {}, responseMeta = {}) {
     const value = String(text || "").trim();
+    if (isOutputLengthFinishReason(responseMeta)) return true;
     const outputTokens = Number(metrics?.outputTokens || metrics?.output_tokens || 0);
-    if (outputTokens >= 4000) return true;
+    const maxOutputTokens = Number(metrics?.maxOutputTokens || 4096);
+    if (outputTokens >= Math.max(1, maxOutputTokens - 96)) return true;
     if (!value) return false;
     const opens = (value.match(/[\[{]/g) || []).length;
     const closes = (value.match(/[\]}]/g) || []).length;
@@ -4493,12 +4878,15 @@ function getSegmentCandidateList(parsed) {
     return null;
 }
 
-function createSegmentsParseError(text, metrics = {}) {
+function createSegmentsParseError(text, metrics = {}, responseMeta = {}) {
     const value = String(text || "").trim();
+    if (isOutputLengthFinishReason(responseMeta)) {
+        return createAppError("SEGMENTS_OUTPUT_TRUNCATED", "分段输出被截断");
+    }
     if (!value) {
         return createAppError("SEGMENTS_EMPTY_RESPONSE", "模型没有返回分段内容");
     }
-    if (isLikelyTruncatedSegmentOutput(value, metrics)) {
+    if (isLikelyTruncatedSegmentOutput(value, metrics, responseMeta)) {
         return createAppError("SEGMENTS_OUTPUT_TRUNCATED", "分段输出被截断");
     }
     return createAppError("SEGMENTS_JSON_PARSE_FAILED", "分段格式解析失败");
@@ -4528,8 +4916,8 @@ function createSegmentsNormalizeError(parsed) {
     return createAppError("SEGMENTS_INVALID_SCHEMA", "分段字段不完整");
 }
 
-function createSegmentsMissingProtocolError(fullText, metrics = {}) {
-    if (isLikelyTruncatedSegmentOutput(fullText, metrics)) {
+function createSegmentsMissingProtocolError(fullText, metrics = {}, responseMeta = {}) {
+    if (isLikelyTruncatedSegmentOutput(fullText, metrics, responseMeta)) {
         return createAppError("SEGMENTS_OUTPUT_TRUNCATED", "分段输出被截断");
     }
     return createAppError("SEGMENTS_MISSING_PROTOCOL", "模型漏掉了分段部分");
@@ -4544,8 +4932,162 @@ function normalizeSegmentsTaskError(error) {
     return error;
 }
 
-function createSummaryEmptyError() {
-    return createAppError("SUMMARY_EMPTY_RESPONSE", "模型没有返回总结内容");
+function getSummaryEmptyResponseDiagnostics(aiRes = {}) {
+    const rawResponseSnapshot = truncateSentryResponseText(String(aiRes?.responseMeta?.rawResponse || ""), 5000, 3000);
+    return {
+        finish_reason: String(aiRes?.responseMeta?.finishReason || ""),
+        content_state: String(aiRes?.responseMeta?.contentState || ""),
+        reasoning_chars: Number(aiRes?.responseMeta?.reasoningChars || 0) || 0,
+        raw_response: rawResponseSnapshot.text,
+        raw_response_truncated: rawResponseSnapshot.truncated
+    };
+}
+
+function logSummaryEmptyResponse({ settings, bvid, mode, source, aiRes } = {}) {
+    logAI.warn("summary_empty_response", {
+        bvid,
+        task: "summary",
+        code: "SUMMARY_EMPTY_RESPONSE",
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        detail: {
+            mode: String(mode || ""),
+            source: String(source || ""),
+            ...getSummaryEmptyResponseDiagnostics(aiRes)
+        }
+    });
+}
+
+function createSummaryEmptyError({ settings, bvid, mode, source, aiRes } = {}) {
+    const diagnostics = getSummaryEmptyResponseDiagnostics(aiRes);
+    return attachSentryContext(
+        createAppError("SUMMARY_EMPTY_RESPONSE", "模型没有返回总结内容"),
+        buildAIResponseSentryContext({
+            task: "summary",
+            bvid,
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            mode,
+            source,
+            responseText: aiRes?.text || "",
+            responseMeta: aiRes?.responseMeta,
+            metrics: aiRes?.metrics,
+            extra: diagnostics
+        })
+    );
+}
+
+async function retryEmptySummaryOnce({ settings, prompt, tabId, bvid, mode, requestStream = false, taskContext = {}, initialAIResponse = null, initialDurationMs = 0 }) {
+    const triggerError = createSummaryEmptyError({
+        settings,
+        bvid,
+        mode,
+        source: "summary_initial_empty",
+        aiRes: initialAIResponse
+    });
+    logSummaryEmptyResponse({
+        settings,
+        bvid,
+        mode,
+        source: "initial",
+        aiRes: initialAIResponse
+    });
+    if (!isRemoteFeatureEnabled(settings?.remoteConfig, "summary_empty_retry", true)) throw triggerError;
+    await reportTaskInitialFailure({
+        settings,
+        taskContext,
+        component: "summary",
+        bvid,
+        error: triggerError,
+        durationMs: initialDurationMs
+    });
+    logAI.warn("summary_empty_retry_start", {
+        bvid,
+        task: "summary",
+        provider: settings.provider,
+        model: settings.model || "",
+        detail: { mode, attempt: 1, max_attempts: 1, prompt_chars: prompt.length, request_stream: requestStream }
+    });
+    await recordSummaryRetryDebugState(tabId, {
+        status: "retrying",
+        stage: "summary_retry",
+        attempt: 1,
+        total: 1,
+        code: "SUMMARY_EMPTY_RESPONSE",
+        mode,
+        message: "总结为空，正在自动重试"
+    }, "开始第 1/1 次总结空响应自动重试").catch(() => {});
+    const recoveryStartedAt = Date.now();
+    try {
+        let streamedSummaryText = "";
+        const messages = [{ role: "user", content: prompt }];
+        const aiRes = requestStream
+            ? await callAIWithTimeoutStream(settings, messages, TASK_TIMEOUT_MS, (delta) => {
+                streamedSummaryText += String(delta || "");
+            }, null, { tabId })
+            : await callAIWithTimeout(settings, messages, TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+        const summaryText = sanitizeSummaryOutput(aiRes.text || streamedSummaryText);
+        if (!summaryText) {
+            logSummaryEmptyResponse({ settings, bvid, mode, source: "retry", aiRes });
+            throw createSummaryEmptyError({
+                settings,
+                bvid,
+                mode,
+                source: "summary_retry_empty",
+                aiRes
+            });
+        }
+        await reportTaskRecoveryFinished({
+            settings,
+            taskContext,
+            component: "summary",
+            bvid,
+            strategy: "summary_empty_retry",
+            triggerError,
+            success: true,
+            durationMs: Date.now() - recoveryStartedAt,
+            metrics: aiRes.metrics
+        });
+        await recordSummaryRetryDebugState(tabId, {
+            status: "recovered",
+            stage: "recovered",
+            attempt: 1,
+            total: 1,
+            code: "",
+            mode,
+            message: "总结重试成功"
+        }, "总结空响应自动重试成功").catch(() => {});
+        logAI.info("summary_empty_retry_success", {
+            bvid,
+            task: "summary",
+            provider: settings.provider,
+            model: settings.model || "",
+            detail: { mode, output_chars: summaryText.length }
+        });
+        return { aiRes, summaryText };
+    } catch (error) {
+        await reportTaskRecoveryFinished({
+            settings,
+            taskContext,
+            component: "summary",
+            bvid,
+            strategy: "summary_empty_retry",
+            triggerError,
+            resultError: error,
+            success: false,
+            durationMs: Date.now() - recoveryStartedAt
+        });
+        await recordSummaryRetryDebugState(tabId, {
+            status: "retry_failed",
+            stage: "retry_failed",
+            attempt: 1,
+            total: 1,
+            code: String(error?.code || "SUMMARY_EMPTY_RESPONSE"),
+            mode,
+            message: error?.message || "总结重试失败"
+        }, `总结空响应自动重试失败：${String(error?.code || "SUMMARY_EMPTY_RESPONSE")}`).catch(() => {});
+        throw error;
+    }
 }
 
 function pickSummarySegmentsFailureError(results) {
@@ -4573,6 +5115,19 @@ const AUTO_RETRY_SEGMENT_ERROR_CODES = new Set([
 
 function shouldAutoRetrySegmentsError(error) {
     return AUTO_RETRY_SEGMENT_ERROR_CODES.has(String(error?.code || ""));
+}
+
+function canRepairSegmentsResponseWithAI(error) {
+    const source = String(error?.[SEGMENTS_REPAIR_SOURCE] || "").trim();
+    return shouldAttemptSegmentsAIRepair(error?.code, source);
+}
+
+function hasAttemptedSegmentsAIRepair(taskContext = {}) {
+    return taskContext?.segmentsAIJsonRepairAttempted === true;
+}
+
+function markSegmentsAIRepairAttempted(taskContext = {}) {
+    if (taskContext && typeof taskContext === "object") taskContext.segmentsAIJsonRepairAttempted = true;
 }
 
 async function ensureOffscreenDocument() {
@@ -4829,7 +5384,7 @@ async function recordAsrChunkingDebugState(tabId, diagnostics = null) {
 
 function buildPrimarySegmentsPrompt({ settings, cache, subtitleText, mode, guided, customPrompts, taskContext, promptTaskContext, forceFull = false }) {
     if (!forceFull && shouldUseCompactSegmentsFirst(settings)) {
-        const compactSubtitle = buildCompactSegmentsSubtitlePayload(cache, 40000) || subtitleText;
+        const compactSubtitle = buildCompactSegmentsSubtitlePayload(cache, MAX_SEGMENTS_SUBTITLE_CHARS) || subtitleText;
         return {
             prompt: buildCompactSegmentsPrompt({ subtitle: compactSubtitle, taskContext: promptTaskContext }),
             subtitleText: compactSubtitle,
@@ -4837,16 +5392,14 @@ function buildPrimarySegmentsPrompt({ settings, cache, subtitleText, mode, guide
         };
     }
     return {
-        prompt: isSegmentPromptTestEnabled(settings)
-            ? buildSegmentsAdTestPrompt({ subtitle: subtitleText, taskContext: promptTaskContext })
-            : buildPrompt({ type: "segments", subtitle: subtitleText, mode, guided, customPrompts, taskContext: promptTaskContext }),
+        prompt: buildPrompt({ type: "segments", subtitle: subtitleText, mode, guided, customPrompts, taskContext: promptTaskContext }),
         subtitleText,
         compact: false
     };
 }
 
 async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, taskContext, mode, originalError }) {
-    const compactSubtitle = buildCompactSegmentsSubtitlePayload(cache, 40000);
+    const compactSubtitle = buildCompactSegmentsSubtitlePayload(cache, MAX_SEGMENTS_SUBTITLE_CHARS);
     if (!compactSubtitle) throw originalError || createSegmentsParseError("");
     const promptTaskContext = { ...taskContext, noSubtitleTimestamps: isNoTimestampSubtitleCache(cache) };
     const compactPrompt = buildCompactSegmentsPrompt({ subtitle: compactSubtitle, taskContext: promptTaskContext });
@@ -4863,10 +5416,12 @@ async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, ta
         }
     });
     const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: compactPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
-    const parsed = robustJSONParse(aiRes.text);
+    const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
+        ? null
+        : robustJSONParse(aiRes.text);
     if (!parsed) {
         const parseError = attachSentryContext(
-            createSegmentsParseError(aiRes.text, aiRes.metrics),
+            createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
             buildAIResponseSentryContext({
                 task: "segments",
                 bvid,
@@ -4916,7 +5471,7 @@ async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, ta
             purpose: "segments",
             mode,
             payload_chars: compactSubtitle.length,
-            max_chars: 40000,
+            max_chars: MAX_SEGMENTS_SUBTITLE_CHARS,
             no_timestamp: isNoTimestampSubtitleCache(cache),
             raw_count: Array.isArray(cache?.rawSubtitle) ? cache.rawSubtitle.length : 0,
             processed_count: Array.isArray(cache?.processedSubtitle) ? cache.processedSubtitle.length : 0
@@ -4940,6 +5495,86 @@ async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, ta
         }
     });
     return normalized;
+}
+
+async function retrySegmentsWithAIRepair({ tabId, bvid, cache, settings, mode, originalError }) {
+    const responseText = String(originalError?.[SEGMENTS_REPAIR_SOURCE] || "").trim();
+    if (!responseText) throw originalError;
+    const repairPrompt = buildSegmentsAIRepairPrompt(responseText);
+    logAI.warn("segments_ai_json_repair_start", {
+        bvid,
+        task: "segments",
+        provider: settings.provider,
+        model: settings.model || "",
+        code: originalError?.code || "",
+        detail: {
+            mode,
+            response_chars: responseText.length,
+            prompt_chars: repairPrompt.length
+        }
+    });
+    const aiRes = await callAIWithTimeout(
+        settings,
+        [{ role: "user", content: repairPrompt }],
+        TASK_TIMEOUT_MS,
+        { bypassQueue: true, tabId }
+    );
+    const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
+        ? null
+        : robustJSONParse(aiRes.text);
+    if (!parsed) {
+        throw attachSentryContext(
+            createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
+            buildAIResponseSentryContext({
+                task: "segments",
+                bvid,
+                provider: settings.provider,
+                model: settings.model || "",
+                mode: `${mode}_ai_json_repair`,
+                source: "segments_ai_json_repair_parse",
+                responseText: aiRes.text,
+                responseMeta: aiRes.responseMeta,
+                metrics: aiRes.metrics
+            })
+        );
+    }
+    const normalized = normalizeSegments(parsed, cache, {
+        bvid,
+        task: "segments",
+        mode: `${mode}_ai_json_repair`,
+        allowLineOnly: true
+    });
+    if (!normalized.length) {
+        throw attachSentryContext(
+            createSegmentsNormalizeError(parsed),
+            buildAIResponseSentryContext({
+                task: "segments",
+                bvid,
+                provider: settings.provider,
+                model: settings.model || "",
+                mode: `${mode}_ai_json_repair`,
+                source: "segments_ai_json_repair_normalize",
+                responseText: aiRes.text,
+                responseMeta: aiRes.responseMeta,
+                metrics: aiRes.metrics,
+                extra: { parsed_item_count: getSegmentCandidateList(parsed)?.length || 0 }
+            })
+        );
+    }
+    logAI.info("segments_ai_json_repair_success", {
+        bvid,
+        task: "segments",
+        provider: settings.provider,
+        model: settings.model || "",
+        duration_ms: aiRes.metrics?.latencyMs || 0,
+        detail: {
+            mode,
+            source_chars: responseText.length,
+            output_chars: String(aiRes.text || "").length,
+            segment_count: normalized.length
+        }
+    });
+    return { segments: normalized, metrics: aiRes.metrics || {} };
 }
 
 async function retrySegmentsWithPrimaryPrompt({
@@ -4981,10 +5616,12 @@ async function retrySegmentsWithPrimaryPrompt({
         }
     });
     const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: segmentPromptPlan.prompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
-    const parsed = robustJSONParse(aiRes.text);
+    const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
+        ? null
+        : robustJSONParse(aiRes.text);
     if (!parsed) {
         const parseError = attachSentryContext(
-            createSegmentsParseError(aiRes.text, aiRes.metrics),
+            createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
             buildAIResponseSentryContext({
                 task: "segments",
                 bvid,
@@ -5055,58 +5692,149 @@ async function retrySegmentsWithAutoFallbacks({
     guided,
     customPrompts,
     mode,
-    originalError
+    originalError,
+    initialDurationMs = 0
 }) {
     let latestError = normalizeSegmentsTaskError(originalError);
     if (!shouldAutoRetrySegmentsError(latestError)) throw latestError;
-    const retrySteps = [
-        () => retrySegmentsWithPrimaryPrompt({
-            tabId,
-            bvid,
-            cache,
-            settings,
-            taskContext,
-            subtitleText,
-            promptMode,
-            guided,
-            customPrompts,
-            mode,
-            originalError: latestError
-        }),
-        () => retrySegmentsWithCompactPrompt({
-            tabId,
-            bvid,
-            cache,
-            settings,
-            taskContext,
-            mode,
-            originalError: latestError
-        })
-    ];
-    for (let index = 0; index < retrySteps.length; index += 1) {
-        const strategy = index === 0 ? "primary" : "compact";
+    await reportTaskInitialFailure({
+        settings,
+        taskContext,
+        component: "segments",
+        bvid,
+        error: latestError,
+        durationMs: initialDurationMs
+    });
+    let primaryUsed = false;
+    let expandedTokensUsed = false;
+    let compactUsed = false;
+    let aiJsonRepairUsed = hasAttemptedSegmentsAIRepair(taskContext);
+    let attempt = 0;
+    while (true) {
+        let strategy = "";
+        let retryStep = null;
+        if (!aiJsonRepairUsed
+            && canRepairSegmentsResponseWithAI(latestError)
+            && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_ai_json_repair", true)) {
+            strategy = "ai_json_repair";
+            aiJsonRepairUsed = true;
+            markSegmentsAIRepairAttempted(taskContext);
+            retryStep = () => retrySegmentsWithAIRepair({
+                tabId,
+                bvid,
+                cache,
+                settings,
+                mode,
+                originalError: latestError
+            });
+        } else if (String(latestError?.code || "") === "SEGMENTS_OUTPUT_TRUNCATED"
+            && !expandedTokensUsed
+            && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_expanded_tokens_retry", true)) {
+            strategy = "expanded_tokens";
+            expandedTokensUsed = true;
+            primaryUsed = true;
+            retryStep = () => retrySegmentsWithPrimaryPrompt({
+                tabId,
+                bvid,
+                cache,
+                settings: { ...settings, maxOutputTokens: EXPANDED_SEGMENTS_MAX_OUTPUT_TOKENS },
+                taskContext,
+                subtitleText,
+                promptMode,
+                guided,
+                customPrompts,
+                mode,
+                originalError: latestError
+            });
+        } else if (!primaryUsed && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_primary_retry", true)) {
+            strategy = "primary";
+            primaryUsed = true;
+            retryStep = () => retrySegmentsWithPrimaryPrompt({
+                tabId,
+                bvid,
+                cache,
+                settings,
+                taskContext,
+                subtitleText,
+                promptMode,
+                guided,
+                customPrompts,
+                mode,
+                originalError: latestError
+            });
+        } else if (!compactUsed && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_compact_retry", true)) {
+            strategy = "compact";
+            compactUsed = true;
+            retryStep = () => retrySegmentsWithCompactPrompt({
+                tabId,
+                bvid,
+                cache,
+                settings,
+                taskContext,
+                mode,
+                originalError: latestError
+            });
+        } else {
+            throw latestError;
+        }
+        attempt += 1;
+        const strategyLabel = strategy === "ai_json_repair"
+            ? "AI JSON 修复"
+            : strategy === "expanded_tokens"
+            ? "提高输出上限"
+            : (strategy === "primary" ? "原 Prompt" : "保守 Prompt");
         await recordSegmentsDebugState(tabId, {
             status: "retrying",
-            stage: strategy === "primary" ? "primary_retry" : "compact_retry",
-            attempt: index + 1,
-            total: retrySteps.length,
+            stage: strategy === "ai_json_repair"
+                ? "ai_json_repair"
+                : (strategy === "expanded_tokens" ? "expanded_tokens_retry" : (strategy === "primary" ? "primary_retry" : "compact_retry")),
+            attempt,
+            total: 4,
             strategy,
             code: String(latestError?.code || ""),
             mode,
             startedAt: Date.now(),
-            message: strategy === "primary" ? "原 Prompt 自动重试中" : "保守 Prompt 自动重试中"
-        }, `开始第 ${index + 1}/${retrySteps.length} 次自动重试：${strategy === "primary" ? "原 Prompt" : "保守 Prompt"}`);
+            maxOutputTokens: strategy === "expanded_tokens" ? EXPANDED_SEGMENTS_MAX_OUTPUT_TOKENS : undefined,
+            message: `${strategyLabel}自动重试中`
+        }, `开始第 ${attempt} 次自动重试：${strategyLabel}`);
+        const recoveryStartedAt = Date.now();
+        const triggerError = latestError;
         try {
-            const result = await retrySteps[index]();
+            const outcome = await retryStep();
+            const result = Array.isArray(outcome) ? outcome : outcome?.segments;
+            const recoveryMetrics = Array.isArray(outcome) ? {} : (outcome?.metrics || {});
+            if (!Array.isArray(result) || !result.length) throw createSegmentsNormalizeError(result);
+            await reportTaskRecoveryFinished({
+                settings,
+                taskContext,
+                component: "segments",
+                bvid,
+                strategy: strategy === "primary" ? "primary_retry" : (strategy === "compact" ? "compact_retry" : strategy),
+                triggerError,
+                success: true,
+                durationMs: Date.now() - recoveryStartedAt,
+                metrics: recoveryMetrics
+            });
             await recordSegmentsDebugState(tabId, {
                 status: "recovered",
                 stage: "recovered",
                 strategy,
-                message: strategy === "primary" ? "原 Prompt 重试成功" : "保守 Prompt 重试成功"
-            }, `自动重试成功：${strategy === "primary" ? "原 Prompt" : "保守 Prompt"}`);
+                message: `${strategyLabel}重试成功`
+            }, `自动重试成功：${strategyLabel}`);
             return result;
         } catch (retryError) {
             latestError = mergeSegmentsResponseAttempts(normalizeSegmentsTaskError(retryError), latestError);
+            await reportTaskRecoveryFinished({
+                settings,
+                taskContext,
+                component: "segments",
+                bvid,
+                strategy: strategy === "primary" ? "primary_retry" : (strategy === "compact" ? "compact_retry" : strategy),
+                triggerError,
+                resultError: latestError,
+                success: false,
+                durationMs: Date.now() - recoveryStartedAt
+            });
             logAI.warn("segments_auto_retry_failed", buildFailureLog(latestError, {
                 task: "segments",
                 bvid,
@@ -5114,8 +5842,9 @@ async function retrySegmentsWithAutoFallbacks({
                 model: settings.model || "",
                 detail: {
                     mode,
-                    retry_attempt: index + 1,
-                    retry_total: retrySteps.length
+                    retry_attempt: attempt,
+                    retry_strategy: strategy,
+                    max_output_tokens: strategy === "expanded_tokens" ? EXPANDED_SEGMENTS_MAX_OUTPUT_TOKENS : undefined
                 }
             }));
             await recordSegmentsDebugState(tabId, {
@@ -5124,13 +5853,40 @@ async function retrySegmentsWithAutoFallbacks({
                 strategy,
                 code: String(latestError?.code || ""),
                 message: latestError?.message || "自动重试失败"
-            }, `自动重试失败：${strategy === "primary" ? "原 Prompt" : "保守 Prompt"} · ${String(latestError?.code || "") || "UNKNOWN"}`);
-            if (!shouldAutoRetrySegmentsError(latestError) || index === retrySteps.length - 1) {
-                throw latestError;
-            }
+            }, `自动重试失败：${strategyLabel} · ${String(latestError?.code || "") || "UNKNOWN"}`);
+            if (!shouldAutoRetrySegmentsError(latestError)) throw latestError;
         }
     }
-    throw latestError;
+}
+
+function consumeDebugForceFirstSegmentsTruncation(taskContext = {}) {
+    if (!taskContext || taskContext.debugForceFirstSegmentsTruncation !== true) return false;
+    taskContext.debugForceFirstSegmentsTruncation = false;
+    return true;
+}
+
+function consumeDebugForceFirstSummaryEmpty(taskContext = {}) {
+    if (!taskContext || taskContext.debugForceFirstSummaryEmpty !== true) return false;
+    taskContext.debugForceFirstSummaryEmpty = false;
+    return true;
+}
+
+async function recordSummaryRetryDebugState(tabId, patch = {}, eventText = "", options = {}) {
+    if (!tabId) return;
+    const current = await getTabState(tabId);
+    const taskRetryState = { ...(current?.taskRetryState || {}) };
+    const previous = taskRetryState.summary && typeof taskRetryState.summary === "object"
+        ? taskRetryState.summary
+        : {};
+    const events = options.resetEvents ? [] : (Array.isArray(previous.events) ? previous.events.slice(-5) : []);
+    if (eventText) events.push({ at: Date.now(), text: String(eventText || "") });
+    taskRetryState.summary = {
+        ...previous,
+        ...patch,
+        events,
+        updatedAt: Date.now()
+    };
+    await updateTabState(tabId, { taskRetryState, updatedAt: Date.now() });
 }
 
 function resolveStatusByError(error) {
@@ -5309,7 +6065,7 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                 let streamedSummaryText = "";
                 let partialWritePromise = Promise.resolve();
                 const partialState = { lastWriteAt: 0 };
-                const aiRes = await callAIWithTimeoutStream(settings, [{ role: "user", content: summaryPrompt }], TASK_TIMEOUT_MS, (delta) => {
+                let aiRes = await callAIWithTimeoutStream(settings, [{ role: "user", content: summaryPrompt }], TASK_TIMEOUT_MS, (delta) => {
                     const chunk = String(delta || "");
                     if (!chunk) return;
                     streamedSummaryText += chunk;
@@ -5318,23 +6074,21 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                         .then(() => writeStreamingSummaryPartial(streamedSummaryText, partialState, false));
                 }, null, { tabId });
                 await partialWritePromise.catch(() => {});
-                const summaryText = sanitizeSummaryOutput(aiRes.text || streamedSummaryText);
+                let summaryText = sanitizeSummaryOutput(aiRes.text || streamedSummaryText);
                 if (!summaryText) {
-                    logAI.error("summary_empty", {
+                    const retried = await retryEmptySummaryOnce({
+                        settings,
+                        prompt: summaryPrompt,
+                        tabId,
                         bvid,
-                        task: "summary",
-                        code: "SUMMARY_EMPTY_RESPONSE",
-                        provider: settings.provider,
-                        model: settings.model || "",
-                        detail: {
-                            mode: "quality",
-                            response_text_chars: String(aiRes.text || "").length,
-                            streamed_text_chars: String(streamedSummaryText || "").length,
-                            subtitle_chars: summarySubtitleText.length,
-                            prompt_chars: summaryPrompt.length
-                        }
+                        mode: "quality",
+                        requestStream: true,
+                        taskContext,
+                        initialAIResponse: aiRes,
+                        initialDurationMs: aiRes.metrics?.latencyMs || 0
                     });
-                    throw createSummaryEmptyError();
+                    aiRes = retried.aiRes;
+                    summaryText = retried.summaryText;
                 }
                 await writeStreamingSummaryPartial(summaryText, partialState, true);
                 results.summary = { ok: true, data: summaryText, error: null };
@@ -5399,6 +6153,7 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
         const effectiveSegmentsSubtitleText = segmentPromptPlan.subtitleText || segmentsSubtitleText || summarySubtitleText;
         logAIPromptBuilt({ bvid, task: "segments", provider: settings.provider, mode: "quality", prompt: segmentsPrompt, promptSettings: settings.promptSettings });
         tasks.push((async () => {
+            let initialAttemptDurationMs = 0;
             try {
                 logAI.info("ai_request_start", {
                     bvid,
@@ -5425,16 +6180,19 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                     message: segmentPromptPlan.compact ? "保守 Prompt 主请求生成中" : "原 Prompt 主请求生成中"
                 }, "开始 quality 分段主请求", { resetEvents: true });
                 const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: segmentsPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+                initialAttemptDurationMs = aiRes.metrics?.latencyMs || 0;
                 await recordSegmentsDebugState(tabId, {
                     status: "running",
                     stage: "parsing",
                     mode: "quality",
                     message: "主响应已返回，正在解析分段"
                 }, "quality 主响应已返回，开始解析分段");
-                const parsed = robustJSONParse(aiRes.text);
+                const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
+                    ? null
+                    : robustJSONParse(aiRes.text);
                 if (!parsed) {
                     throw attachSentryContext(
-                        createSegmentsParseError(aiRes.text, aiRes.metrics),
+                        createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
                         buildAIResponseSentryContext({
                             task: "segments",
                             bvid,
@@ -5488,7 +6246,7 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                             purpose: "segments",
                             mode: "quality",
                             payload_chars: effectiveSegmentsSubtitleText.length,
-                            max_chars: 40000,
+                            max_chars: MAX_SEGMENTS_SUBTITLE_CHARS,
                             no_timestamp: isNoTimestampSubtitleCache(cache),
                             raw_count: Array.isArray(cache?.rawSubtitle) ? cache.rawSubtitle.length : 0,
                             processed_count: Array.isArray(cache?.processedSubtitle) ? cache.processedSubtitle.length : 0
@@ -5531,7 +6289,8 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                             guided,
                             customPrompts,
                             mode: "quality",
-                            originalError: segmentError
+                            originalError: segmentError,
+                            initialDurationMs: initialAttemptDurationMs
                         });
                         results.segments = { ok: true, data: normalized, error: null };
                         await applySummarySegmentsResults(tabId, bvid, { segments: results.segments }, { taskContext });
@@ -5614,7 +6373,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
         guided,
         customPrompts,
         taskContext: promptTaskContext,
-        segmentsPromptOverride: isSegmentPromptTestEnabled(settings) ? SEGMENTS_AD_TEST_PROMPT : ""
+        segmentsPromptOverride: ""
     });
     logAIPromptBuilt({
         bvid,
@@ -5712,10 +6471,12 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                 mode: "efficiency",
                 message: "联合响应已返回，正在解析分段"
             }, "efficiency 联合响应已返回，开始解析分段");
-            const parsed = robustJSONParse(segmentsSection.content);
+            const parsed = isLikelyTruncatedSegmentOutput(segmentsSection.content, aiRes.metrics, aiRes.responseMeta)
+                ? null
+                : robustJSONParse(segmentsSection.content);
             if (!parsed) {
                 segmentsFailureError = attachSentryContext(
-                    createSegmentsParseError(segmentsSection.content, aiRes.metrics),
+                    createSegmentsParseError(segmentsSection.content, aiRes.metrics, aiRes.responseMeta),
                     buildAIResponseSentryContext({
                         task: "segments",
                         bvid,
@@ -5768,9 +6529,21 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                 }
             }
         }
-        if (!segmentsResolved) {
+        if (!segmentsResolved
+            && String(segmentsFailureError?.code || "") !== "SEGMENTS_OUTPUT_TRUNCATED"
+            && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_local_json_repair", true)) {
             const jsonMatch = fullText.match(/\[\s*\{[\s\S]*?\}\s*\]/);
             if (jsonMatch) {
+                const localRepairStartedAt = Date.now();
+                const localRepairTrigger = segmentsFailureError || createSegmentsMissingProtocolError(fullText, aiRes.metrics, aiRes.responseMeta);
+                await reportTaskInitialFailure({
+                    settings,
+                    taskContext,
+                    component: "segments",
+                    bvid,
+                    error: localRepairTrigger,
+                    durationMs: aiRes.metrics?.latencyMs || 0
+                });
                 const parsed = robustJSONParse(jsonMatch[0]);
                 const normalized = normalizeSegments(parsed, cache, { bvid, task: "segments", mode: "efficiency", fallback: "loose_json_array" });
                 if (normalized.length) {
@@ -5784,11 +6557,22 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                         subtitlePayload: getSubtitlePayloadMeta(cache, subtitleText, subtitlePayloadOptions)
                     });
                 }
+                await reportTaskRecoveryFinished({
+                    settings,
+                    taskContext,
+                    component: "segments",
+                    bvid,
+                    strategy: "local_json_extract",
+                    triggerError: localRepairTrigger,
+                    resultError: normalized.length ? null : createSegmentsNormalizeError(parsed),
+                    success: normalized.length > 0,
+                    durationMs: Date.now() - localRepairStartedAt
+                });
             }
         }
         if (!segmentsResolved && !segmentsFailureError) {
             segmentsFailureError = attachSentryContext(
-                createSegmentsMissingProtocolError(fullText, aiRes.metrics),
+                createSegmentsMissingProtocolError(fullText, aiRes.metrics, aiRes.responseMeta),
                 buildAIResponseSentryContext({
                     task: "segments",
                     bvid,
@@ -5812,11 +6596,104 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                 }
             });
         }
-        if (!segmentsResolved) {
+        if (!segmentsResolved
+            && !hasAttemptedSegmentsAIRepair(taskContext)
+            && canRepairSegmentsResponseWithAI(segmentsFailureError)
+            && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_ai_json_repair", true)) {
+            await reportTaskInitialFailure({
+                settings,
+                taskContext,
+                component: "segments",
+                bvid,
+                error: segmentsFailureError,
+                durationMs: aiRes.metrics?.latencyMs || 0
+            });
+            markSegmentsAIRepairAttempted(taskContext);
+            const repairStartedAt = Date.now();
+            const repairTriggerError = segmentsFailureError;
+            await recordSegmentsDebugState(tabId, {
+                status: "retrying",
+                stage: "ai_json_repair",
+                strategy: "ai_json_repair",
+                code: String(segmentsFailureError?.code || ""),
+                mode: "efficiency",
+                message: "正在用 AI 修复分段 JSON/字段结构"
+            }, "开始专用 AI JSON/结构修复");
             try {
-                const fallbackPrompt = isSegmentPromptTestEnabled(settings)
-                    ? buildSegmentsAdTestPrompt({ subtitle: subtitleText, taskContext: promptTaskContext })
-                    : buildPrompt({ type: "segments", subtitle: subtitleText, mode, guided, customPrompts, taskContext: promptTaskContext });
+                const repaired = await retrySegmentsWithAIRepair({
+                    tabId,
+                    bvid,
+                    cache,
+                    settings,
+                    mode: "efficiency",
+                    originalError: segmentsFailureError
+                });
+                results.segments = { ok: true, data: repaired.segments, error: null };
+                segmentsResolved = true;
+                segmentsFailureError = null;
+                await applySummarySegmentsResults(tabId, bvid, { segments: results.segments }, { taskContext });
+                await appendMetrics(bvid, null, "segments", repaired.metrics, taskContext);
+                await reportFeatureUsage("segments", bvid, settings, repaired.metrics);
+                await reportTaskRecoveryFinished({
+                    settings,
+                    taskContext,
+                    component: "segments",
+                    bvid,
+                    strategy: "ai_json_repair",
+                    triggerError: repairTriggerError,
+                    success: true,
+                    durationMs: Date.now() - repairStartedAt,
+                    metrics: repaired.metrics
+                });
+                await recordSegmentsDebugState(tabId, {
+                    status: "recovered",
+                    stage: "recovered",
+                    strategy: "ai_json_repair",
+                    message: "AI JSON/结构修复成功"
+                }, "专用 AI JSON/结构修复成功");
+            } catch (repairError) {
+                segmentsFailureError = mergeSegmentsResponseAttempts(
+                    normalizeSegmentsTaskError(repairError),
+                    segmentsFailureError
+                );
+                await reportTaskRecoveryFinished({
+                    settings,
+                    taskContext,
+                    component: "segments",
+                    bvid,
+                    strategy: "ai_json_repair",
+                    triggerError: repairTriggerError,
+                    resultError: segmentsFailureError,
+                    success: false,
+                    durationMs: Date.now() - repairStartedAt
+                });
+                await recordSegmentsDebugState(tabId, {
+                    status: "retry_failed",
+                    stage: "retry_failed",
+                    strategy: "ai_json_repair",
+                    code: String(segmentsFailureError?.code || ""),
+                    message: segmentsFailureError?.message || "AI JSON/结构修复失败"
+                }, "专用 AI JSON/结构修复失败，继续尝试整份分段重试");
+            }
+        }
+        if (!segmentsResolved
+            && String(segmentsFailureError?.code || "") !== "SEGMENTS_OUTPUT_TRUNCATED"
+            && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_primary_retry", true)) {
+            await reportTaskInitialFailure({
+                settings,
+                taskContext,
+                component: "segments",
+                bvid,
+                error: segmentsFailureError,
+                durationMs: aiRes.metrics?.latencyMs || 0
+            });
+            const fallbackStartedAt = Date.now();
+            const fallbackTriggerError = segmentsFailureError;
+            let fallbackRecoverySuccess = false;
+            let fallbackRecoveryError = null;
+            let fallbackRecoveryMetrics = {};
+            try {
+                const fallbackPrompt = buildPrompt({ type: "segments", subtitle: subtitleText, mode, guided, customPrompts, taskContext: promptTaskContext });
                 logAI.warn("segments_merged_parse_fallback_start", {
                     bvid,
                     task: "segments",
@@ -5829,10 +6706,13 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                     }
                 });
                 const fallbackRes = await callAIWithTimeout(settings, [{ role: "user", content: fallbackPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
-                const parsed = robustJSONParse(fallbackRes.text);
+                fallbackRecoveryMetrics = fallbackRes.metrics || {};
+                const parsed = isLikelyTruncatedSegmentOutput(fallbackRes.text, fallbackRes.metrics, fallbackRes.responseMeta)
+                    ? null
+                    : robustJSONParse(fallbackRes.text);
                 if (!parsed) {
                     const fallbackParseError = attachSentryContext(
-                        createSegmentsParseError(fallbackRes.text, fallbackRes.metrics),
+                        createSegmentsParseError(fallbackRes.text, fallbackRes.metrics, fallbackRes.responseMeta),
                         buildAIResponseSentryContext({
                             task: "segments",
                             bvid,
@@ -5845,6 +6725,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                             metrics: fallbackRes.metrics
                         })
                     );
+                    fallbackRecoveryError = fallbackParseError;
                     segmentsFailureError = mergeSegmentsResponseAttempts(fallbackParseError, segmentsFailureError);
                     logAI.error("segments_merged_fallback_parse_error", {
                         bvid,
@@ -5862,6 +6743,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                         results.segments = { ok: true, data: normalized, error: null };
                         segmentsResolved = true;
                         segmentsFailureError = null;
+                        fallbackRecoverySuccess = true;
                         logSegmentQualitySummary(bvid, normalized, cache, {
                             task: "segments",
                             mode: "efficiency_fallback",
@@ -5898,10 +6780,12 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                                 extra: { parsed_item_count: getSegmentCandidateList(parsed)?.length || 0 }
                             })
                         );
+                        fallbackRecoveryError = fallbackNormalizeError;
                         segmentsFailureError = mergeSegmentsResponseAttempts(fallbackNormalizeError, segmentsFailureError);
                     }
                 }
             } catch (fallbackError) {
+                fallbackRecoveryError = fallbackError;
                 segmentsFailureError = mergeSegmentsResponseAttempts(normalizeSegmentsTaskError(fallbackError), segmentsFailureError);
                 logAI.warn("segments_merged_parse_fallback_failed", buildFailureLog(fallbackError, {
                     task: "segments",
@@ -5913,6 +6797,18 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                     }
                 }));
             }
+            await reportTaskRecoveryFinished({
+                settings,
+                taskContext,
+                component: "segments",
+                bvid,
+                strategy: "primary_retry",
+                triggerError: fallbackTriggerError,
+                resultError: fallbackRecoveryError || segmentsFailureError,
+                success: fallbackRecoverySuccess,
+                durationMs: Date.now() - fallbackStartedAt,
+                metrics: fallbackRecoveryMetrics
+            });
         }
         if (!segmentsResolved) {
             if (shouldAutoRetrySegmentsError(segmentsFailureError)) {
@@ -5927,7 +6823,8 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                     guided,
                     customPrompts,
                     mode: "efficiency",
-                    originalError: segmentsFailureError
+                    originalError: segmentsFailureError,
+                    initialDurationMs: aiRes.metrics?.latencyMs || 0
                 });
                 results.segments = { ok: true, data: retriedSegments, error: null };
                 segmentsResolved = true;
@@ -5962,6 +6859,36 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
             segmentCount: Array.isArray(results?.segments?.data) ? results.segments.data.length : 0,
             message: "分段生成完成"
         }, `efficiency 分段成功，共 ${Array.isArray(results?.segments?.data) ? results.segments.data.length : 0} 段`);
+        if (!results.summary.ok) {
+            const summaryPrompt = buildPrompt({
+                type: "summary",
+                subtitle: subtitleText,
+                mode,
+                guided,
+                customPrompts,
+                taskContext: promptTaskContext
+            });
+            try {
+                const retried = await retryEmptySummaryOnce({
+                    settings,
+                    prompt: summaryPrompt,
+                    tabId,
+                    bvid,
+                    mode: "efficiency",
+                    requestStream: true,
+                    taskContext,
+                    initialAIResponse: aiRes,
+                    initialDurationMs: aiRes.metrics?.latencyMs || 0
+                });
+                results.summary = { ok: true, data: retried.summaryText, error: null };
+                await applySummarySegmentsResults(tabId, bvid, { summary: results.summary }, { taskContext });
+                await appendMetrics(bvid, null, "summary", retried.aiRes.metrics, taskContext);
+                await reportFeatureUsage("summary", bvid, settings, retried.aiRes.metrics);
+            } catch (summaryError) {
+                results.summary = { ok: false, data: null, error: summaryError };
+                await applySummarySegmentsResults(tabId, bvid, { summary: results.summary }, { taskContext });
+            }
+        }
         if (results.summary.ok) {
             logSummaryQualitySummary(bvid, String(results.summary.data || ""), {
                 subtitleChars: subtitleText.length,
@@ -6168,7 +7095,7 @@ function buildRawAdEvidencePayload(cache, maxChars = 8000) {
     return lines.join("\n").slice(0, maxChars);
 }
 
-function buildCompactSegmentsSubtitlePayload(cache, maxChars = 40000) {
+function buildCompactSegmentsSubtitlePayload(cache, maxChars = MAX_SEGMENTS_SUBTITLE_CHARS) {
     const raw = Array.isArray(cache?.rawSubtitle) ? cache.rawSubtitle : [];
     if (!raw.length) return "";
     const lines = [];
@@ -7119,6 +8046,7 @@ function buildRequestMetrics(settings, tokenInfo, latencyMs, rateLimitInfo = nul
         tokens: tokenInfo.total,
         inputTokens: tokenInfo.input,
         outputTokens: tokenInfo.output,
+        maxOutputTokens: Number(settings?.maxOutputTokens || 4096),
         provider,
         model,
         modelScopeRemaining: rateLimitInfo?.modelRemaining ?? null,
@@ -7805,6 +8733,9 @@ function isEqualJSON(a, b) {
 
 function normalizeSettings(settings) {
     const base = settings && typeof settings === "object" ? { ...settings } : {};
+    delete base.remoteConfig;
+    delete base.providerCatalog;
+    delete base.segmentPromptVariant;
     delete base.customAsrBaseUrl;
     delete base.customAsrApiKey;
     delete base.customAsrModel;
@@ -7860,8 +8791,6 @@ function normalizeSettings(settings) {
     const pluginDisplayFeatureSeen = Object.prototype.hasOwnProperty.call(base, "pluginDisplayFeatureSeen")
         ? !!base.pluginDisplayFeatureSeen
         : Object.keys(base).length === 0;
-    const segmentPromptVariantRaw = String(base.segmentPromptVariant || DEFAULT_SETTINGS.segmentPromptVariant || "test").toLowerCase();
-    const segmentPromptVariant = segmentPromptVariantRaw === "original" ? "original" : "test";
     const storedSentryDsn = String(base.sentryDsn || "").trim();
     const sentryDsn = !storedSentryDsn || LEGACY_SENTRY_DSNS.has(storedSentryDsn)
         ? DEFAULT_SENTRY_DSN
@@ -7904,7 +8833,6 @@ function normalizeSettings(settings) {
         prefMode,
         pluginDisplayMode,
         pluginDisplayFeatureSeen,
-        segmentPromptVariant,
         disableCloudCacheRead
     };
 }
@@ -7924,7 +8852,7 @@ function hasTaskResult(cache, task) {
 function getTaskModelName(settings) {
     const configured = String(settings?.model || "").trim();
     if (configured) return configured;
-    const provider = PROVIDERS[settings?.provider] || {};
+    const provider = settings?.providerCatalog?.[settings?.provider] || PROVIDERS[settings?.provider] || {};
     return String(provider.model || "").trim();
 }
 
@@ -8709,6 +9637,7 @@ function withPromptSettings(settings, promptSettings) {
 }
 
 async function getResolvedSettings() {
+    const remoteConfig = await ensureRemoteConfigLoaded();
     const { settings } = await chrome.storage.local.get(["settings"]);
     const normalizedSettings = normalizeSettings(settings);
     const { promptSettings } = await chrome.storage.sync.get(["promptSettings"]);
@@ -8721,7 +9650,11 @@ async function getResolvedSettings() {
         });
         await chrome.storage.sync.set({ promptSettings: normalizedPromptSettings });
     }
-    return withPromptSettings(normalizedSettings, normalizedPromptSettings);
+    return withPromptSettings({
+        ...normalizedSettings,
+        remoteConfig,
+        providerCatalog: buildEffectiveProviderCatalog(PROVIDERS, remoteConfig, normalizedSettings.provider)
+    }, normalizedPromptSettings);
 }
 
 function logAIPromptBuilt({ bvid, task, provider, mode, prompt, promptSettings }) {

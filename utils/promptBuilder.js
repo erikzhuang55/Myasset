@@ -23,83 +23,6 @@ SEGMENTS 部分必须输出 JSON 数组，每个对象必须包含以下字段�
 [{"start":0,"end":105,"start_line":0,"end_line":40,"label":"案件引入与背景介绍","type":"content"},{"start":407,"end":520,"start_line":120,"end_line":145,"label":"品牌推广","type":"ad","ad_start_line":120,"ad_end_line":145}]
 `.trim();
 
-export const SEGMENTS_AD_TEST_PROMPT = `
-你是一个 B 站视频分段助手。请基于字幕，把视频划分为适合进度条展示的章节，并识别广告片段。
-
-【输入说明】
-字幕每行格式如下：
-#行号 [开始时间-结束时间] 字幕内容
-
-【任务】
-1. 按视频内容变化划分章节。
-2. 识别广告片段。
-3. 必须覆盖整个视频，从第一行字幕到最后一行字幕。
-4. 不要只分析前半段，最后一个章节必须覆盖到字幕最后一行附近。
-
-【分段要求】
-- 10 分钟以内：4-7 段。
-- 10-25 分钟：6-10 段。
-- 25-45 分钟：8-12 段。
-- 45 分钟以上：10-16 段。
-- 遇到新案件、新人物、新阶段、新证据、新观点、结论变化时，应拆成新段。
-- 普通正文段 type 为 "content"。
-- 广告段 type 为 "ad"。
-
-【广告判断】
-广告是指视频主线暂停，开始推广产品、服务、课程、APP、活动、优惠、购买/下载/注册链接等内容。
-
-广告段必须返回：
-- ad_start_line：广告开始的字幕行号。
-- ad_end_line：广告结束的字幕行号。
-
-广告开始行：
-第一句明确进入推广内容的字幕。
-
-广告结束行：
-最后一句仍属于推广内容的字幕。
-
-广告结束规则补充：
-- 广告段中的情绪铺垫、送礼场景、亲情表达、用户痛点共鸣、使用体验延伸，仍属于广告的一部分。
-- 不要因为某几句没有出现品牌名、产品名或购买词，就判定广告结束。
-- 只有当字幕明确回到视频原本主题、案件、故事、教程或正文主线时，才算广告结束。
-- 如果广告后出现“回到正题 / 说回案件 / 继续刚才的话题 / 接着讲故事 / 话说回来”等明显回归主线表达，应把这些句子作为正文，不算广告。
-
-【输出格式】
-只输出 JSON 数组，不要 Markdown，不要解释。
-
-普通段格式：
-{
-  "start": 秒数,
-  "end": 秒数,
-  "start_line": 行号,
-  "end_line": 行号,
-  "label": "简短章节标题",
-  "type": "content"
-}
-
-广告段格式：
-{
-  "start": 秒数,
-  "end": 秒数,
-  "start_line": 行号,
-  "end_line": 行号,
-  "label": "广告：产品或服务名称",
-  "type": "ad",
-  "ad_start_line": 行号,
-  "ad_end_line": 行号
-}
-
-【重要约束】
-- start/end 必须来自字幕时间，不要凭空估算。
-- start/end/start_line/end_line/ad_start_line/ad_end_line 必须是合法 JSON 数字；禁止输出 III、NaN、Infinity、中文数字或其他未加引号的非数字 token。
-- start_line/end_line 必须来自字幕开头的 #行号；普通正文和广告都必须填写。
-- 系统会优先使用 start_line/end_line 映射最终 start/end，start/end 只作为兼容字段。
-- 所有分段按时间升序排列。
-- 不要重叠。
-- 不要漏掉视频后半段。
-- 最后一段 end 必须接近最后一行字幕的结束时间。
-`.trim();
-
 export const OUTPUT_PROTOCOL = `
 【输出协议 - 严格执行】
 你必须严格按照以下格式输出，任何偏离都会导致解析失败：
@@ -458,23 +381,6 @@ export function buildPrompt({
         videoMetaBlock,
         subtitleBlock,
         formatRule
-    ].filter(Boolean).join("\n\n");
-}
-
-export function buildSegmentsAdTestPrompt({
-    subtitle,
-    taskContext = {}
-}) {
-    const videoMetaBlock = buildVideoMetaBlock(taskContext);
-    const durationHardRule = buildDurationHardRule(taskContext);
-    const noTimestampRule = buildNoTimestampTaskRule("segments", taskContext);
-    const subtitleBlock = `【字幕内容】\n${subtitle}`.trim();
-    return [
-        SEGMENTS_AD_TEST_PROMPT,
-        noTimestampRule,
-        durationHardRule,
-        videoMetaBlock,
-        subtitleBlock
     ].filter(Boolean).join("\n\n");
 }
 

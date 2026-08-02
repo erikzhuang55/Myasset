@@ -45,8 +45,52 @@ describe("providerAdapter", () => {
     expect(JSON.parse(init.body)).toMatchObject({
       model: "gpt-test",
       messages: [{ role: "user", content: "hello" }],
+      max_tokens: 4096,
       stream: false
     });
+  });
+
+  it("uses a remotely supplied provider catalog for requests", async () => {
+    const fetchMock = vi.fn(async () => mockJsonResponse({
+      choices: [{ message: { content: "remote" } }]
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await callAI("remote-provider", {
+      provider: "remote-provider",
+      apiKey: "remote-key",
+      model: "remote-model",
+      providerCatalog: {
+        "remote-provider": {
+          name: "Remote Provider",
+          baseUrl: "https://remote.example.com/v1",
+          model: "remote-model",
+          headerKey: "Authorization",
+          tokenPrefix: "Bearer "
+        }
+      }
+    }, [{ role: "user", content: "hello" }]);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://remote.example.com/v1/chat/completions");
+    expect(init.headers.Authorization).toBe("Bearer remote-key");
+  });
+
+  it("allows a one-off higher output token limit", async () => {
+    const fetchMock = vi.fn(async () => mockJsonResponse({
+      choices: [{ message: { content: "完整分段" }, finish_reason: "stop" }]
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await callAI("openai", {
+      provider: "openai",
+      apiKey: "sk-test",
+      model: "gpt-test",
+      maxOutputTokens: 8192
+    }, [{ role: "user", content: "生成分段" }]);
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body).max_tokens).toBe(8192);
   });
 
   it("keeps the raw provider response when OpenAI-compatible content is empty", async () => {
@@ -168,7 +212,8 @@ describe("providerAdapter", () => {
     expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent?key=gemini-key");
     expect(init.headers.Authorization).toBeUndefined();
     expect(JSON.parse(init.body)).toEqual({
-      contents: [{ parts: [{ text: "字幕内容" }] }]
+      contents: [{ parts: [{ text: "字幕内容" }] }],
+      generationConfig: { maxOutputTokens: 4096 }
     });
   });
 
@@ -321,7 +366,8 @@ describe("providerAdapter", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-test:streamGenerateContent?key=gemini-key&alt=sse");
     expect(JSON.parse(init.body)).toEqual({
-      contents: [{ parts: [{ text: "hello" }] }]
+      contents: [{ parts: [{ text: "hello" }] }],
+      generationConfig: { maxOutputTokens: 4096 }
     });
     expect(result.text).toBe("第一第二");
     expect(result.usage).toEqual({ prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 });
@@ -531,6 +577,52 @@ describe("providerAdapter", () => {
     }, [{ role: "user", content: "hello" }])).rejects.toMatchObject({
       code: "HTTP_401",
       status: 401
+    });
+  });
+
+  it("maps a custom provider HTML response to an actionable error", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+      text: async () => "<!doctype html><html><body>Proxy landing page</body></html>"
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(callAI("custom", {
+      provider: "custom",
+      customProtocol: "openai",
+      customBaseUrl: "https://proxy.example.com",
+      apiKey: "custom-key",
+      model: "custom-model"
+    }, [{ role: "user", content: "hello" }])).rejects.toMatchObject({
+      code: "PROVIDER_INVALID_RESPONSE",
+      responseKind: "html",
+      responseContentType: "text/html; charset=utf-8",
+      isCustomProvider: true,
+      requestEntry: "callAI"
+    });
+  });
+
+  it("maps a custom provider HTTP error page to the same actionable error", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 404,
+      headers: new Headers({ "content-type": "text/html" }),
+      text: async () => "<html><body>Not Found</body></html>"
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(callAI("custom", {
+      provider: "custom",
+      customProtocol: "openai",
+      customBaseUrl: "https://proxy.example.com/wrong-path",
+      apiKey: "custom-key",
+      model: "custom-model"
+    }, [{ role: "user", content: "hello" }])).rejects.toMatchObject({
+      code: "PROVIDER_INVALID_RESPONSE",
+      status: 404,
+      responseKind: "html"
     });
   });
 });
