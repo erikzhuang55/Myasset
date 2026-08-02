@@ -205,7 +205,6 @@ export const TASK_PROMPTS = {
    - 除非视频本身确实长期只讲同一件事，否则普通 content 章节尽量不要超过 5–7 分钟。
 2. 每个章节需要有：
    - 一个简短清晰的小标题，像视频进度条章节标题
-   - 一段精炼的内容概述，概括本段核心信息
    - start_line 和 end_line，必须直接来自逐句字幕前的 #编号
 3. 章节必须按时间顺序排列，并尽量连续覆盖视频内容，不要出现明显重叠或错序。
    - 但广告段例外：广告的 start 和 end 必须精确对应字幕中推广内容的实际边界，
@@ -445,12 +444,13 @@ export function buildPrompt({
             formatRule
         ].filter(Boolean).join("\n\n");
     }
-    const toneRule = TONE_PROMPTS[guided.tone || "balanced"] || "";
-    const detailRule = DETAIL_PROMPTS[guided.detail || "normal"] || "";
+    const isSummaryTask = type === "summary";
+    const toneRule = isSummaryTask ? (TONE_PROMPTS[guided.tone || "balanced"] || "") : "";
+    const detailRule = isSummaryTask ? (DETAIL_PROMPTS[guided.detail || "normal"] || "") : "";
     return [
         BASE_PROMPT,
         TASK_PROMPTS[type],
-        "【输出风格要求】",
+        isSummaryTask ? "【输出风格要求】" : "",
         toneRule,
         detailRule,
         noTimestampRule,
@@ -483,7 +483,6 @@ export function buildCompactSegmentsPrompt({
     taskContext = {}
 }) {
     const videoMetaBlock = buildVideoMetaBlock(taskContext);
-    const durationHardRule = buildDurationHardRule(taskContext);
     const noTimestampRule = buildNoTimestampTaskRule("segments", taskContext);
     const subtitleBlock = `【字幕内容】\n${subtitle}`.trim();
     return [
@@ -507,7 +506,6 @@ export function buildCompactSegmentsPrompt({
         "广告段只允许字段：{\"start_line\":120,\"end_line\":145,\"label\":\"广告推广\",\"type\":\"ad\",\"ad_start_line\":120,\"ad_end_line\":145}",
         "禁止输出 start/end 秒数，系统会用 line_id 自动映射时间。",
         noTimestampRule,
-        durationHardRule,
         videoMetaBlock,
         subtitleBlock
     ].filter(Boolean).join("\n\n");
@@ -531,13 +529,12 @@ export function buildMergedSummarySegmentsPrompt({
     const segmentsPrompt = mode === "custom"
         ? (customPrompts.segments || TASK_PROMPTS.segments || "")
         : (TASK_PROMPTS.segments || "");
-    const parts = [BASE_PROMPT];
+    const parts = [BASE_PROMPT, "【任务1：视频总结】", summaryPrompt];
     if (mode !== "custom") {
         const toneRule = TONE_PROMPTS[guided.tone || "balanced"] || "";
         const detailRule = DETAIL_PROMPTS[guided.detail || "normal"] || "";
-        parts.push("【输出风格要求】", toneRule, detailRule);
+        parts.push("【任务1输出风格要求】", toneRule, detailRule);
     }
-    parts.push("【任务1：视频总结】", summaryPrompt);
     parts.push("【任务2：视频分段】", segmentsPromptOverride || segmentsPrompt, noTimestampRule, durationHardRule);
     parts.push(MERGED_SEGMENTS_FORMAT_RULE);
     parts.push(videoMetaBlock);

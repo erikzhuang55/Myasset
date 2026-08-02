@@ -33,6 +33,8 @@ describe("promptBuilder", () => {
     expect(prompt).toContain("视频总时长 1200 秒");
     expect(prompt).toContain("最后一个章节的 start 必须大于 900 秒");
     expect(prompt).toContain("只输出 JSON 数组");
+    expect(prompt).not.toContain("一段精炼的内容概述");
+    expect(prompt).not.toContain("输出 3-4 个加粗小标题");
   });
 
   it("builds merged summary and segments prompt with protocol tags", () => {
@@ -44,6 +46,7 @@ describe("promptBuilder", () => {
     expect(prompt).toContain("<<<SUMMARY_START>>>");
     expect(prompt).toContain("<<<SEGMENTS_START>>>");
     expect(prompt).toContain("【任务1：视频总结】");
+    expect(prompt).toContain("【任务1输出风格要求】");
     expect(prompt).toContain("【任务2：视频分段】");
   });
 
@@ -57,6 +60,7 @@ describe("promptBuilder", () => {
     expect(prompt).toContain("禁止输出 start/end 秒数");
     expect(prompt).toContain("\"start_line\"");
     expect(prompt).toContain("#9 结尾");
+    expect(prompt).not.toContain("最后一个章节的 start 必须大于");
   });
 
   it("asks rumor checks to return timestamp_sec as integer seconds", () => {
