@@ -2282,6 +2282,624 @@ input[type="range"]:active::-webkit-slider-thumb {
     word-break: break-word;
 }
 
+.debug-tools-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+}
+
+.debug-tools-title,
+.debug-header-actions,
+.debug-tool-card-head,
+.debug-result-head,
+.debug-result-meta,
+.debug-card-actions,
+.debug-log-view-switch {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.debug-tools-title .empty-text {
+    margin-top: 3px;
+}
+
+.debug-runtime-badge,
+.debug-risk-badge {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+}
+
+.debug-runtime-badge {
+    gap: 5px;
+    padding: 5px 8px;
+    color: #16794c;
+    background: #eaf8f1;
+}
+
+.debug-runtime-badge i {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #21a366;
+    box-shadow: 0 0 0 3px rgba(33, 163, 102, 0.12);
+}
+
+.debug-header-actions {
+    justify-content: flex-end;
+}
+
+.debug-header-actions .panel-btn {
+    height: 28px;
+    font-size: 11px;
+}
+
+.debug-tools-tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
+    margin: 0 10px;
+    padding: 4px;
+    border-radius: 10px;
+    background: #f1f4f8;
+}
+
+.debug-tools-tabs button,
+.debug-log-view-switch button {
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: #737a86;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.debug-tools-tabs button {
+    height: 30px;
+}
+
+.debug-tools-tabs button.active,
+.debug-log-view-switch button.active {
+    color: #18191c;
+    background: #fff;
+    box-shadow: 0 1px 4px rgba(18, 26, 38, 0.1);
+}
+
+.debug-tool-card,
+.debug-overview-hero,
+.debug-empty-card,
+.debug-result-card {
+    border: 1px solid #e8edf3;
+    border-radius: 10px;
+    background: #fff;
+}
+
+.debug-tool-card {
+    padding: 12px;
+}
+
+.debug-tool-card-head {
+    align-items: flex-start;
+    margin-bottom: 10px;
+}
+
+.debug-tool-card-head > div {
+    min-width: 0;
+}
+
+.debug-tool-card-head strong,
+.debug-tool-card-head span,
+.debug-scenario-row strong,
+.debug-scenario-row small {
+    display: block;
+}
+
+.debug-tool-card-head strong {
+    color: #18191c;
+    font-size: 13px;
+}
+
+.debug-tool-card-head > div > span {
+    margin-top: 2px;
+    color: #9499a0;
+    font-size: 10px;
+    line-height: 1.4;
+}
+
+.debug-risk-badge {
+    padding: 4px 7px;
+}
+
+.debug-risk-badge.safe {
+    color: #16794c;
+    background: #eaf8f1;
+}
+
+.debug-risk-badge.reversible {
+    color: #7a5b11;
+    background: #fff5d8;
+}
+
+.debug-risk-badge.network {
+    color: #a33b24;
+    background: #fff0eb;
+}
+
+.debug-risk-badge.state {
+    color: #465a9b;
+    background: #eef1ff;
+}
+
+.debug-field-label {
+    display: block;
+    margin: 10px 0 5px;
+    color: #61666d;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.debug-tool-card select,
+.debug-tool-card input[type="search"] {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    height: 32px;
+    padding: 0 9px;
+    border: 1px solid #dfe4eb;
+    border-radius: 7px;
+    outline: none;
+    background: #fff;
+    color: #18191c;
+    font-size: 11px;
+}
+
+.debug-tool-card select:focus,
+.debug-tool-card input[type="search"]:focus {
+    border-color: #fb7299;
+    box-shadow: 0 0 0 2px rgba(251, 114, 153, 0.1);
+}
+
+.debug-field-help {
+    margin-top: 5px;
+    color: #9499a0;
+    font-size: 10px;
+    line-height: 1.45;
+}
+
+.debug-card-actions {
+    justify-content: flex-start;
+    margin-top: 12px;
+}
+
+.debug-card-actions .panel-btn {
+    min-width: 86px;
+}
+
+.debug-scenario-list {
+    display: grid;
+    gap: 6px;
+}
+
+.debug-scenario-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    padding: 9px 10px;
+    border: 1px solid #edf0f4;
+    border-radius: 8px;
+    background: #fafbfc;
+    text-align: left;
+    cursor: pointer;
+}
+
+.debug-scenario-row:hover {
+    border-color: #f5b5c8;
+    background: #fff8fa;
+}
+
+.debug-scenario-row span {
+    min-width: 0;
+}
+
+.debug-scenario-row strong {
+    color: #30343b;
+    font-size: 11px;
+}
+
+.debug-scenario-row small {
+    margin-top: 2px;
+    color: #9499a0;
+    font-size: 10px;
+}
+
+.debug-scenario-row b {
+    flex-shrink: 0;
+    color: #fb7299;
+    font-size: 10px;
+}
+
+.debug-overview-hero {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
+}
+
+.debug-overview-hero > div {
+    min-width: 0;
+    padding: 12px;
+}
+
+.debug-overview-hero > div + div {
+    border-left: 1px solid #edf0f4;
+}
+
+.debug-overview-hero span,
+.debug-overview-hero strong,
+.debug-overview-hero small {
+    display: block;
+}
+
+.debug-overview-hero span,
+.debug-overview-hero small {
+    color: #9499a0;
+    font-size: 10px;
+}
+
+.debug-overview-hero strong {
+    margin: 4px 0;
+    overflow: hidden;
+    color: #18191c;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.debug-task-status-list,
+.debug-state-table {
+    display: grid;
+    gap: 1px;
+    overflow: hidden;
+    border: 1px solid #edf0f4;
+    border-radius: 8px;
+    background: #edf0f4;
+}
+
+.debug-task-status-list > div,
+.debug-state-table > div {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 9px;
+    background: #fafbfc;
+    font-size: 11px;
+}
+
+.debug-task-status-list span,
+.debug-state-table span {
+    color: #737a86;
+}
+
+.debug-task-status-list b,
+.debug-state-table strong {
+    overflow: hidden;
+    color: #30343b;
+    font-size: 10px;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.debug-task-status-list .status-done,
+.debug-task-status-list .status-success {
+    color: #168455;
+}
+
+.debug-task-status-list .status-error,
+.debug-task-status-list .status-timeout {
+    color: #d94b45;
+}
+
+.debug-task-status-list .status-processing,
+.debug-task-status-list .status-running,
+.debug-task-status-list .status-retrying {
+    color: #b36b00;
+}
+
+.debug-empty-card {
+    padding: 14px;
+    color: #9499a0;
+    font-size: 11px;
+    text-align: center;
+}
+
+.debug-result-card {
+    padding: 10px;
+    border-left-width: 3px;
+}
+
+.debug-result-card.passed {
+    border-left-color: #21a366;
+}
+
+.debug-result-card.failed {
+    border-left-color: #d94b45;
+}
+
+.debug-result-card.running {
+    border-left-color: #e6a23c;
+}
+
+.debug-result-card.cancelled,
+.debug-result-card.needs_config {
+    border-left-color: #8b93a1;
+}
+
+.debug-result-head {
+    margin-bottom: 7px;
+    color: #737a86;
+    font-size: 10px;
+}
+
+.debug-result-head span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.debug-result-head i {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+.debug-result-card > strong {
+    color: #30343b;
+    font-size: 12px;
+}
+
+.debug-result-card p {
+    margin: 6px 0 0;
+    color: #61666d;
+    font-size: 10px;
+    line-height: 1.5;
+}
+
+.debug-result-meta {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+.debug-result-meta span {
+    padding: 3px 6px;
+    border-radius: 5px;
+    background: #f3f5f7;
+    color: #737a86;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 9px;
+}
+
+.debug-quick-actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+}
+
+.debug-quick-actions .panel-btn {
+    min-width: 0;
+    padding: 0 5px;
+    font-size: 10px;
+}
+
+.debug-state-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.debug-state-grid > div {
+    padding: 7px;
+    border-radius: 7px;
+    background: #f7f8fa;
+    color: #61666d;
+    font-size: 10px;
+    line-height: 1.45;
+}
+
+.debug-details {
+    margin-top: 9px;
+    border-top: 1px solid #edf0f4;
+    color: #61666d;
+    font-size: 10px;
+}
+
+.debug-details summary {
+    padding: 9px 0 0;
+    color: #46515f;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.debug-boundary-group {
+    margin-top: 10px;
+}
+
+.debug-boundary-group > b {
+    color: #30343b;
+}
+
+.debug-boundary-row {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    gap: 7px;
+    margin-top: 5px;
+    line-height: 1.45;
+}
+
+.debug-boundary-row span {
+    min-width: 0;
+    word-break: break-word;
+}
+
+.debug-state-json {
+    max-height: 320px;
+    margin: 9px 0 0;
+    padding: 10px;
+    overflow: auto;
+    border-radius: 7px;
+    background: #111827;
+    color: #bfdbfe;
+    font-size: 10px;
+    white-space: pre-wrap;
+}
+
+.debug-log-tool-card {
+    padding: 10px;
+}
+
+.debug-log-filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.debug-log-filters input[type="search"] {
+    grid-column: 1 / -1;
+}
+
+.debug-log-failure-toggle {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #61666d;
+    font-size: 10px;
+}
+
+.debug-log-view-switch {
+    justify-content: flex-start;
+    margin-bottom: 8px;
+    padding: 3px;
+    border-radius: 7px;
+    background: #f1f4f8;
+}
+
+.debug-log-view-switch button {
+    height: 25px;
+    padding: 0 10px;
+}
+
+.debug-log-body:not(.raw) {
+    white-space: normal;
+}
+
+.debug-log-body.raw {
+    white-space: pre-wrap;
+}
+
+.debug-log-entry {
+    padding: 9px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.debug-log-entry:last-child {
+    border-bottom: 0;
+}
+
+.debug-log-entry-main {
+    display: grid;
+    grid-template-columns: 54px 40px 58px minmax(0, 1fr);
+    align-items: center;
+    gap: 5px;
+}
+
+.debug-log-entry-main time {
+    color: #94a3b8;
+}
+
+.debug-log-entry-main b {
+    overflow: hidden;
+    color: #93c5fd;
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.debug-log-entry-main strong {
+    min-width: 0;
+    color: #e5e7eb;
+    font-size: 10px;
+    word-break: break-word;
+}
+
+.debug-level-chip {
+    padding: 2px 4px;
+    border-radius: 4px;
+    background: rgba(148, 163, 184, 0.15);
+    color: #cbd5e1;
+    font-size: 8px;
+    text-align: center;
+}
+
+.debug-log-entry.level-error .debug-level-chip {
+    color: #fecaca;
+    background: rgba(239, 68, 68, 0.18);
+}
+
+.debug-log-entry.level-warn .debug-level-chip {
+    color: #fde68a;
+    background: rgba(245, 158, 11, 0.18);
+}
+
+.debug-log-entry-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 6px 0 0 59px;
+}
+
+.debug-log-entry-meta span {
+    padding: 2px 4px;
+    border-radius: 4px;
+    background: rgba(148, 163, 184, 0.12);
+    color: #9fb2ca;
+    font-size: 8px;
+}
+
+.debug-log-entry details {
+    margin: 6px 0 0 59px;
+    color: #94a3b8;
+}
+
+.debug-log-entry details summary {
+    cursor: pointer;
+}
+
+.debug-log-entry details pre {
+    margin: 5px 0 0;
+    color: #bfdbfe;
+    font-size: 9px;
+    white-space: pre-wrap;
+}
+
+.debug-log-empty {
+    padding: 30px 10px;
+    color: #94a3b8;
+    text-align: center;
+}
+
 .settings-tip {
     font-size: 11px;
     color: #9499a0;

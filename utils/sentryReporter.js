@@ -3,6 +3,9 @@ import { PROVIDERS } from "./providerAdapter.js";
 const SENSITIVE_KEY_PATTERN = /(api[_-]?key|authorization|token|secret|password|cookie|prompt|subtitle|content|message|messages|base[_-]?url|download[_-]?url|dsn|url)/i;
 const UNFILTERED_RAW_KEYS = new Set([
   "ai_response_raw",
+  "ai_provider_response_raw",
+  "response_text",
+  "provider_response",
   "subtitle_chars",
   "subtitleCount",
   "subtitle_line_count",
@@ -22,17 +25,36 @@ const IGNORED_ERROR_PATTERNS = [
   /暂无\s*raw\s*字幕/i,
   /用户取消/i,
   /user\s*cancel/i,
+  /已停止生成/i,
+  /本次未完成授权/i,
   /未授权访问该自定义\s*api\s*域名/i,
   /缺少自定义\s*api\s*地址/i,
   /自定义\s*provider\s*需要填写\s*base\s*url/i,
+  /base\s*url.*(?:格式不正确|必须使用\s*https|invalid)/i,
+  /自定义\s*(?:api\s*)?地址必须使用\s*https/i,
+  /failed to construct ['"]url['"]:\s*invalid url/i,
+  /未获取到视频字幕/i,
+  /file_error_no_space/i,
+  /resource::kquotabytes quota exceeded/i,
+  /a listener indicated an asynchronous response.*message channel closed/i,
+  /could not establish connection\. receiving end does not exist/i,
   /sentry\s*dsn/i,
   /ResizeObserver loop completed with undelivered notifications/i
 ];
 
+const IGNORED_ERROR_CODES = new Set([
+  "ABORTED",
+  "USER_CANCELLED",
+  "CONFIG_REQUIRED",
+  "VALIDATION_ERROR",
+  "MISSING_API_KEY",
+  "MISSING_SUBTITLE"
+]);
+
 export function shouldReportToSentry(errorInput, context = {}) {
   const message = getErrorMessage(errorInput);
   const code = String(errorInput?.code || context?.code || "").trim().toUpperCase();
-  if (["USER_CANCELLED", "CONFIG_REQUIRED", "VALIDATION_ERROR", "MISSING_API_KEY", "MISSING_SUBTITLE"].includes(code)) return false;
+  if (IGNORED_ERROR_CODES.has(code)) return false;
   return !IGNORED_ERROR_PATTERNS.some((pattern) => pattern.test(message));
 }
 
@@ -107,6 +129,10 @@ export function createSentryEvent(errorInput, context = {}, runtime = {}) {
       status: errorMeta.status,
       page_type: pageType,
       source: safeContext.source,
+      timeout_phase: safeContext.timeout_phase,
+      request_stream: typeof safeContext.request_stream === "boolean"
+        ? String(safeContext.request_stream)
+        : undefined,
       manifest_version: runtime.manifestVersion
     }),
     user: {

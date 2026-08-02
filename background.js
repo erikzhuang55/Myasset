@@ -37,6 +37,7 @@ import { reportToSentry } from "./utils/sentryReporter.js";
 import { createAppError, createHttpError, serializeAppError } from "./utils/appError.js";
 import { isSupabaseEnabled, supabaseRpc, supabaseSelect, supabaseWrite } from "./utils/supabaseClient.js";
 import { reportUsageEvent } from "./utils/usageEvents.js";
+import { createProviderRequestTiming } from "./utils/providerRequestTiming.js";
 import "./logger.js";
 
 let IS_DEBUG_MODE = false;
@@ -95,7 +96,8 @@ async function captureTaskFailureToSentry(errorInput, context = {}) {
         ...(errorInput.sentryContext && typeof errorInput.sentryContext === "object" ? errorInput.sentryContext : {}),
         ...(context && typeof context === "object" ? context : {})
     };
-    const mergedContext = await enrichTaskFailureContext(baseContext);
+    const failureContext = buildSegmentsFailureSentrySummary(errorInput, baseContext);
+    const mergedContext = await enrichTaskFailureContext(failureContext);
     errorInput.__sentryCaptured = true;
     return captureBackgroundError(errorInput, mergedContext);
 }
@@ -113,9 +115,50 @@ function buildAIResponseSentryContext({
     mode,
     source,
     responseText,
+    responseMeta,
     metrics,
     extra = {}
 } = {}) {
+    if (String(task || "") === "segments") {
+        const responseValue = String(responseText || "");
+        const trimmedValue = responseValue.trim();
+        const isNormalizeFailure = String(source || "").includes("normalize");
+        const isMissingProtocol = String(source || "").includes("missing");
+        const parsedItemCount = Number(extra?.parsed_item_count || 0) || 0;
+        const contextExtra = extra && typeof extra === "object" ? { ...extra } : {};
+        delete contextExtra.parsed_item_count;
+        const responseTextSnapshot = truncateSentryResponseText(responseValue, 8000, 4000);
+        const providerResponseSnapshot = !trimmedValue
+            ? truncateSentryResponseText(String(responseMeta?.rawResponse || ""), 5000, 3000)
+            : { text: "", truncated: false };
+        return {
+            task: "segments",
+            bvid: String(bvid || ""),
+            provider: String(provider || ""),
+            model: String(model || ""),
+            ai_response_mode: String(mode || ""),
+            ai_response_attempts: [{
+                attempt: 1,
+                strategy: resolveSegmentsAttemptStrategy(source, mode),
+                finish_reason: String(responseMeta?.finishReason || ""),
+                content_state: String(responseMeta?.contentState || (trimmedValue ? "text" : "empty")),
+                output_tokens: Number(metrics?.outputTokens || 0) || 0,
+                response_chars: responseValue.length,
+                reasoning_chars: Number(responseMeta?.reasoningChars || 0) || 0,
+                parse_result: isNormalizeFailure ? "valid_json" : (trimmedValue && !isMissingProtocol ? "invalid_json" : "not_run"),
+                normalize_result: isNormalizeFailure
+                    ? (parsedItemCount === 0 ? "empty_list" : "invalid_schema")
+                    : "not_run",
+                parsed_item_count: isNormalizeFailure ? parsedItemCount : undefined,
+                valid_segment_count: isNormalizeFailure ? 0 : undefined,
+                response_text_truncated: responseTextSnapshot.truncated,
+                response_text: responseTextSnapshot.text,
+                provider_response_truncated: providerResponseSnapshot.text ? providerResponseSnapshot.truncated : undefined,
+                provider_response: providerResponseSnapshot.text || undefined
+            }],
+            ...contextExtra
+        };
+    }
     return {
         task: String(task || ""),
         bvid: String(bvid || ""),
@@ -124,8 +167,70 @@ function buildAIResponseSentryContext({
         source: String(source || "ai_parse_failure"),
         ai_response_mode: String(mode || ""),
         ai_response_raw: String(responseText || ""),
+        ai_provider_response_raw: String(responseMeta?.rawResponse || ""),
+        ai_response_content_state: String(responseMeta?.contentState || ""),
+        ai_response_finish_reason: String(responseMeta?.finishReason || ""),
+        ai_response_choice_count: Number(responseMeta?.choiceCount || 0) || 0,
+        ai_response_reasoning_chars: Number(responseMeta?.reasoningChars || 0) || 0,
         ...getSegmentsResponseDiagnostics(responseText, metrics),
         ...(extra && typeof extra === "object" ? extra : {})
+    };
+}
+
+function truncateSentryResponseText(value, headChars, tailChars) {
+    const text = String(value || "");
+    const maxChars = Math.max(0, Number(headChars || 0) + Number(tailChars || 0));
+    if (!maxChars || text.length <= maxChars) return { text, truncated: false };
+    return {
+        text: `${text.slice(0, headChars)}\n...[中间内容已截断，原始响应共 ${text.length} 字符]...\n${text.slice(-tailChars)}`,
+        truncated: true
+    };
+}
+
+function resolveSegmentsAttemptStrategy(source, mode) {
+    const value = String(source || "");
+    if (value.includes("compact_retry")) return "compact_retry";
+    if (value.includes("primary_retry")) return "primary_retry";
+    if (value.includes("merged_fallback")) return "fallback";
+    if (value.includes("merged")) return "merged_primary";
+    if (value.includes("compact_primary") || String(mode || "").includes("compact")) return "compact_primary";
+    return "primary";
+}
+
+function mergeSegmentsResponseAttempts(nextError, previousError) {
+    if (!nextError || typeof nextError !== "object") return nextError;
+    const previousAttempts = Array.isArray(previousError?.sentryContext?.ai_response_attempts)
+        ? previousError.sentryContext.ai_response_attempts
+        : [];
+    const nextAttempts = Array.isArray(nextError?.sentryContext?.ai_response_attempts)
+        ? nextError.sentryContext.ai_response_attempts
+        : [];
+    if (!previousAttempts.length) return nextError;
+    let attempts = [...previousAttempts, ...nextAttempts];
+    if (attempts.length > 3) attempts = [attempts[0], ...attempts.slice(-2)];
+    attempts = attempts.map((attempt, index) => ({ ...attempt, attempt: index + 1 }));
+    return attachSentryContext(nextError, { ai_response_attempts: attempts });
+}
+
+function buildSegmentsFailureSentrySummary(errorInput, context = {}) {
+    const attempts = Array.isArray(context?.ai_response_attempts) ? context.ai_response_attempts : [];
+    if (String(context?.task || "") !== "segments" || !attempts.length) return context;
+    const code = String(errorInput?.code || "");
+    const summaryByCode = {
+        SEGMENTS_EMPTY_RESPONSE: ["empty_response", "模型没有返回可解析的正文"],
+        SEGMENTS_OUTPUT_TRUNCATED: ["output_truncated", "模型输出被截断"],
+        SEGMENTS_JSON_PARSE_FAILED: ["json_parse", "模型正文不是合法的分段 JSON"],
+        SEGMENTS_INVALID_SCHEMA: ["schema_validation", "JSON 解析成功，但字段结构不符合分段要求"],
+        SEGMENTS_EMPTY_LIST: ["empty_list", "模型返回了空分段数组"],
+        SEGMENTS_MISSING_PROTOCOL: ["missing_protocol", "联合生成结果中缺少分段标记"]
+    };
+    const [failureStage, failureReason] = summaryByCode[code] || ["segments_processing", errorInput?.message || "分段处理失败"];
+    return {
+        ...context,
+        failure_stage: failureStage,
+        failure_reason: failureReason,
+        failed_attempt: attempts.length,
+        attempt_count: attempts.length
     };
 }
 
@@ -144,7 +249,10 @@ function buildProviderRequestTelemetry(settings, timeoutMs, options = {}) {
         bypass_queue: !!options.bypassQueue,
         queue_size_at_start: Number(options.queueSizeAtStart || 0),
         active_count_at_start: Number(options.activeCountAtStart || 0),
-        elapsed_ms: Number(options.elapsedMs || 0) || undefined,
+        queue_wait_ms: Number(options.queueWaitMs || 0) || 0,
+        provider_request_ms: Number(options.providerRequestMs || 0) || undefined,
+        first_response_ms: Number(options.firstResponseMs || 0) || undefined,
+        timeout_phase: String(options.timeoutPhase || ""),
         first_response_received: options.firstResponseReceived === undefined ? undefined : !!options.firstResponseReceived
     };
 }
@@ -4220,6 +4328,7 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                     mode: "single",
                     source: "segments_single_parse",
                     responseText: aiRes.text,
+                    responseMeta: aiRes.responseMeta,
                     metrics: aiRes.metrics
                 })
             );
@@ -4258,7 +4367,9 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                     mode: "single",
                     source: "segments_single_normalize",
                     responseText: aiRes.text,
-                    metrics: aiRes.metrics
+                    responseMeta: aiRes.responseMeta,
+                    metrics: aiRes.metrics,
+                    extra: { parsed_item_count: getSegmentCandidateList(parsed)?.length || 0 }
                 })
             );
             return await retrySegmentsWithAutoFallbacks({
@@ -4303,6 +4414,7 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                 mode: "single",
                 source: "rumors_parse",
                 responseText: aiRes.text,
+                responseMeta: aiRes.responseMeta,
                 metrics: aiRes.metrics
             })
         );
@@ -4763,6 +4875,7 @@ async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, ta
                 mode: `${mode}_compact_retry`,
                 source: "segments_compact_retry_parse",
                 responseText: aiRes.text,
+                responseMeta: aiRes.responseMeta,
                 metrics: aiRes.metrics
             })
         );
@@ -4789,7 +4902,9 @@ async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, ta
                 mode: `${mode}_compact_retry`,
                 source: "segments_compact_retry_normalize",
                 responseText: aiRes.text,
-                metrics: aiRes.metrics
+                responseMeta: aiRes.responseMeta,
+                metrics: aiRes.metrics,
+                extra: { parsed_item_count: getSegmentCandidateList(parsed)?.length || 0 }
             })
         );
     }
@@ -4877,9 +4992,10 @@ async function retrySegmentsWithPrimaryPrompt({
                 model: settings.model || "",
                 mode: `${mode}_primary_retry`,
                 source: "segments_primary_retry_parse",
-                responseText: aiRes.text,
-                metrics: aiRes.metrics,
-                extra: {
+                    responseText: aiRes.text,
+                    responseMeta: aiRes.responseMeta,
+                    metrics: aiRes.metrics,
+                    extra: {
                     compact_segments: !!segmentPromptPlan.compact
                 }
             })
@@ -4903,9 +5019,11 @@ async function retrySegmentsWithPrimaryPrompt({
                 mode: `${mode}_primary_retry`,
                 source: "segments_primary_retry_normalize",
                 responseText: aiRes.text,
+                responseMeta: aiRes.responseMeta,
                 metrics: aiRes.metrics,
                 extra: {
-                    compact_segments: !!segmentPromptPlan.compact
+                    compact_segments: !!segmentPromptPlan.compact,
+                    parsed_item_count: getSegmentCandidateList(parsed)?.length || 0
                 }
             })
         );
@@ -4988,7 +5106,7 @@ async function retrySegmentsWithAutoFallbacks({
             }, `自动重试成功：${strategy === "primary" ? "原 Prompt" : "保守 Prompt"}`);
             return result;
         } catch (retryError) {
-            latestError = normalizeSegmentsTaskError(retryError);
+            latestError = mergeSegmentsResponseAttempts(normalizeSegmentsTaskError(retryError), latestError);
             logAI.warn("segments_auto_retry_failed", buildFailureLog(latestError, {
                 task: "segments",
                 bvid,
@@ -5325,6 +5443,7 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                             mode: "quality",
                             source: segmentPromptPlan.compact ? "segments_quality_compact_primary_parse" : "segments_quality_parse",
                             responseText: aiRes.text,
+                            responseMeta: aiRes.responseMeta,
                             metrics: aiRes.metrics,
                             extra: {
                                 compact_segments: !!segmentPromptPlan.compact
@@ -5344,9 +5463,11 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                             mode: "quality",
                             source: segmentPromptPlan.compact ? "segments_quality_compact_primary_normalize" : "segments_quality_normalize",
                             responseText: aiRes.text,
+                            responseMeta: aiRes.responseMeta,
                             metrics: aiRes.metrics,
                             extra: {
-                                compact_segments: !!segmentPromptPlan.compact
+                                compact_segments: !!segmentPromptPlan.compact,
+                                parsed_item_count: getSegmentCandidateList(parsed)?.length || 0
                             }
                         })
                     );
@@ -5603,6 +5724,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                         mode: "efficiency",
                         source: "segments_merged_protocol_section_parse",
                         responseText: segmentsSection.content,
+                        responseMeta: aiRes.responseMeta,
                         metrics: aiRes.metrics
                     })
                 );
@@ -5638,7 +5760,9 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                             mode: "efficiency",
                             source: "segments_merged_protocol_section_normalize",
                             responseText: segmentsSection.content,
-                            metrics: aiRes.metrics
+                            responseMeta: aiRes.responseMeta,
+                            metrics: aiRes.metrics,
+                            extra: { parsed_item_count: getSegmentCandidateList(parsed)?.length || 0 }
                         })
                     );
                 }
@@ -5673,6 +5797,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                     mode: "efficiency",
                     source: "segments_merged_protocol_missing",
                     responseText: fullText,
+                    responseMeta: aiRes.responseMeta,
                     metrics: aiRes.metrics
                 })
             );
@@ -5706,7 +5831,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                 const fallbackRes = await callAIWithTimeout(settings, [{ role: "user", content: fallbackPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
                 const parsed = robustJSONParse(fallbackRes.text);
                 if (!parsed) {
-                    segmentsFailureError = attachSentryContext(
+                    const fallbackParseError = attachSentryContext(
                         createSegmentsParseError(fallbackRes.text, fallbackRes.metrics),
                         buildAIResponseSentryContext({
                             task: "segments",
@@ -5716,9 +5841,11 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                             mode: "efficiency_fallback",
                             source: "segments_merged_fallback_parse",
                             responseText: fallbackRes.text,
+                            responseMeta: fallbackRes.responseMeta,
                             metrics: fallbackRes.metrics
                         })
                     );
+                    segmentsFailureError = mergeSegmentsResponseAttempts(fallbackParseError, segmentsFailureError);
                     logAI.error("segments_merged_fallback_parse_error", {
                         bvid,
                         task: "segments",
@@ -5756,7 +5883,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                             }
                         });
                     } else {
-                        segmentsFailureError = attachSentryContext(
+                        const fallbackNormalizeError = attachSentryContext(
                             createSegmentsNormalizeError(parsed),
                             buildAIResponseSentryContext({
                                 task: "segments",
@@ -5766,13 +5893,16 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                                 mode: "efficiency_fallback",
                                 source: "segments_merged_fallback_normalize",
                                 responseText: fallbackRes.text,
-                                metrics: fallbackRes.metrics
+                                responseMeta: fallbackRes.responseMeta,
+                                metrics: fallbackRes.metrics,
+                                extra: { parsed_item_count: getSegmentCandidateList(parsed)?.length || 0 }
                             })
                         );
+                        segmentsFailureError = mergeSegmentsResponseAttempts(fallbackNormalizeError, segmentsFailureError);
                     }
                 }
             } catch (fallbackError) {
-                segmentsFailureError = normalizeSegmentsTaskError(fallbackError);
+                segmentsFailureError = mergeSegmentsResponseAttempts(normalizeSegmentsTaskError(fallbackError), segmentsFailureError);
                 logAI.warn("segments_merged_parse_fallback_failed", buildFailureLog(fallbackError, {
                     task: "segments",
                     bvid,
@@ -6693,21 +6823,42 @@ function createUserAbortedError() {
 async function callAIWithTimeout(settings, messages, timeoutMs, options = {}) {
     const controller = new AbortController();
     const unregister = registerTabAbortController(options?.tabId, controller);
-    const timeoutId = setTimeout(() => controller.abort("timeout"), timeoutMs);
-    const start = performance.now();
     const queueSizeAtStart = queue.length;
     const activeCountAtStart = activeCount;
+    const timing = createProviderRequestTiming({ controller, timeoutMs });
     try {
-        const requestRunner = () => callAI(settings.provider, settings, messages, controller.signal);
+        const requestRunner = () => {
+            const requestTiming = timing.startRequest();
+            logAI.debug("provider_request_start", {
+                task: "ai",
+                provider: settings.provider,
+                model: settings.model || "",
+                duration_ms: requestTiming.queueWaitMs || 0,
+                detail: {
+                    queue_wait_ms: requestTiming.queueWaitMs || 0,
+                    queue_size_at_start: queueSizeAtStart,
+                    active_count_at_start: activeCountAtStart,
+                    bypass_queue: !!options?.bypassQueue
+                }
+            });
+            return callAI(settings.provider, settings, messages, controller.signal);
+        };
         const res = options?.bypassQueue ? await requestRunner() : await runQueued(requestRunner);
-        const latencyMs = Math.round(performance.now() - start);
+        const requestTiming = timing.snapshot();
+        const latencyMs = requestTiming.providerRequestMs || 0;
         const tokenInfo = resolveTokenInfo(res.usage, res.text, messages);
         const rateLimitInfo = resolveRateLimitInfo(settings, res.headers);
         logAI.debug("provider_response", {
             provider: settings.provider,
             model: settings.model || "",
             duration_ms: latencyMs,
-            detail: { ...tokenInfo, has_text: !!res.text, rate_limit: rateLimitInfo }
+            detail: {
+                ...tokenInfo,
+                has_text: !!res.text,
+                rate_limit: rateLimitInfo,
+                queue_wait_ms: requestTiming.queueWaitMs || 0,
+                provider_request_ms: latencyMs
+            }
         });
         logAIResponseText({
             provider: settings.provider,
@@ -6715,12 +6866,21 @@ async function callAIWithTimeout(settings, messages, timeoutMs, options = {}) {
             durationMs: latencyMs,
             text: res.text || ""
         });
-        return { text: res.text || "", metrics: buildRequestMetrics(settings, tokenInfo, latencyMs, rateLimitInfo) };
+        return {
+            text: res.text || "",
+            metrics: buildRequestMetrics(settings, tokenInfo, latencyMs, rateLimitInfo),
+            responseMeta: res.responseMeta || null
+        };
     } catch (error) {
+        const requestTiming = timing.snapshot();
         logAI.error("ai_request_failed", buildFailureLog(error, {
             task: "ai",
             provider: settings.provider,
-            model: settings.model || ""
+            model: settings.model || "",
+            detail: {
+                queue_wait_ms: requestTiming.queueWaitMs || 0,
+                provider_request_ms: requestTiming.providerRequestMs
+            }
         }));
         if (controller.signal.aborted) {
             if (controller.signal.reason === "aborted") {
@@ -6732,13 +6892,21 @@ async function callAIWithTimeout(settings, messages, timeoutMs, options = {}) {
                 bypassQueue: !!options?.bypassQueue,
                 queueSizeAtStart,
                 activeCountAtStart,
-                elapsedMs: Math.round(performance.now() - start)
+                ...requestTiming,
+                timeoutPhase: "provider_request"
             }));
             logAI.error("ai_request_timeout", buildFailureLog(timeoutError, {
                 task: "ai",
                 provider: settings.provider,
                 model: settings.model || "",
-                code: timeoutError.code || "AI_RESPONSE_TIMEOUT"
+                code: timeoutError.code || "AI_RESPONSE_TIMEOUT",
+                detail: {
+                    queue_wait_ms: requestTiming.queueWaitMs || 0,
+                    provider_request_ms: requestTiming.providerRequestMs,
+                    first_response_ms: requestTiming.firstResponseMs,
+                    timeout_phase: "provider_request",
+                    timeout_ms: timeoutMs
+                }
             }));
             throw timeoutError;
         }
@@ -6747,12 +6915,12 @@ async function callAIWithTimeout(settings, messages, timeoutMs, options = {}) {
             bypassQueue: !!options?.bypassQueue,
             queueSizeAtStart,
             activeCountAtStart,
-            elapsedMs: Math.round(performance.now() - start)
+            ...requestTiming
         }));
         throw error;
     } finally {
         unregister();
-        clearTimeout(timeoutId);
+        timing.finish();
     }
 }
 
@@ -6762,24 +6930,42 @@ async function callAIWithTimeoutStream(settings, messages, timeoutMs, onDelta, e
     let firstResponseReceived = false;
     const retryDelaysMs = [STREAM_INITIAL_RETRY_DELAY_MS];
     const maxAttempts = retryDelaysMs.length + 1;
-    const timeoutId = setTimeout(() => {
-        if (!firstResponseReceived) controller.abort("timeout");
-    }, timeoutMs);
-    const start = performance.now();
     const queueSizeAtStart = queue.length;
     const activeCountAtStart = activeCount;
+    const timing = createProviderRequestTiming({
+        controller,
+        timeoutMs,
+        stopTimeoutOnFirstResponse: true
+    });
     try {
         const wrappedOnDelta = (delta) => {
             if (!firstResponseReceived) {
                 firstResponseReceived = true;
-                clearTimeout(timeoutId);
+                timing.markFirstResponse();
             }
             if (typeof onDelta === "function") onDelta(delta);
         };
         let res = null;
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
             try {
-                res = await runQueued(() => callAIStream(settings.provider, settings, messages, controller.signal, wrappedOnDelta));
+                res = await runQueued(() => {
+                    const requestTiming = timing.startRequest();
+                    if (attempt === 1) {
+                        logAI.debug("provider_request_start", {
+                            task: "ai",
+                            provider: settings.provider,
+                            model: settings.model || "",
+                            duration_ms: requestTiming.queueWaitMs || 0,
+                            detail: {
+                                request_stream: true,
+                                queue_wait_ms: requestTiming.queueWaitMs || 0,
+                                queue_size_at_start: queueSizeAtStart,
+                                active_count_at_start: activeCountAtStart
+                            }
+                        });
+                    }
+                    return callAIStream(settings.provider, settings, messages, controller.signal, wrappedOnDelta);
+                });
                 break;
             } catch (error) {
                 decorateStreamRetryMetadata(error, attempt, maxAttempts, retryDelaysMs);
@@ -6801,17 +6987,36 @@ async function callAIWithTimeoutStream(settings, messages, timeoutMs, onDelta, e
                 await waitForAbortableDelay(delayMs, controller.signal);
             }
         }
-        const latencyMs = Math.round(performance.now() - start);
+        const requestTiming = timing.snapshot();
+        const latencyMs = requestTiming.providerRequestMs || 0;
         const tokenInfo = resolveTokenInfo(res.usage, res.text, messages);
         const rateLimitInfo = resolveRateLimitInfo(settings, res.headers);
+        logAI.debug("provider_response", {
+            provider: settings.provider,
+            model: settings.model || "",
+            duration_ms: latencyMs,
+            detail: {
+                request_stream: true,
+                queue_wait_ms: requestTiming.queueWaitMs || 0,
+                provider_request_ms: latencyMs,
+                first_response_ms: requestTiming.firstResponseMs,
+                first_response_received: firstResponseReceived,
+                ...tokenInfo
+            }
+        });
         logAIResponseText({
             provider: settings.provider,
             model: settings.model || "",
             durationMs: latencyMs,
             text: res.text || ""
         });
-        return { text: res.text || "", metrics: buildRequestMetrics(settings, tokenInfo, latencyMs, rateLimitInfo) };
+        return {
+            text: res.text || "",
+            metrics: buildRequestMetrics(settings, tokenInfo, latencyMs, rateLimitInfo),
+            responseMeta: res.responseMeta || null
+        };
     } catch (error) {
+        const requestTiming = timing.snapshot();
         if (controller.signal.aborted) {
             if (controller.signal.reason === "aborted") {
                 throw createUserAbortedError();
@@ -6822,8 +7027,23 @@ async function callAIWithTimeoutStream(settings, messages, timeoutMs, onDelta, e
                 bypassQueue: false,
                 queueSizeAtStart,
                 activeCountAtStart,
-                elapsedMs: Math.round(performance.now() - start),
+                ...requestTiming,
+                timeoutPhase: "first_response",
                 firstResponseReceived
+            }));
+            logAI.error("ai_request_timeout", buildFailureLog(timeoutError, {
+                task: "ai",
+                provider: settings.provider,
+                model: settings.model || "",
+                code: timeoutError.code || "AI_STREAM_TIMEOUT",
+                detail: {
+                    queue_wait_ms: requestTiming.queueWaitMs || 0,
+                    provider_request_ms: requestTiming.providerRequestMs,
+                    first_response_ms: requestTiming.firstResponseMs,
+                    timeout_phase: "first_response",
+                    timeout_ms: timeoutMs,
+                    first_response_received: firstResponseReceived
+                }
             }));
             throw timeoutError;
         }
@@ -6832,13 +7052,13 @@ async function callAIWithTimeoutStream(settings, messages, timeoutMs, onDelta, e
             bypassQueue: false,
             queueSizeAtStart,
             activeCountAtStart,
-            elapsedMs: Math.round(performance.now() - start),
+            ...requestTiming,
             firstResponseReceived
         }));
         throw error;
     } finally {
         unregister();
-        clearTimeout(timeoutId);
+        timing.finish();
     }
 }
 

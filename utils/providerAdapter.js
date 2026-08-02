@@ -210,6 +210,59 @@ function extractOpenAIMessageText(data) {
     return normalizeTextContent(data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? "");
 }
 
+const MAX_PROVIDER_RESPONSE_DEBUG_CHARS = 100000;
+
+function serializeProviderResponseForDebug(data) {
+    try {
+        const serialized = JSON.stringify(data);
+        if (serialized.length <= MAX_PROVIDER_RESPONSE_DEBUG_CHARS) return serialized;
+        return `${serialized.slice(0, MAX_PROVIDER_RESPONSE_DEBUG_CHARS)}...[truncated]`;
+    } catch (_) {
+        return String(data || "").slice(0, MAX_PROVIDER_RESPONSE_DEBUG_CHARS);
+    }
+}
+
+function getResponseContentState(content) {
+    if (content === undefined) return "missing";
+    if (content === null) return "null";
+    return normalizeTextContent(content).trim() ? "text" : "empty";
+}
+
+function buildProviderResponseMeta(data, req, text = "") {
+    if (req.provider.type === "google") {
+        const candidates = Array.isArray(data?.candidates) ? data.candidates : [];
+        return {
+            rawResponse: serializeProviderResponseForDebug(data),
+            contentState: String(text || "").trim() ? "text" : (candidates.length ? "empty" : "missing"),
+            finishReason: String(candidates[0]?.finishReason || ""),
+            choiceCount: candidates.length,
+            reasoningChars: 0
+        };
+    }
+    if (isClaudeRequest(req)) {
+        const content = data?.content;
+        return {
+            rawResponse: serializeProviderResponseForDebug(data),
+            contentState: getResponseContentState(content),
+            finishReason: String(data?.stop_reason || ""),
+            choiceCount: Array.isArray(content) ? content.length : 0,
+            reasoningChars: 0
+        };
+    }
+    const choices = Array.isArray(data?.choices) ? data.choices : [];
+    const message = choices[0]?.message;
+    const content = message && Object.prototype.hasOwnProperty.call(message, "content")
+        ? message.content
+        : choices[0]?.text;
+    return {
+        rawResponse: serializeProviderResponseForDebug(data),
+        contentState: getResponseContentState(content),
+        finishReason: String(choices[0]?.finish_reason || ""),
+        choiceCount: choices.length,
+        reasoningChars: String(message?.reasoning_content || message?.reasoning || "").length
+    };
+}
+
 function splitSseEvents(buffer) {
     const parts = String(buffer || "").split(/\r?\n\r?\n/);
     return {
@@ -435,9 +488,11 @@ export async function callAI(providerKey, config, messages, signal) {
     }
     const data = await res.json();
     if (req.provider.type === "google") {
+        const text = extractGeminiText(data);
         return {
-            text: extractGeminiText(data),
-            headers: res.headers
+            text,
+            headers: res.headers,
+            responseMeta: buildProviderResponseMeta(data, req, text)
         };
     }
     if (isClaudeRequest(req)) {
@@ -447,13 +502,16 @@ export async function callAI(providerKey, config, messages, signal) {
         return {
             text,
             headers: res.headers,
-            usage: data.usage
+            usage: data.usage,
+            responseMeta: buildProviderResponseMeta(data, req, text)
         };
     }
+    const text = extractOpenAIMessageText(data);
     return {
-        text: extractOpenAIMessageText(data),
+        text,
         headers: res.headers,
-        usage: data.usage
+        usage: data.usage,
+        responseMeta: buildProviderResponseMeta(data, req, text)
     };
 }
 
@@ -520,12 +578,21 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
                 : "";
         }
         if (typeof onDelta === "function" && text) onDelta(text);
-        return { text, headers: res.headers, usage: data.usage };
+        return { text, headers: res.headers, usage: data.usage, responseMeta: buildProviderResponseMeta(data, req, text) };
     }
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
     let fullText = "";
     let usage = null;
+    let rawResponse = "";
+    let finishReason = "";
+    let choiceCount = 0;
+    let reasoningChars = 0;
+    const appendRawResponse = (value) => {
+        if (rawResponse.length >= MAX_PROVIDER_RESPONSE_DEBUG_CHARS) return;
+        const next = `${rawResponse ? "\n" : ""}${String(value || "")}`;
+        rawResponse += next.slice(0, MAX_PROVIDER_RESPONSE_DEBUG_CHARS - rawResponse.length);
+    };
     const emitToken = (token) => {
         const text = String(token || "");
         if (!text) return;
@@ -541,9 +608,13 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
             } catch (_) {
                 continue;
             }
+            appendRawResponse(dataPart);
             if (parsed?.usage) usage = parsed.usage;
+            choiceCount = Math.max(choiceCount, Array.isArray(parsed?.choices) ? parsed.choices.length : 0);
+            finishReason = String(parsed?.choices?.[0]?.finish_reason || finishReason || "");
             const delta = parsed?.choices?.[0]?.delta || parsed?.choices?.[0]?.message || {};
             const content = delta?.content ?? delta?.text ?? "";
+            reasoningChars += String(delta?.reasoning_content || delta?.reasoning || "").length;
             if (delta?.reasoning_content && delta?.content == null && delta?.text == null) {
                 getProviderLogger()?.debug("provider_stream_reasoning_delta_ignored", {
                     task: "ai",
@@ -579,6 +650,10 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
             } catch (_) {
                 continue;
             }
+            appendRawResponse(dataPart);
+            const candidates = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
+            choiceCount = Math.max(choiceCount, candidates.length);
+            finishReason = String(candidates[0]?.finishReason || finishReason || "");
             if (parsed?.usageMetadata) {
                 usage = {
                     prompt_tokens: parsed.usageMetadata.promptTokenCount,
@@ -604,6 +679,9 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
         } catch (_) {
             return;
         }
+        appendRawResponse(event.data);
+        finishReason = String(parsed?.stop_reason || parsed?.delta?.stop_reason || finishReason || "");
+        if (Array.isArray(parsed?.content)) choiceCount = Math.max(choiceCount, parsed.content.length);
         if (parsed?.type === "message_start" && parsed?.message?.usage) usage = parsed.message.usage;
         if (parsed?.type === "message_delta" && parsed?.usage) usage = { ...(usage || {}), ...parsed.usage };
         const text = parsed?.type === "content_block_delta" && parsed?.delta?.type === "text_delta"
@@ -636,7 +714,14 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
     return {
         text: fullText,
         headers: res.headers,
-        usage
+        usage,
+        responseMeta: {
+            rawResponse,
+            contentState: fullText.trim() ? "text" : (rawResponse ? "empty" : "missing"),
+            finishReason,
+            choiceCount,
+            reasoningChars
+        }
     };
 }
 

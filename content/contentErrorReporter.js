@@ -8,12 +8,31 @@
         /暂无\s*raw\s*字幕/i,
         /用户取消/i,
         /user\s*cancel/i,
+        /已停止生成/i,
+        /本次未完成授权/i,
         /未授权访问该自定义\s*api\s*域名/i,
         /缺少自定义\s*api\s*地址/i,
         /自定义\s*provider\s*需要填写\s*base\s*url/i,
+        /base\s*url.*(?:格式不正确|必须使用\s*https|invalid)/i,
+        /自定义\s*(?:api\s*)?地址必须使用\s*https/i,
+        /failed to construct ['"]url['"]:\s*invalid url/i,
+        /未获取到视频字幕/i,
+        /file_error_no_space/i,
+        /resource::kquotabytes quota exceeded/i,
+        /a listener indicated an asynchronous response.*message channel closed/i,
+        /could not establish connection\. receiving end does not exist/i,
         /sentry\s*dsn/i,
         /ResizeObserver loop completed with undelivered notifications/i
     ];
+
+    const IGNORED_ERROR_CODES = new Set([
+        "ABORTED",
+        "USER_CANCELLED",
+        "CONFIG_REQUIRED",
+        "VALIDATION_ERROR",
+        "MISSING_API_KEY",
+        "MISSING_SUBTITLE"
+    ]);
 
     function normalizeError(errorInput) {
         if (errorInput instanceof Error) {
@@ -46,8 +65,32 @@
     function shouldReportContentError(errorInput, context = {}) {
         const normalized = normalizeError(errorInput);
         const code = String(errorInput?.code || context?.code || "").trim().toUpperCase();
-        if (["USER_CANCELLED", "CONFIG_REQUIRED", "VALIDATION_ERROR", "MISSING_API_KEY", "MISSING_SUBTITLE"].includes(code)) return false;
+        if (IGNORED_ERROR_CODES.has(code)) return false;
+        if (isClearlyThirdPartyExtensionError(normalized.stack, context)) return false;
         return !IGNORED_ERROR_PATTERNS.some((pattern) => pattern.test(normalized.message));
+    }
+
+    function isClearlyThirdPartyExtensionError(stackInput, context = {}) {
+        const source = String(context?.source || "");
+        if (!["content_window_error", "content_unhandled_rejection"].includes(source)) return false;
+
+        const stack = String(stackInput || "");
+        const extensionOrigins = [...stack.matchAll(/\b(?:chrome|moz)-extension:\/\/([^/\s)]+)/gi)]
+            .map((match) => String(match?.[1] || "").toLowerCase())
+            .filter(Boolean);
+        if (!extensionOrigins.length) return false;
+
+        const runtime = globalThis.chrome?.runtime;
+        if (typeof runtime?.getURL !== "function") return false;
+        try {
+            const ownOriginMatch = String(runtime.getURL(""))
+                .match(/^(?:chrome|moz)-extension:\/\/([^/]+)/i);
+            const ownExtensionOrigin = String(ownOriginMatch?.[1] || "").toLowerCase();
+            if (!ownExtensionOrigin) return false;
+            return !extensionOrigins.includes(ownExtensionOrigin);
+        } catch (_) {
+            return false;
+        }
     }
 
     function buildPageContext(extra = {}) {

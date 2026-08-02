@@ -376,6 +376,13 @@ const appState = {
     chatPort: null,
     chatActiveMessageId: "",
     debugLogPollTimer: null,
+    debugToolsTab: "overview",
+    debugLogLevel: "all",
+    debugLogModule: "all",
+    debugLogQuery: "",
+    debugLogOnlyFailures: false,
+    debugLogView: "timeline",
+    debugScenarioResult: null,
     asrRateLimitRetryAfterSec: 0,
     asrUiTraceLogs: [],
     chatAutoScrollPausedUntil: 0,
@@ -1321,9 +1328,8 @@ function logAsrUiTrace(event, detail = {}) {
     };
     const nextLogs = Array.isArray(appState.asrUiTraceLogs) ? [...appState.asrUiTraceLogs, entry] : [entry];
     appState.asrUiTraceLogs = nextLogs.slice(-300);
-    const box = panelShadowRoot ? panelShadowRoot.getElementById("debug-asr-ui-log-body") : null;
-    if (box && appState.activePage === "debug") {
-        renderAsrUiTraceData();
+    if (appState.activePage === "debug" && appState.debugToolsTab === "logs") {
+        renderRealtimeLogData();
     }
 }
 
@@ -1477,6 +1483,14 @@ function notifyMappedError(error, fallbackMessage = "请求失败") {
 function runErrorDisplayDemo(code, target = "summary") {
     const normalizedCode = String(code || "UNKNOWN").trim();
     const page = String(target || "summary");
+    recordDebugScenarioResult({
+        id: `error_${normalizedCode.toLowerCase()}`,
+        title: `错误展示 · ${normalizedCode}`,
+        status: "passed",
+        expected: `在${page === "chat" ? "聊天" : page === "real" ? "验真" : page === "CC" ? "字幕" : "总结"}页面展示对应错误`,
+        actual: `已注入 ${normalizedCode}`,
+        durationMs: 0
+    });
     logUI.info("debug_error_demo", {
         task: "debug",
         code: normalizedCode,
@@ -1496,7 +1510,7 @@ function runErrorDisplayDemo(code, target = "summary") {
         showToast(view.message);
         return;
     }
-    const targetPage = ["summary", "chat", "real"].includes(page) ? page : "summary";
+    const targetPage = ["summary", "chat", "real", "CC"].includes(page) ? page : "summary";
     appState.panelErrors = {
         ...(appState.panelErrors || {}),
         [targetPage]: view
@@ -2309,6 +2323,34 @@ function expandPanelAfterSummaryCompletion() {
     setPanelCollapsed(false);
     renderNav();
     renderContent();
+}
+
+function recordDebugScenarioResult(result = {}) {
+    const nextResult = {
+        id: String(result.id || "debug_scenario"),
+        title: String(result.title || "调试场景"),
+        status: ["running", "passed", "failed", "cancelled", "needs_config"].includes(String(result.status || ""))
+            ? String(result.status)
+            : "passed",
+        expected: String(result.expected || ""),
+        actual: String(result.actual || ""),
+        durationMs: Math.max(0, Number(result.durationMs || 0)),
+        traceId: String(result.traceId || `debug_${Date.now().toString(36)}`),
+        updatedAt: Date.now()
+    };
+    appState.debugScenarioResult = nextResult;
+    try {
+        logUI.info(`debug_scenario_${nextResult.status}`, {
+            task: "debug",
+            trace_id: nextResult.traceId,
+            duration_ms: nextResult.durationMs,
+            detail: {
+                scenario_id: nextResult.id,
+                title: nextResult.title,
+                actual: nextResult.actual
+            }
+        });
+    } catch (_) {}
 }
 
 function setEmbeddedPanelVisible(visible = true) {
@@ -3185,6 +3227,32 @@ function bindPanelDelegatedEvents() {
             saveSettingsFromPanel(true);
             return;
         }
+        if (action === "debug-switch-tab") {
+            const nextTab = String(actionNode.dataset.tab || "overview");
+            appState.debugToolsTab = ["overview", "scenarios", "logs", "state"].includes(nextTab) ? nextTab : "overview";
+            renderContent();
+            return;
+        }
+        if (action === "debug-run-error-demo") {
+            const debugPanel = panelShadowRoot?.getElementById("page-debug");
+            const code = String(debugPanel?.querySelector("#debug-error-code")?.value || "HTTP_429");
+            const target = String(debugPanel?.querySelector("#debug-error-target")?.value || "summary");
+            runErrorDisplayDemo(code, target);
+            return;
+        }
+        if (action === "debug-log-view") {
+            appState.debugLogView = actionNode.dataset.view === "raw" ? "raw" : "timeline";
+            renderContent();
+            return;
+        }
+        if (action === "debug-copy-diagnostics") {
+            copyDebugDiagnosticReport();
+            return;
+        }
+        if (action === "debug-clear-session") {
+            clearDebugSession();
+            return;
+        }
         if (action === "debug-error-demo") {
             runErrorDisplayDemo(actionNode.dataset.code || "", actionNode.dataset.target || "summary");
             return;
@@ -3197,6 +3265,13 @@ function bindPanelDelegatedEvents() {
             return;
         }
         if (action === "debug-show-release-notice") {
+            recordDebugScenarioResult({
+                id: "release_notice",
+                title: "更新导览",
+                status: "passed",
+                expected: "显示当前版本更新导览",
+                actual: "已打开更新导览"
+            });
             globalThis.BilitatoReleaseNotice?.renderReleaseNotice?.({
                 root: panelShadowRoot,
                 version: globalThis.chrome?.runtime?.getManifest?.()?.version || "1.4.3",
@@ -3205,11 +3280,25 @@ function bindPanelDelegatedEvents() {
             return;
         }
         if (action === "debug-show-version-update") {
+            recordDebugScenarioResult({
+                id: "version_update",
+                title: "新版本入口",
+                status: "passed",
+                expected: "显示可用版本更新入口",
+                actual: "已显示更新入口"
+            });
             showDebugVersionUpdateBadge();
             return;
         }
         if (action === "debug-simulate-first-install") {
             logUI.info("debug_simulate_first_install", { task: "debug" });
+            recordDebugScenarioResult({
+                id: "first_install",
+                title: "首次安装体验",
+                status: "passed",
+                expected: "显示首次安装引导",
+                actual: "已打开首次安装引导"
+            });
             showSetupGuide({ simulateFirstInstall: true });
             return;
         }
@@ -5724,7 +5813,6 @@ function renderSettings(panel) {
 }
 
 function renderErrorDemoControls() {
-    const currentVersion = globalThis.chrome?.runtime?.getManifest?.()?.version || "1.4.3";
     const panelErrors = [
         ["HTTP_401", "401 Key 无效", "summary"],
         ["ALIYUN_REALNAME_REQUIRED", "阿里云未实名", "summary"],
@@ -5768,23 +5856,59 @@ function renderErrorDemoControls() {
         ["CLOUD_FAILED", "云缓存失败"],
         ["DOWNLOAD_FAILED", "下载失败"]
     ];
-    const renderButton = ([code, label, target]) => (
-        `<button type="button" class="panel-btn ghost error-demo-btn" data-action="debug-error-demo" data-code="${escapeHtml(code)}" data-target="${escapeHtml(target || "summary")}">${escapeHtml(label)}</button>`
-    );
+    const renderOption = ([code, label]) => `<option value="${escapeHtml(code)}">${escapeHtml(label)} · ${escapeHtml(code)}</option>`;
     return `
-        <div class="settings-group-title">开发测试</div>
-        <div class="error-demo-section">
-            <div class="error-demo-label">面板提示</div>
-            <div class="error-demo-grid">${panelErrors.map(renderButton).join("")}</div>
-            <div class="error-demo-label">Toast 提示</div>
-            <div class="error-demo-grid">${toastErrors.map(renderButton).join("")}</div>
-            <div class="error-demo-label">更新导览</div>
-            <button type="button" class="panel-btn ghost" data-action="debug-show-release-notice">显示 v${escapeHtml(currentVersion)} 更新导览</button>
-            <button type="button" class="panel-btn ghost" data-action="debug-show-version-update">显示可用版本更新入口</button>
-            <div class="error-demo-label">首次安装体验</div>
-            <button type="button" class="panel-btn ghost" data-action="debug-simulate-first-install">模拟首次安装用户</button>
-            <button type="button" class="panel-btn ghost error-demo-clear" data-action="debug-clear-errors">清空测试状态</button>
-        </div>
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head">
+                <div>
+                    <strong>错误展示预览</strong>
+                    <span>选择错误和展示页面，不再平铺全部按钮</span>
+                </div>
+                <span class="debug-risk-badge safe">安全预览</span>
+            </div>
+            <label class="debug-field-label" for="debug-error-code">错误类型</label>
+            <select id="debug-error-code">
+                <optgroup label="面板错误">${panelErrors.map(renderOption).join("")}</optgroup>
+                <optgroup label="Toast 错误">${toastErrors.map(renderOption).join("")}</optgroup>
+            </select>
+            <label class="debug-field-label" for="debug-error-target">展示位置</label>
+            <select id="debug-error-target">
+                <option value="summary">总结页</option>
+                <option value="chat">聊天页</option>
+                <option value="real">验真页</option>
+                <option value="CC">字幕页</option>
+            </select>
+            <div class="debug-card-actions">
+                <button type="button" class="panel-btn primary" data-action="debug-run-error-demo">运行预览</button>
+                <button type="button" class="panel-btn ghost" data-action="debug-clear-errors">清空错误状态</button>
+            </div>
+        </section>
+    `;
+}
+
+function renderLifecycleDemoControls() {
+    const currentVersion = globalThis.chrome?.runtime?.getManifest?.()?.version || "1.4.3";
+    return `
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head">
+                <div>
+                    <strong>安装与更新</strong>
+                    <span>预览安装、升级和版本入口</span>
+                </div>
+                <span class="debug-risk-badge reversible">可恢复状态</span>
+            </div>
+            <div class="debug-scenario-list">
+                <button type="button" class="debug-scenario-row" data-action="debug-show-release-notice">
+                    <span><strong>更新导览</strong><small>显示 v${escapeHtml(currentVersion)} 更新内容</small></span><b>运行</b>
+                </button>
+                <button type="button" class="debug-scenario-row" data-action="debug-show-version-update">
+                    <span><strong>新版本入口</strong><small>显示可用版本更新提示</small></span><b>运行</b>
+                </button>
+                <button type="button" class="debug-scenario-row" data-action="debug-simulate-first-install">
+                    <span><strong>首次安装体验</strong><small>打开首次安装引导</small></span><b>运行</b>
+                </button>
+            </div>
+        </section>
     `;
 }
 
@@ -5863,13 +5987,15 @@ function resetTaskUiForDeletedCache() {
 
 function renderSubtitleEmptyDemoControls() {
     return `
-        <div class="settings-group-title">字幕空状态</div>
-        <div class="error-demo-section">
-            <div class="error-demo-label">总结页无字幕提示预览</div>
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head">
+                <div><strong>字幕空状态</strong><span>总结页无字幕提示组件预览</span></div>
+                <span class="debug-risk-badge safe">安全预览</span>
+            </div>
             <div class="debug-state-preview">
                 ${renderMissingSubtitleState()}
             </div>
-        </div>
+        </section>
     `;
 }
 
@@ -5877,27 +6003,29 @@ function renderSegmentPromptDebugControls() {
     const variant = String(appState.settings?.segmentPromptVariant || "test").toLowerCase() === "original" ? "original" : "test";
     const debugEnabled = !!appState.settings?.debugMode;
     return `
-        <div class="settings-group-title">分段 Prompt 对比</div>
-        <div class="error-demo-section">
-            <div class="error-demo-label">调试日志</div>
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head">
+                <div><strong>分段 Prompt 实验</strong><span>切换后重新生成分段生效</span></div>
+                <span class="debug-risk-badge reversible">持久设置</span>
+            </div>
+            <label class="debug-field-label" for="debug-mode-inline">调试日志</label>
             <select id="debug-mode-inline">
                 <option value="false" ${debugEnabled ? "" : "selected"}>关闭</option>
                 <option value="true" ${debugEnabled ? "selected" : ""}>开启</option>
             </select>
-            <div class="empty-text" style="margin-top:8px;">开启后会记录完整 Prompt 分块。测试完建议关闭。</div>
-            <div class="error-demo-label">当前用于“视频分段 + 广告识别”的 Prompt</div>
+            <div class="debug-field-help">关闭后开发者工具入口会隐藏并返回设置页。</div>
+            <label class="debug-field-label" for="debug-segment-prompt-variant">视频分段与广告识别 Prompt</label>
             <select id="debug-segment-prompt-variant">
                 <option value="test" ${variant === "test" ? "selected" : ""}>测试版：简化分段 + 广告识别</option>
                 <option value="original" ${variant === "original" ? "selected" : ""}>原版：当前正式分段 Prompt</option>
             </select>
-            <div class="empty-text" style="margin-top:8px;">切换后重新点击总结/分段刷新生效。开启调试模式后，日志会输出实际发送给 AI 的 Prompt 分块。</div>
-        </div>
+            <div class="debug-field-help">开启调试日志后会记录脱敏后的 Prompt 分块信息。</div>
+        </section>
     `;
 }
 
 function renderTaskRetryDebugPanel() {
     const retryState = appState.tabState?.taskRetryState?.segments || null;
-    const asrChunkingState = appState.tabState?.taskRetryState?.asrChunking || null;
     const taskStatus = String(appState.tabState?.taskStatus?.segments || "idle");
     const taskError = appState.tabState?.taskErrors?.segments || null;
     const events = Array.isArray(retryState?.events) ? retryState.events : [];
@@ -5930,41 +6058,14 @@ function renderTaskRetryDebugPanel() {
             return `<div style="margin-bottom:6px;"><strong>${escapeHtml(time)}</strong> · ${escapeHtml(String(item?.text || ""))}</div>`;
         }).join("")}</div>`
         : `<div class="empty-text" style="margin-top:8px;">当前还没有分段阶段事件。</div>`;
-    const boundaries = Array.isArray(asrChunkingState?.boundaries) ? asrChunkingState.boundaries : [];
-    const renderBoundaryRows = (rows = []) => {
-        if (!rows.length) return `<div class="empty-text">无</div>`;
-        return rows.map((row) => {
-            const hasTimeline = Number.isFinite(Number(row?.start)) && Number.isFinite(Number(row?.end));
-            const label = hasTimeline
-                ? `${formatTime(Number(row?.start || 0))}-${formatTime(Number(row?.end || 0))}`
-                : "无时间轴";
-            return `<div style="margin-bottom:6px;"><strong>${escapeHtml(label)}</strong> · ${escapeHtml(String(row?.text || ""))}</div>`;
-        }).join("");
-    };
-    const chunkBoundaryHtml = boundaries.length
-        ? `<div class="debug-state-preview" style="margin-top:8px;">${boundaries.map((item) => {
-            const chunkLabel = `Chunk ${Number(item?.chunkIndex || 0)}/${Number(item?.chunkCount || 0)}`;
-            const rangeLabel = `${formatTime(Number(item?.startSec || 0))}-${formatTime(Number(item?.endSec || 0))}`;
-            return `
-                <div style="margin-bottom:14px; padding-bottom:10px; border-bottom:1px solid rgba(0,0,0,.08);">
-                    <div><strong>${escapeHtml(chunkLabel)}</strong> · ${escapeHtml(rangeLabel)}</div>
-                    <div style="margin-top:6px;"><strong>本片开头字幕</strong></div>
-                    <div>${renderBoundaryRows(item?.sourceHead || [])}</div>
-                    <div style="margin-top:6px;"><strong>本片结尾字幕</strong></div>
-                    <div>${renderBoundaryRows(item?.sourceTail || [])}</div>
-                    <div style="margin-top:6px;"><strong>合并前上一片尾部</strong></div>
-                    <div>${renderBoundaryRows(item?.mergedTailBefore || [])}</div>
-                    <div style="margin-top:6px;"><strong>合并后尾部结果</strong></div>
-                    <div>${renderBoundaryRows(item?.mergedTailAfter || [])}</div>
-                </div>
-            `;
-        }).join("")}</div>`
-        : `<div class="empty-text" style="margin-top:8px;">当前还没有切片边界诊断数据。</div>`;
     return `
-        <div class="settings-group-title">分段自动重试状态</div>
-        <div class="error-demo-section">
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head">
+                <div><strong>分段自动重试</strong><span>真实调用模型并验证恢复策略</span></div>
+                <span class="debug-risk-badge network">真实请求 · 可能计费</span>
+            </div>
             <button type="button" class="panel-btn ghost" data-action="debug-run-segments-retry-test">触发分段自动重试测试</button>
-            <div class="debug-state-preview" style="margin-top:8px;">
+            <div class="debug-state-grid">
                 <div><strong>任务状态：</strong>${escapeHtml(statusMap[taskStatus] || taskStatus)}</div>
                 <div><strong>运行阶段：</strong>${escapeHtml(statusMap[String(retryState?.status || "")] || String(retryState?.status || "未开始"))}</div>
                 <div><strong>当前策略：</strong>${escapeHtml(strategyLabel)}</div>
@@ -5976,11 +6077,45 @@ function renderTaskRetryDebugPanel() {
                 <div><strong>分段数量：</strong>${Number(retryState?.segmentCount || 0) || (Array.isArray(appState.cache?.segments) ? appState.cache.segments.length : 0)}</div>
                 <div><strong>最后更新：</strong>${escapeHtml(updatedText)}</div>
             </div>
-            <div class="error-demo-label">最近阶段事件</div>
-            ${eventListHtml}
-            <div class="error-demo-label">切片边界诊断</div>
-            ${chunkBoundaryHtml}
-        </div>
+            <details class="debug-details">
+                <summary>最近阶段事件</summary>
+                ${eventListHtml}
+            </details>
+        </section>
+    `;
+}
+
+function renderAsrChunkingStatePanel() {
+    const boundaries = Array.isArray(appState.tabState?.taskRetryState?.asrChunking?.boundaries)
+        ? appState.tabState.taskRetryState.asrChunking.boundaries
+        : [];
+    const renderRows = (rows = []) => {
+        if (!rows.length) return `<div class="empty-text">无</div>`;
+        return rows.map((row) => {
+            const hasTimeline = Number.isFinite(Number(row?.start)) && Number.isFinite(Number(row?.end));
+            const label = hasTimeline ? `${formatTime(Number(row.start))}-${formatTime(Number(row.end))}` : "无时间轴";
+            return `<div class="debug-boundary-row"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(String(row?.text || ""))}</span></div>`;
+        }).join("");
+    };
+    const content = boundaries.length
+        ? boundaries.map((item) => `
+            <details class="debug-details">
+                <summary>Chunk ${Number(item?.chunkIndex || 0)}/${Number(item?.chunkCount || 0)} · ${formatTime(Number(item?.startSec || 0))}-${formatTime(Number(item?.endSec || 0))}</summary>
+                <div class="debug-boundary-group"><b>本片开头</b>${renderRows(item?.sourceHead || [])}</div>
+                <div class="debug-boundary-group"><b>本片结尾</b>${renderRows(item?.sourceTail || [])}</div>
+                <div class="debug-boundary-group"><b>合并前上一片尾部</b>${renderRows(item?.mergedTailBefore || [])}</div>
+                <div class="debug-boundary-group"><b>合并后尾部</b>${renderRows(item?.mergedTailAfter || [])}</div>
+            </details>
+        `).join("")
+        : `<div class="empty-text">当前还没有 ASR 切片边界诊断数据。</div>`;
+    return `
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head">
+                <div><strong>ASR 切片边界</strong><span>${boundaries.length} 个边界诊断</span></div>
+                <span class="debug-risk-badge state">状态快照</span>
+            </div>
+            ${content}
+        </section>
     `;
 }
 
@@ -5988,44 +6123,251 @@ function renderDebugPanel(panel) {
     panel.dataset.lastSignature = "debug";
     const manifestVersion = globalThis.chrome?.runtime?.getManifest?.()?.version || "";
     const buildText = manifestVersion
-        ? `调试面板构建时间：${DEBUG_PANEL_BUILD_STAMP} · v${manifestVersion}`
-        : `调试面板构建时间：${DEBUG_PANEL_BUILD_STAMP}`;
+        ? `${DEBUG_PANEL_BUILD_STAMP} · v${manifestVersion}`
+        : DEBUG_PANEL_BUILD_STAMP;
+    const activeTab = ["overview", "scenarios", "logs", "state"].includes(appState.debugToolsTab)
+        ? appState.debugToolsTab
+        : "overview";
+    appState.debugToolsTab = activeTab;
+    stopRealtimeLogPolling();
+    const tabContent = activeTab === "scenarios"
+        ? renderDebugScenariosPanel()
+        : activeTab === "logs"
+            ? renderRealtimeLogPanel()
+            : activeTab === "state"
+                ? renderDebugStatePanel()
+                : renderDebugOverviewPanel();
     panel.innerHTML = `
-        <div class="page-header">
-            <div>
-                <h3>测试</h3>
-                <div class="empty-text" style="margin-top:4px;">${escapeHtml(buildText)}</div>
+        <div class="page-header debug-tools-header">
+            <div class="debug-tools-title">
+                <div>
+                    <h3>开发者工具</h3>
+                    <div class="empty-text">${escapeHtml(buildText)}</div>
+                </div>
+                <span class="debug-runtime-badge"><i></i>Debug 已开启</span>
+            </div>
+            <div class="debug-header-actions">
+                <button type="button" class="panel-btn ghost" data-action="debug-copy-diagnostics">复制诊断</button>
+                <button type="button" class="panel-btn ghost" data-action="debug-clear-session">清空会话</button>
             </div>
         </div>
+        <nav class="debug-tools-tabs" aria-label="开发者工具页签">
+            ${[
+                ["overview", "概览"],
+                ["scenarios", "场景测试"],
+                ["logs", "日志"],
+                ["state", "状态"]
+            ].map(([id, label]) => `<button type="button" class="${activeTab === id ? "active" : ""}" data-action="debug-switch-tab" data-tab="${id}">${label}</button>`).join("")}
+        </nav>
         <div class="page-body debug-page-body">
-            ${renderTaskRetryDebugPanel()}
-            ${renderSegmentPromptDebugControls()}
-            ${renderSubtitleEmptyDemoControls()}
-            ${renderAsrUiTracePanel()}
-            ${renderErrorDemoControls()}
-            ${renderRealtimeLogPanel()}
+            ${tabContent}
         </div>
     `;
-    bindSegmentPromptDebugControls(panel);
-    bindRealtimeLogPanel(panel);
-    renderAsrUiTraceData();
-    renderRealtimeLogData();
-    startRealtimeLogPolling();
+    if (activeTab === "scenarios") bindSegmentPromptDebugControls(panel);
+    if (activeTab === "logs") {
+        bindRealtimeLogPanel(panel);
+        renderRealtimeLogData();
+        startRealtimeLogPolling();
+    }
+}
+
+function renderDebugScenarioResult() {
+    const result = appState.debugScenarioResult;
+    if (!result) {
+        return `<div class="debug-empty-card">尚未运行场景。进入“场景测试”后选择一个测试开始。</div>`;
+    }
+    const statusLabel = {
+        running: "运行中",
+        passed: "通过",
+        failed: "失败",
+        cancelled: "已取消",
+        needs_config: "需要配置"
+    }[result.status] || "完成";
+    return `
+        <article class="debug-result-card ${escapeHtml(result.status)}">
+            <div class="debug-result-head">
+                <span><i></i>${escapeHtml(statusLabel)}</span>
+                <time>${escapeHtml(formatTimelineTime(result.updatedAt))}</time>
+            </div>
+            <strong>${escapeHtml(result.title)}</strong>
+            ${result.expected ? `<p><b>预期：</b>${escapeHtml(result.expected)}</p>` : ""}
+            ${result.actual ? `<p><b>实际：</b>${escapeHtml(result.actual)}</p>` : ""}
+            <div class="debug-result-meta">
+                <span>Trace ${escapeHtml(result.traceId)}</span>
+                ${result.durationMs ? `<span>${Math.round(result.durationMs)} ms</span>` : ""}
+            </div>
+        </article>
+    `;
+}
+
+function renderDebugOverviewPanel() {
+    const bvid = normalizeBvidCase(resolveCurrentBvid() || appState.cache?.bvid || "") || "-";
+    const cid = Number(resolveCid() || appState.cache?.cid || 0);
+    const tid = String(getTidFromUrl(location.href) || "");
+    const taskStatus = appState.tabState?.taskStatus || {};
+    const taskRows = [
+        ["Summary", taskStatus.summary || "idle"],
+        ["Segments", taskStatus.segments || "idle"],
+        ["Real-time", taskStatus.rumors || "idle"],
+        ["ASR", isTranscriptionRunning() ? "processing" : "idle"]
+    ];
+    return `
+        <section class="debug-overview-hero">
+            <div><span>当前视频</span><strong>${escapeHtml(bvid)}</strong><small>${cid ? `CID ${cid}` : "CID 未知"}${tid ? ` · P${escapeHtml(tid)}` : ""}</small></div>
+            <div><span>Provider</span><strong>${escapeHtml(String(appState.settings?.provider || "-"))}</strong><small>${escapeHtml(String(appState.settings?.model || "未选择模型"))}</small></div>
+        </section>
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head"><div><strong>当前任务</strong><span>当前标签页的任务状态</span></div><span class="debug-risk-badge state">实时状态</span></div>
+            <div class="debug-task-status-list">
+                ${taskRows.map(([label, status]) => `<div><span>${label}</span><b class="status-${escapeHtml(status)}">${escapeHtml(status)}</b></div>`).join("")}
+            </div>
+        </section>
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head"><div><strong>最近场景</strong><span>场景运行结果和关联 Trace</span></div></div>
+            ${renderDebugScenarioResult()}
+        </section>
+        <section class="debug-quick-actions">
+            <button type="button" class="panel-btn ghost" data-action="debug-switch-tab" data-tab="scenarios">运行场景测试</button>
+            <button type="button" class="panel-btn ghost" data-action="debug-switch-tab" data-tab="logs">查看日志</button>
+            <button type="button" class="panel-btn ghost" data-action="debug-switch-tab" data-tab="state">查看状态快照</button>
+        </section>
+    `;
+}
+
+function renderDebugScenariosPanel() {
+    return `
+        ${renderTaskRetryDebugPanel()}
+        ${renderErrorDemoControls()}
+        ${renderSubtitleEmptyDemoControls()}
+        ${renderLifecycleDemoControls()}
+        ${renderSegmentPromptDebugControls()}
+    `;
+}
+
+function buildDebugStateSnapshot() {
+    const bvid = normalizeBvidCase(resolveCurrentBvid() || appState.cache?.bvid || "");
+    const cid = Number(resolveCid() || appState.cache?.cid || 0);
+    const tid = String(getTidFromUrl(location.href) || "");
+    const rawRows = Array.isArray(appState.cache?.rawSubtitle) ? appState.cache.rawSubtitle : [];
+    const processedRows = Array.isArray(appState.cache?.processedSubtitle) ? appState.cache.processedSubtitle : [];
+    return {
+        video: {
+            bvid,
+            cid,
+            page: tid,
+            part_key: bvid && cid ? `${bvid}::${cid}` : ""
+        },
+        subtitle: {
+            source: appState.cache?.subtitleSource || appState.cache?.source || "",
+            raw_rows: rawRows.length,
+            processed_rows: processedRows.length,
+            active_language: appState.activeSubtitleId || ""
+        },
+        tasks: { ...(appState.tabState?.taskStatus || {}) },
+        asr: {
+            active: !!appState.asrSession?.active,
+            stage: appState.asrSession?.stage || "",
+            progress: Number(appState.asrSession?.progress || 0),
+            provider: appState.settings?.asrProvider || "groq"
+        },
+        cache: {
+            present: !!appState.cache,
+            schema_version: Number(appState.cache?.schemaVersion || 0),
+            has_summary: !!String(appState.cache?.summary || "").trim(),
+            segment_count: Array.isArray(appState.cache?.segments) ? appState.cache.segments.length : 0,
+            history_count: Array.isArray(appState.cache?.history) ? appState.cache.history.length : 0,
+            task_sources: appState.cache?.taskSources || {}
+        },
+        runtime: {
+            debug: isDebugLoggingEnabled(),
+            tab_id: Number(appState.tabId || 0),
+            provider: appState.settings?.provider || "",
+            model: appState.settings?.model || ""
+        }
+    };
+}
+
+function renderDebugStatePanel() {
+    const snapshot = buildDebugStateSnapshot();
+    const rows = [
+        ["BVID", snapshot.video.bvid || "-"],
+        ["CID / P", `${snapshot.video.cid || "-"} / ${snapshot.video.page || "-"}`],
+        ["字幕", `${snapshot.subtitle.processed_rows || snapshot.subtitle.raw_rows} 行 · ${snapshot.subtitle.source || "未知来源"}`],
+        ["ASR", snapshot.asr.active ? `${snapshot.asr.stage || "运行中"} · ${snapshot.asr.progress}%` : "空闲"],
+        ["缓存", snapshot.cache.present ? `命中 · ${snapshot.cache.segment_count} 个分段` : "未命中"],
+        ["Provider", `${snapshot.runtime.provider || "-"} · ${snapshot.runtime.model || "-"}`]
+    ];
+    return `
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head"><div><strong>当前状态快照</strong><span>不包含字幕正文、Prompt 和密钥</span></div><span class="debug-risk-badge state">只读</span></div>
+            <div class="debug-state-table">
+                ${rows.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join("")}
+            </div>
+        </section>
+        ${renderAsrChunkingStatePanel()}
+        <section class="debug-tool-card">
+            <details class="debug-details">
+                <summary>原始状态 JSON</summary>
+                <pre class="debug-state-json">${escapeHtml(JSON.stringify(snapshot, null, 2))}</pre>
+            </details>
+        </section>
+    `;
 }
 
 function bindSegmentPromptDebugControls(panel) {
     const retryTestBtn = panel?.querySelector('[data-action="debug-run-segments-retry-test"]');
     if (retryTestBtn) {
         retryTestBtn.addEventListener("click", async () => {
+            const confirmed = window.confirm("该测试会真实调用当前 AI Provider，可能产生 API 费用。确定继续吗？");
+            if (!confirmed) {
+                recordDebugScenarioResult({
+                    id: "segments_retry",
+                    title: "分段自动重试",
+                    status: "cancelled",
+                    expected: "主请求失败后采用保守 Prompt 恢复",
+                    actual: "已取消，未发起请求"
+                });
+                renderContent();
+                return;
+            }
             retryTestBtn.disabled = true;
+            const startedAt = Date.now();
+            const traceId = `debug_segments_retry_${startedAt.toString(36)}`;
+            recordDebugScenarioResult({
+                id: "segments_retry",
+                title: "分段自动重试",
+                status: "running",
+                expected: "主请求失败后采用保守 Prompt 恢复",
+                actual: "正在运行",
+                traceId
+            });
             try {
                 clearPanelError("summary");
                 await runTasks(["segments"], { overrideAction: "RUN_SEGMENTS_RETRY_TEST" });
+                recordDebugScenarioResult({
+                    id: "segments_retry",
+                    title: "分段自动重试",
+                    status: "passed",
+                    expected: "主请求失败后采用保守 Prompt 恢复",
+                    actual: "测试请求已完成，请结合状态和日志确认恢复路径",
+                    durationMs: Date.now() - startedAt,
+                    traceId
+                });
                 showToast("已触发分段自动重试测试");
             } catch (error) {
+                recordDebugScenarioResult({
+                    id: "segments_retry",
+                    title: "分段自动重试",
+                    status: "failed",
+                    expected: "主请求失败后采用保守 Prompt 恢复",
+                    actual: error?.message || "测试失败",
+                    durationMs: Date.now() - startedAt,
+                    traceId
+                });
                 showToast(error.message || "触发测试失败");
             } finally {
                 retryTestBtn.disabled = false;
+                renderContent();
             }
         });
     }
@@ -6033,6 +6375,10 @@ function bindSegmentPromptDebugControls(panel) {
     if (debugSelect) {
         debugSelect.addEventListener("change", async () => {
             const debugMode = String(debugSelect.value || "false") === "true";
+            if (!debugMode && !window.confirm("关闭后开发者工具入口会隐藏，并返回设置页。确定关闭吗？")) {
+                debugSelect.value = "true";
+                return;
+            }
             const nextSettings = { ...(appState.settings || {}), debugMode };
             try {
                 const res = await chrome.runtime.sendMessage({ action: "SAVE_SETTINGS", settings: nextSettings });
@@ -6077,8 +6423,26 @@ function bindSegmentPromptDebugControls(panel) {
 
 function renderRealtimeLogPanel() {
     return `
-        <div class="settings-group-title">实时日志</div>
-        <div class="debug-log-panel">
+        <section class="debug-tool-card debug-log-tool-card">
+            <div class="debug-tool-card-head">
+                <div><strong>统一日志</strong><span>结构化日志与 ASR UI Trace 合并展示</span></div>
+                <span class="debug-risk-badge state">本地会话</span>
+            </div>
+            <div class="debug-log-filters">
+                <select id="debug-log-level" aria-label="日志等级">
+                    ${["all", "error", "warn", "info", "debug"].map((level) => `<option value="${level}" ${appState.debugLogLevel === level ? "selected" : ""}>${level === "all" ? "全部等级" : level.toUpperCase()}</option>`).join("")}
+                </select>
+                <select id="debug-log-module" aria-label="日志模块">
+                    ${["all", "asr_ui", "asr", "download", "subtitle", "ai", "cache", "background", "content", "ui", "inject", "cloud"].map((module) => `<option value="${module}" ${appState.debugLogModule === module ? "selected" : ""}>${module === "all" ? "全部模块" : module}</option>`).join("")}
+                </select>
+                <input id="debug-log-query" type="search" value="${escapeHtml(appState.debugLogQuery || "")}" placeholder="搜索事件、任务、错误码">
+                <label class="debug-log-failure-toggle"><input id="debug-log-only-failures" type="checkbox" ${appState.debugLogOnlyFailures ? "checked" : ""}>只看失败/兜底</label>
+            </div>
+            <div class="debug-log-view-switch">
+                <button type="button" class="${appState.debugLogView === "timeline" ? "active" : ""}" data-action="debug-log-view" data-view="timeline">时间线</button>
+                <button type="button" class="${appState.debugLogView === "raw" ? "active" : ""}" data-action="debug-log-view" data-view="raw">原始日志</button>
+            </div>
+            <div class="debug-log-panel">
             <div class="debug-log-toolbar">
                 <span class="debug-log-status" id="debug-log-status">自动刷新中</span>
                 <div class="debug-log-actions">
@@ -6087,43 +6451,39 @@ function renderRealtimeLogPanel() {
                     <button type="button" class="panel-btn ghost" data-action="debug-logs-clear">清空</button>
                 </div>
             </div>
-            <pre class="debug-log-body" id="debug-log-body">正在读取日志...</pre>
-        </div>
-    `;
-}
-
-function renderAsrUiTracePanel() {
-    return `
-        <div class="settings-group-title">转录 UI 状态日志</div>
-        <div class="debug-log-panel">
-            <div class="debug-log-toolbar">
-                <span class="debug-log-status" id="debug-asr-ui-log-status">本页本地记录</span>
-                <div class="debug-log-actions">
-                    <button type="button" class="panel-btn ghost" data-action="debug-asr-ui-copy">复制</button>
-                    <button type="button" class="panel-btn ghost" data-action="debug-asr-ui-clear">清空</button>
-                </div>
+                <div class="debug-log-body" id="debug-log-body">正在读取日志...</div>
             </div>
-            <pre class="debug-log-body debug-asr-ui-log-body" id="debug-asr-ui-log-body">暂无转录 UI 状态日志。</pre>
-        </div>
+        </section>
     `;
 }
 
 function bindRealtimeLogPanel(panel) {
     if (!panel) return;
+    const refresh = () => renderRealtimeLogData();
+    panel.querySelector("#debug-log-level")?.addEventListener("change", (event) => {
+        appState.debugLogLevel = String(event.target?.value || "all");
+        refresh();
+    });
+    panel.querySelector("#debug-log-module")?.addEventListener("change", (event) => {
+        appState.debugLogModule = String(event.target?.value || "all");
+        refresh();
+    });
+    panel.querySelector("#debug-log-query")?.addEventListener("input", (event) => {
+        appState.debugLogQuery = String(event.target?.value || "");
+        refresh();
+    });
+    panel.querySelector("#debug-log-only-failures")?.addEventListener("change", (event) => {
+        appState.debugLogOnlyFailures = !!event.target?.checked;
+        refresh();
+    });
     panel.querySelector('[data-action="debug-logs-refresh"]')?.addEventListener("click", () => {
-        renderRealtimeLogData();
+        refresh();
     });
     panel.querySelector('[data-action="debug-logs-copy"]')?.addEventListener("click", () => {
         copyRealtimeLogData();
     });
     panel.querySelector('[data-action="debug-logs-clear"]')?.addEventListener("click", () => {
         clearRealtimeLogs();
-    });
-    panel.querySelector('[data-action="debug-asr-ui-copy"]')?.addEventListener("click", () => {
-        copyAsrUiTraceData();
-    });
-    panel.querySelector('[data-action="debug-asr-ui-clear"]')?.addEventListener("click", () => {
-        clearAsrUiTraceData();
     });
 }
 
@@ -9399,13 +9759,57 @@ async function renderRealtimeLogData() {
     try {
         const res = await chrome.runtime.sendMessage({ action: "GET_LOGS" });
         if (!res?.ok) throw new Error(res?.error || "读取日志失败");
-        const logs = Array.isArray(res.logs) ? res.logs : [];
-        box.textContent = logs.length
-            ? logs.slice(-DEBUG_LOG_DISPLAY_LIMIT).map(formatLogEntryLine).join("\n")
-            : "暂无日志。请先在测试页或插件里触发一次操作。";
+        const structuredLogs = Array.isArray(res.logs) ? res.logs : [];
+        const asrUiLogs = (Array.isArray(appState.asrUiTraceLogs) ? appState.asrUiTraceLogs : []).map((item) => ({
+            time: item?.time || "",
+            level: "debug",
+            module: "asr_ui",
+            event: item?.event || "asr_ui_trace",
+            task: "transcribe",
+            source: "content",
+            detail: item?.detail || {}
+        }));
+        const logs = [...structuredLogs, ...asrUiLogs]
+            .sort((left, right) => String(left?.time || "").localeCompare(String(right?.time || "")));
+        const query = String(appState.debugLogQuery || "").trim().toLowerCase();
+        const filtered = logs.filter((item) => {
+            if (appState.debugLogLevel !== "all" && String(item?.level || "") !== appState.debugLogLevel) return false;
+            if (appState.debugLogModule !== "all" && String(item?.module || "") !== appState.debugLogModule) return false;
+            if (appState.debugLogOnlyFailures) {
+                const signal = `${item?.level || ""} ${item?.event || ""} ${item?.code || ""}`.toLowerCase();
+                if (!/(warn|error|fail|timeout|abort|fallback|retry|denied|invalid|blocked|mismatch)/.test(signal)) return false;
+            }
+            if (query) {
+                const searchable = [
+                    item?.event,
+                    item?.task,
+                    item?.task_id,
+                    item?.trace_id,
+                    item?.module,
+                    item?.code,
+                    item?.fallback,
+                    item?.provider,
+                    item?.model,
+                    JSON.stringify(item?.detail || {})
+                ].join(" ").toLowerCase();
+                if (!searchable.includes(query)) return false;
+            }
+            return true;
+        });
+        const shownLogs = filtered.slice(-DEBUG_LOG_DISPLAY_LIMIT);
+        if (appState.debugLogView === "raw") {
+            box.classList.add("raw");
+            box.textContent = shownLogs.length
+                ? shownLogs.map(formatLogEntryLine).join("\n")
+                : "没有符合当前筛选条件的日志。";
+        } else {
+            box.classList.remove("raw");
+            box.innerHTML = shownLogs.length
+                ? shownLogs.map(formatDebugTimelineEntry).join("")
+                : `<div class="debug-log-empty">没有符合当前筛选条件的日志。</div>`;
+        }
         if (status) {
-            const shown = Math.min(logs.length, DEBUG_LOG_DISPLAY_LIMIT);
-            status.textContent = `${logs.length} 条，显示 ${shown} 条，${formatTimelineTime(Date.now())} 已刷新`;
+            status.textContent = `${logs.length} 条 · 筛选后 ${filtered.length} 条 · 显示 ${shownLogs.length} 条`;
         }
     } catch (error) {
         box.textContent = `读取日志失败：${error.message || "未知错误"}`;
@@ -9421,55 +9825,22 @@ async function renderRealtimeLogData() {
     }
 }
 
-function formatAsrUiTraceLine(item) {
-    const detail = item?.detail && typeof item.detail === "object" ? item.detail : {};
-    return `${item?.time || ""} ${item?.event || ""} | ${JSON.stringify(detail)}`;
-}
-
-function renderAsrUiTraceData() {
-    const box = panelShadowRoot ? panelShadowRoot.getElementById("debug-asr-ui-log-body") : null;
-    const status = panelShadowRoot ? panelShadowRoot.getElementById("debug-asr-ui-log-status") : null;
-    if (!box) return;
-    const logs = Array.isArray(appState.asrUiTraceLogs) ? appState.asrUiTraceLogs : [];
-    box.textContent = logs.length
-        ? logs.slice(-200).map(formatAsrUiTraceLine).join("\n")
-        : "暂无转录 UI 状态日志。点击转录后这里会记录按钮/进度条状态。";
-    if (status) {
-        const shown = Math.min(logs.length, 200);
-        status.textContent = `${logs.length} 条，显示 ${shown} 条，${formatTimelineTime(Date.now())} 已刷新`;
-    }
-}
-
 function formatLogEntryLine(item) {
     const detail = item?.detail && typeof item.detail === "object" ? item.detail : {};
     const meta = [
         item?.task ? `task=${item.task}` : "",
+        item?.task_id ? `task_id=${item.task_id}` : "",
+        item?.trace_id ? `trace=${item.trace_id}` : "",
         item?.bvid ? `bvid=${item.bvid}` : "",
         item?.provider ? `provider=${item.provider}` : "",
         item?.model ? `model=${item.model}` : "",
         item?.code ? `code=${item.code}` : "",
         item?.status ? `status=${item.status}` : "",
+        item?.fallback ? `fallback=${item.fallback}` : "",
         item?.duration_ms ? `duration=${item.duration_ms}ms` : ""
     ].filter(Boolean).join(" ");
     const detailText = JSON.stringify(detail || {});
     return `${item?.time || ""} ${String(item?.level || "").toUpperCase()} [${item?.module || ""}] ${item?.event || ""}${meta ? ` | ${meta}` : ""} | ${detailText}`;
-}
-
-function copyAsrUiTraceData() {
-    const box = panelShadowRoot ? panelShadowRoot.getElementById("debug-asr-ui-log-body") : null;
-    const text = box?.textContent || "";
-    if (!text) return;
-    navigator.clipboard.writeText(text).then(() => {
-        showToast("转录 UI 日志已复制");
-    }).catch(() => {
-        showToast("复制失败");
-    });
-}
-
-function clearAsrUiTraceData() {
-    appState.asrUiTraceLogs = [];
-    renderAsrUiTraceData();
-    showToast("转录 UI 日志已清空");
 }
 
 function copyRealtimeLogData() {
@@ -9488,9 +9859,77 @@ function copyRealtimeLogData() {
     });
 }
 
+async function copyDebugDiagnosticReport() {
+    try {
+        const response = await chrome.runtime.sendMessage({ action: "GET_LOGS" });
+        const report = {
+            generated_at: new Date().toISOString(),
+            extension_version: globalThis.chrome?.runtime?.getManifest?.()?.version || "",
+            state: buildDebugStateSnapshot(),
+            last_scenario: appState.debugScenarioResult || null,
+            logs: Array.isArray(response?.logs) ? response.logs.slice(-200) : [],
+            asr_ui_trace: Array.isArray(appState.asrUiTraceLogs) ? appState.asrUiTraceLogs.slice(-100) : []
+        };
+        await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+        showToast("诊断报告已复制");
+    } catch (error) {
+        showToast("复制诊断报告失败");
+        logContent.error("task_abort", {
+            task: "copy_diagnostics",
+            code: "DIAGNOSTIC_COPY_FAILED",
+            detail: { error_message: error?.message || "复制失败" }
+        });
+    }
+}
+
+function formatDebugTimelineEntry(item) {
+    const level = String(item?.level || "info").toLowerCase();
+    const time = item?.time ? new Date(item.time).toLocaleTimeString() : "--:--:--";
+    const detail = item?.detail && typeof item.detail === "object" ? item.detail : {};
+    const meta = [
+        item?.task ? `task=${item.task}` : "",
+        item?.task_id ? `task_id=${item.task_id}` : "",
+        item?.trace_id ? `trace=${item.trace_id}` : "",
+        item?.provider ? `provider=${item.provider}` : "",
+        item?.code ? `code=${item.code}` : "",
+        item?.status ? `status=${item.status}` : "",
+        item?.fallback ? `fallback=${item.fallback}` : "",
+        item?.duration_ms ? `${item.duration_ms}ms` : "",
+        Number.isFinite(Number(detail.queue_wait_ms)) ? `queue=${Number(detail.queue_wait_ms)}ms` : "",
+        Number.isFinite(Number(detail.provider_request_ms)) ? `request=${Number(detail.provider_request_ms)}ms` : "",
+        Number.isFinite(Number(detail.first_response_ms)) ? `first=${Number(detail.first_response_ms)}ms` : "",
+        detail.timeout_phase ? `phase=${detail.timeout_phase}` : ""
+    ].filter(Boolean);
+    const detailText = JSON.stringify(detail);
+    return `
+        <article class="debug-log-entry level-${escapeHtml(level)}">
+            <div class="debug-log-entry-main">
+                <time>${escapeHtml(time)}</time>
+                <span class="debug-level-chip">${escapeHtml(level.toUpperCase())}</span>
+                <b>${escapeHtml(String(item?.module || ""))}</b>
+                <strong>${escapeHtml(String(item?.event || "unknown_event"))}</strong>
+            </div>
+            ${meta.length ? `<div class="debug-log-entry-meta">${meta.map((value) => `<span>${escapeHtml(value)}</span>`).join("")}</div>` : ""}
+            ${detailText !== "{}" ? `<details><summary>详情</summary><pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre></details>` : ""}
+        </article>
+    `;
+}
+
+async function clearDebugSession() {
+    try {
+        await chrome.runtime.sendMessage({ action: "CLEAR_LOGS" });
+    } catch (_) {}
+    appState.asrUiTraceLogs = [];
+    appState.debugScenarioResult = null;
+    appState.panelErrors = {};
+    renderContent();
+    showToast("本次调试会话已清空");
+}
+
 async function clearRealtimeLogs() {
     try {
         await chrome.runtime.sendMessage({ action: "CLEAR_LOGS" });
+        appState.asrUiTraceLogs = [];
         await renderRealtimeLogData();
         showToast("日志已清空");
     } catch (error) {

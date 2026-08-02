@@ -36,13 +36,31 @@ describe("sentryReporter", () => {
 
   it("keeps raw ai response when explicitly allowed", () => {
     const rawText = "模型原始返回 {" + "x".repeat(1200) + "}";
+    const providerRaw = JSON.stringify({ choices: [{ message: { content: rawText } }] });
     const sanitized = sanitizeForSentry({
       ai_response_raw: rawText,
+      ai_provider_response_raw: providerRaw,
       prompt: "完整 Prompt"
     });
 
     expect(sanitized.ai_response_raw).toBe(rawText);
+    expect(sanitized.ai_provider_response_raw).toBe(providerRaw);
     expect(sanitized.prompt).toBe("[Filtered]");
+
+    const event = createSentryEvent(new Error("分段格式解析失败"), {
+      task: "segments",
+      ai_response_raw: rawText,
+      ai_provider_response_raw: providerRaw,
+      ai_response_attempts: [{
+        attempt: 1,
+        response_text: rawText,
+        provider_response: providerRaw
+      }]
+    });
+    expect(event.extra.ai_response_raw).toBe(rawText);
+    expect(event.extra.ai_provider_response_raw).toBe(providerRaw);
+    expect(event.extra.ai_response_attempts[0].response_text).toBe(rawText);
+    expect(event.extra.ai_response_attempts[0].provider_response).toBe(providerRaw);
   });
 
   it("keeps subtitle and duration stats while still filtering subtitle text", () => {
@@ -93,6 +111,35 @@ describe("sentryReporter", () => {
     });
     expect(event.contexts.runtime.userAgent).toBe("Chrome Test");
     expect(event.contexts.platform.os).toBe("win");
+  });
+
+  it("tags timeout phase and stream mode while keeping timing values in extra", () => {
+    const event = createSentryEvent(new Error("模型长时间没有开始返回内容，请重试"), {
+      task: "summary",
+      provider: "custom",
+      model: "LongCat-2.0",
+      timeout_phase: "first_response",
+      request_stream: true,
+      queue_wait_ms: 2300,
+      provider_request_ms: 60012,
+      first_response_ms: undefined,
+      timeout_ms: 60000
+    }, {
+      extensionVersion: "1.5.2"
+    });
+
+    expect(event.tags).toMatchObject({
+      timeout_phase: "first_response",
+      request_stream: "true",
+      extension_version: "1.5.2"
+    });
+    expect(event.extra).toMatchObject({
+      queue_wait_ms: 2300,
+      provider_request_ms: 60012,
+      timeout_ms: 60000
+    });
+    expect(event.tags).not.toHaveProperty("queue_wait_ms");
+    expect(event.tags).not.toHaveProperty("provider_request_ms");
   });
 
   it("fills provider and model from settings when context is missing", async () => {
@@ -238,6 +285,13 @@ describe("sentryReporter", () => {
     expect(shouldReportToSentry(new Error("请先配置 API Key"))).toBe(false);
     expect(shouldReportToSentry(new Error("当前视频暂无字幕，无法生成总结"))).toBe(false);
     expect(shouldReportToSentry({ message: "用户取消授权", code: "USER_CANCELLED" })).toBe(false);
+    expect(shouldReportToSentry({ message: "已停止生成", code: "ABORTED" })).toBe(false);
+    expect(shouldReportToSentry(new Error("自定义 API 地址必须使用 https"))).toBe(false);
+    expect(shouldReportToSentry(new Error("Failed to construct 'URL': Invalid URL"))).toBe(false);
+    expect(shouldReportToSentry(new Error("未获取到视频字幕"))).toBe(false);
+    expect(shouldReportToSentry(new Error("IO error: FILE_ERROR_NO_SPACE"))).toBe(false);
+    expect(shouldReportToSentry(new Error("A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received"))).toBe(false);
+    expect(shouldReportToSentry(new Error("Could not establish connection. Receiving end does not exist."))).toBe(false);
     expect(shouldReportToSentry(new Error("Cannot read properties of undefined"))).toBe(true);
 
     const result = await reportToSentry(

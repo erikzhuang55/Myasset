@@ -30,6 +30,14 @@ describe("providerAdapter", () => {
     }, [{ role: "user", content: "hello" }]);
 
     expect(result.text).toBe("总结完成");
+    expect(result.responseMeta).toMatchObject({
+      contentState: "text",
+      choiceCount: 1,
+      reasoningChars: 0
+    });
+    expect(JSON.parse(result.responseMeta.rawResponse)).toMatchObject({
+      choices: [{ message: { content: "总结完成" } }]
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("https://api.openai.com/v1/chat/completions");
@@ -39,6 +47,33 @@ describe("providerAdapter", () => {
       messages: [{ role: "user", content: "hello" }],
       stream: false
     });
+  });
+
+  it("keeps the raw provider response when OpenAI-compatible content is empty", async () => {
+    const responseBody = {
+      id: "chatcmpl-empty",
+      choices: [{
+        message: { content: null, reasoning_content: "只返回了推理过程" },
+        finish_reason: "length"
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 }
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => mockJsonResponse(responseBody)));
+
+    const result = await callAI("openai", {
+      provider: "openai",
+      apiKey: "sk-test",
+      model: "gpt-test"
+    }, [{ role: "user", content: "生成分段" }]);
+
+    expect(result.text).toBe("");
+    expect(result.responseMeta).toMatchObject({
+      contentState: "null",
+      finishReason: "length",
+      choiceCount: 1,
+      reasoningChars: 8
+    });
+    expect(JSON.parse(result.responseMeta.rawResponse)).toEqual(responseBody);
   });
 
   it("retries provider network failures for non-stream requests and then succeeds", async () => {
@@ -419,6 +454,9 @@ describe("providerAdapter", () => {
     expect(result.text).toBe("正式总结");
     expect(onDelta).toHaveBeenCalledTimes(1);
     expect(onDelta).toHaveBeenCalledWith("正式总结");
+    expect(result.responseMeta.reasoningChars).toBe(6);
+    expect(result.responseMeta.rawResponse).toContain("让我分析一下");
+    expect(result.responseMeta.contentState).toBe("text");
   });
 
   it("parses the final OpenAI-compatible stream event without trailing blank line", async () => {
