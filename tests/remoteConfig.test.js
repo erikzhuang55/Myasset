@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildEffectiveProviderCatalog,
+  isRemoteConfigCacheFresh,
   isRemoteFeatureEnabled,
   normalizeRemoteConfigRow,
 } from "../utils/remoteConfig.js";
@@ -60,5 +61,13 @@ describe("remote configuration", () => {
   it("falls back safely when a feature flag is absent", () => {
     expect(isRemoteFeatureEnabled({}, "unknown", false)).toBe(false);
     expect(isRemoteFeatureEnabled({ featureFlags: { enabled: true } }, "enabled", false)).toBe(true);
+  });
+
+  it("refreshes remote configuration only after the daily cache expires", () => {
+    const now = Date.UTC(2026, 7, 4, 0, 0, 0);
+    expect(isRemoteConfigCacheFresh(now - 23 * 60 * 60 * 1000, now)).toBe(true);
+    expect(isRemoteConfigCacheFresh(now - 24 * 60 * 60 * 1000, now)).toBe(false);
+    expect(isRemoteConfigCacheFresh(0, now)).toBe(false);
+    expect(isRemoteConfigCacheFresh(now + 1, now)).toBe(false);
   });
 });

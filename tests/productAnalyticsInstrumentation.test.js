@@ -34,8 +34,35 @@ describe("product analytics instrumentation", () => {
   it("routes provider authentication failures to product analytics instead of Sentry", () => {
     expect(background).toContain('eventName: "provider_auth_failed"');
     expect(background).toContain('errorCode: "HTTP_401"');
-    expect(background).toContain('provider: String(context?.provider || errorInput?.provider || settings?.provider || "")');
+    expect(background).toContain('provider: String(mergedContext?.provider || errorInput?.provider || settings?.provider || "")');
     expect(background).toContain('reason: "provider_auth_failed_metric"');
+  });
+
+  it("captures a generated task only once at its final failure boundary", () => {
+    expect(background).toContain('source: "task_final_failure"');
+    expect(background).toContain('task_id: taskId');
+    expect(background).toContain('reason: "task_already_captured"');
+    expect(background).toContain('if (errorInput?.__sentryCaptured) return { sent: false, reason: "already_captured" }');
+    expect(background).toMatch(/task: "transcribe",\s*task_id: taskId/);
+    expect(background).toMatch(/task: "chat",\s*task_id: taskId/);
+    expect(background).not.toContain('source: "task_status_update"');
+    expect(content).not.toContain('reportContentError?.(error, { task: tasks.join(","), source: "run_tasks" })');
+  });
+
+  it("queues Supabase telemetry without blocking task execution", () => {
+    expect(background).toContain("function reportClientUsageEvent");
+    expect(background).toContain("void sendClientUsageEvent(payload, settingsInput)");
+    expect(background).toContain("function reportDailyFeatureUsage");
+    expect(background).toContain("void sendDailyFeatureUsage(featureName, settings, metrics, status, errorCode, usageContext)");
+  });
+
+  it("classifies terminal failures for the dashboard", () => {
+    expect(background).toContain("function resolveTaskOutcomeCategory");
+    expect(background).toContain('return "plugin_logic_failed"');
+    expect(background).toContain('return "provider_service_failed"');
+    expect(background).toContain('return "user_config_failed"');
+    expect(background).toContain('return "cancelled"');
+    expect(background).toContain('outcome_category: summaryOk && segmentsOk ? "success" : "partial_success"');
   });
 
   it("reports summary success only after a non-empty result", () => {

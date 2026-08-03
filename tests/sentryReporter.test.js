@@ -88,6 +88,7 @@ describe("sentryReporter", () => {
   it("keeps useful runtime environment fields", () => {
     const event = createSentryEvent(new Error("boom"), {
       task: "summary",
+      task_id: "summary_task_123",
       provider: "deepseek",
       model: "deepseek-chat",
       bvid: "BV1",
@@ -124,6 +125,7 @@ describe("sentryReporter", () => {
   it("tags timeout phase and stream mode while keeping timing values in extra", () => {
     const event = createSentryEvent(new Error("模型长时间没有开始返回内容，请重试"), {
       task: "summary",
+      task_id: "summary_task_123",
       provider: "custom",
       model: "LongCat-2.0",
       timeout_phase: "first_response",

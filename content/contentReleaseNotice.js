@@ -4,6 +4,42 @@
   const STORAGE_KEY = "bilitato_last_seen_version";
 
   const RELEASE_NOTES = {
+    "1.6.1": {
+      title: "Bilitato 已更新至 v1.6.1",
+      displayVersion: "v1.6.1",
+      subtitle: "本次重点降低远程配置带来的服务压力，并同步更新 ModelScope 当前可用模型。",
+      groups: [
+        {
+          tag: "优化",
+          items: [
+            {
+              title: "远程配置更轻量",
+              desc: "不再保持远程配置长连接，改为优先读取本地缓存并每日更新一次，减少后台连接和请求对正常使用的影响。",
+              highlight: true,
+            },
+            {
+              title: "服务异常时继续使用缓存",
+              desc: "远程配置暂时不可用时会继续使用本地配置，不影响字幕、总结、分段和聊天等主要功能。",
+            },
+          ],
+        },
+        {
+          tag: "更新",
+          items: [
+            {
+              title: "更新 ModelScope 模型列表",
+              desc: "新增并整理 Qwen3 与 DeepSeek V4 当前可用模型，旧版 DeepSeek-V4-Flash 会自动切换到推荐模型。",
+              highlight: true,
+            },
+            {
+              title: "推荐模型更容易选择",
+              desc: "默认使用 Qwen3-30B-A3B-Instruct-2507，并保留 Qwen3、DeepSeek V4 Pro 和 DeepSeek V4 Flash 0731 等可用选项。",
+            },
+          ],
+        },
+      ],
+      privacy: "Bilitato 不会上传您的 API Key、Prompt 或与 AI 的聊天内容。远程配置仅同步公开的可用模型和功能开关。",
+    },
     "1.6.0": {
       title: "Bilitato 已更新至 v1.6",
       displayVersion: "v1.6",
@@ -1024,7 +1060,9 @@
 
   function buildReleasePageVersions(version) {
     const majorHistory = [];
-    if (version === "1.6.0") {
+    if (version === "1.6.1") {
+      majorHistory.push("1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");
+    } else if (version === "1.6.0") {
       majorHistory.push("1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");
     } else if (version === "1.5.1" || version === "1.5.0" || version === "1.5.x") {
       majorHistory.push("1.5.x", "1.4.x", "1.3.x", "1.2.x");

@@ -62,7 +62,8 @@ describe("usageEvents", () => {
             "https://example.supabase.co/rest/v1/usage_events",
             expect.objectContaining({
                 method: "POST",
-                requestName: "usage_event_report"
+                requestName: "usage_event_report",
+                timeoutMs: 5000
             })
         );
     });

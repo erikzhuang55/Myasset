@@ -16,6 +16,22 @@ export const DEFAULT_REMOTE_CONFIG = Object.freeze({
   asr: {},
 });
 
+export const REMOTE_CONFIG_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+export function isRemoteConfigCacheFresh(
+  fetchedAt,
+  now = Date.now(),
+  maxAgeMs = REMOTE_CONFIG_CACHE_MAX_AGE_MS,
+) {
+  const fetched = Number(fetchedAt || 0);
+  const current = Number(now || 0);
+  const maxAge = Number(maxAgeMs || 0);
+  return fetched > 0
+    && current >= fetched
+    && maxAge > 0
+    && current - fetched < maxAge;
+}
+
 function cleanText(value, maxLength = 160) {
   return String(value || "").trim().slice(0, maxLength);
 }

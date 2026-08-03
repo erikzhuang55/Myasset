@@ -112,6 +112,7 @@ export function createSentryEvent(errorInput, context = {}, runtime = {}) {
   const provider = String(safeContext.provider || "").trim();
   const model = String(safeContext.model || "").trim();
   const task = String(safeContext.task || "").trim();
+  const taskId = String(safeContext.task_id || safeContext.taskId || "").trim();
   const bvid = String(safeContext.bvid || "").trim();
   const pageType = String(safeContext.pageType || "").trim();
 
@@ -127,6 +128,7 @@ export function createSentryEvent(errorInput, context = {}, runtime = {}) {
       provider,
       model,
       task,
+      task_id: taskId,
       bvid,
       code: errorMeta.code,
       status: errorMeta.status,

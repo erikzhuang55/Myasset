@@ -4,7 +4,15 @@ export const PROVIDERS = {
     modelscope: {
         name: "ModelScope (魔搭)",
         baseUrl: "https://api-inference.modelscope.cn/v1/",
-        model: "deepseek-ai/DeepSeek-V4-Flash",
+        model: "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        models: [
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "Qwen/Qwen3-235B-A22B-Instruct-2507",
+            "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            "Qwen/Qwen3-30B-A3B",
+            "deepseek-ai/DeepSeek-V4-Pro",
+            "deepseek-ai/DeepSeek-V4-Flash-0731"
+        ],
         headerKey: "Authorization",
         tokenPrefix: "Bearer ",
         regUrl: "https://modelscope.cn/my/myaccesstoken"

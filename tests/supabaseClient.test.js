@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildSupabaseHeaders, isSupabaseEnabled, supabaseRpc, supabaseSelect, supabaseWrite } from "../utils/supabaseClient.js";
+import {
+  DEFAULT_SUPABASE_REQUEST_TIMEOUT_MS,
+  buildSupabaseHeaders,
+  isSupabaseEnabled,
+  supabaseRpc,
+  supabaseSelect,
+  supabaseWrite
+} from "../utils/supabaseClient.js";
 
 const originalFetch = globalThis.fetch;
 
@@ -14,6 +21,10 @@ afterEach(() => {
 });
 
 describe("supabaseClient", () => {
+  it("uses a five second default request timeout", () => {
+    expect(DEFAULT_SUPABASE_REQUEST_TIMEOUT_MS).toBe(5000);
+  });
+
   it("detects whether supabase is configured", () => {
     expect(isSupabaseEnabled(settings)).toBe(true);
     expect(isSupabaseEnabled({ supabaseUrl: "", supabaseAnonKey: "anon-key" })).toBe(false);
@@ -41,6 +52,7 @@ describe("supabaseClient", () => {
     expect(url).toContain("https://project.supabase.co/rest/v1/video_cache?");
     expect(url).toContain("select=bvid%2Cupdated_at");
     expect(init.headers.Authorization).toBe("Bearer anon-key");
+    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
   it("writes rows with return=minimal", async () => {
@@ -56,6 +68,7 @@ describe("supabaseClient", () => {
     expect(init.method).toBe("PATCH");
     expect(init.headers.Prefer).toBe("return=minimal");
     expect(JSON.parse(init.body)).toEqual({ bvid: "BV1" });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
   it("passes request scoped headers", async () => {
@@ -78,5 +91,6 @@ describe("supabaseClient", () => {
     expect(url).toBe("https://project.supabase.co/rest/v1/rpc/increment_feature_usage_daily");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ f_name: "summary" });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 });

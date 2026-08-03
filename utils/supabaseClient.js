@@ -1,5 +1,7 @@
 import { requestJson, requestNoContent } from "./httpClient.js";
 
+export const DEFAULT_SUPABASE_REQUEST_TIMEOUT_MS = 5000;
+
 export function isSupabaseEnabled(settings) {
   return !!String(settings?.supabaseUrl || "").trim() && !!String(settings?.supabaseAnonKey || "").trim();
 }
@@ -21,6 +23,11 @@ function buildRestUrl(settings, path) {
   return `${getSupabaseBaseUrl(settings)}/rest/v1/${path}`;
 }
 
+function resolveRequestTimeoutMs(options = {}) {
+  const value = Number(options.timeoutMs);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_SUPABASE_REQUEST_TIMEOUT_MS;
+}
+
 function appendSearchParams(url, params = {}) {
   Object.entries(params || {}).forEach(([key, value]) => {
     if (value === undefined || value === null) return;
@@ -36,7 +43,8 @@ export async function supabaseSelect(settings, tableName, params = {}, options =
     method: "GET",
     headers: buildSupabaseHeaders(settings, { Accept: "application/json", ...(options.headers || {}) }),
     requestName: options.requestName || `supabase_select:${tableName}`,
-    errorMessage: options.errorMessage
+    errorMessage: options.errorMessage,
+    timeoutMs: resolveRequestTimeoutMs(options)
   });
   return Array.isArray(result.data) ? result.data : [];
 }
@@ -53,7 +61,8 @@ export async function supabaseWrite(settings, tableName, body, options = {}) {
     }),
     body: JSON.stringify(body || {}),
     requestName: options.requestName || `supabase_write:${tableName}`,
-    errorMessage: options.errorMessage
+    errorMessage: options.errorMessage,
+    timeoutMs: resolveRequestTimeoutMs(options)
   });
   return true;
 }
@@ -68,7 +77,8 @@ export async function supabaseRpc(settings, rpcName, payload = {}, options = {})
     }),
     body: JSON.stringify(payload || {}),
     requestName: options.requestName || `supabase_rpc:${rpcName}`,
-    errorMessage: options.errorMessage
+    errorMessage: options.errorMessage,
+    timeoutMs: resolveRequestTimeoutMs(options)
   });
   return true;
 }

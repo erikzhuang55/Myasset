@@ -3,11 +3,11 @@ import { robustJSONParse } from "./utils/jsonParse.js";
 import { callAI, callAIStream, PROVIDERS } from "./utils/providerAdapter.js";
 import {
     DEFAULT_REMOTE_CONFIG,
+    isRemoteConfigCacheFresh,
     buildEffectiveProviderCatalog,
     isRemoteFeatureEnabled,
     normalizeRemoteConfigRow
 } from "./utils/remoteConfig.js";
-import { createRemoteConfigRealtimeSubscription } from "./vendor/remoteConfigRealtime.js";
 import {
     MAX_SEGMENTS_REPAIR_INPUT_CHARS,
     buildSegmentsAIRepairPrompt,
@@ -72,6 +72,7 @@ const USAGE_EVENT_SESSION_ID = createUsageEventSessionId();
 const VERSION_CHECK_STORAGE_KEY = "latestVersionState";
 const VERSION_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const SEGMENTS_REPAIR_SOURCE = Symbol("segmentsRepairSource");
+const capturedSentryTaskIds = new Set();
 
 function syncRuntimeDebugFlag(enabled) {
     IS_DEBUG_MODE = !!enabled;
@@ -80,29 +81,43 @@ function syncRuntimeDebugFlag(enabled) {
 
 async function captureBackgroundError(errorInput, context = {}) {
     try {
+        if (errorInput?.__sentryCaptured) return { sent: false, reason: "already_captured" };
+        const mergedContext = {
+            ...(errorInput?.sentryContext && typeof errorInput.sentryContext === "object" ? errorInput.sentryContext : {}),
+            ...(context && typeof context === "object" ? context : {})
+        };
+        const taskId = String(mergedContext?.task_id || mergedContext?.taskId || "").trim();
+        if (taskId && capturedSentryTaskIds.has(taskId)) return { sent: false, reason: "task_already_captured" };
         if (!await hasTechnicalDataConsent()) {
             return { sent: false, reason: "technical_data_permission_denied" };
         }
         const settings = await getResolvedSettings();
-        const errorCode = String(errorInput?.code || context?.code || "").trim().toUpperCase();
-        const errorStatus = Number(errorInput?.status || context?.status || 0);
+        const errorCode = String(errorInput?.code || mergedContext?.code || "").trim().toUpperCase();
+        const errorStatus = Number(errorInput?.status || mergedContext?.status || 0);
         const errorMessage = String(errorInput?.message || errorInput || "");
+        if (taskId) {
+            capturedSentryTaskIds.add(taskId);
+            if (capturedSentryTaskIds.size > 500) {
+                capturedSentryTaskIds.delete(capturedSentryTaskIds.values().next().value);
+            }
+        }
+        if (errorInput && typeof errorInput === "object") errorInput.__sentryCaptured = true;
         if (errorCode === "HTTP_401" || errorStatus === 401 || /\b(?:HTTP|API Error)\s*401\b/i.test(errorMessage)) {
             await reportClientUsageEvent({
                 eventName: "provider_auth_failed",
-                featureName: String(context?.task || "provider"),
+                featureName: String(mergedContext?.task || "provider"),
                 status: "failed",
                 errorCode: "HTTP_401",
-                provider: String(context?.provider || errorInput?.provider || settings?.provider || ""),
-                model: String(context?.model || errorInput?.model || settings?.model || ""),
-                bvid: String(context?.bvid || ""),
-                tabId: Number(context?.tabId || 0) || undefined,
-                metadata: { source: String(context?.source || "provider_request") }
+                provider: String(mergedContext?.provider || errorInput?.provider || settings?.provider || ""),
+                model: String(mergedContext?.model || errorInput?.model || settings?.model || ""),
+                bvid: String(mergedContext?.bvid || ""),
+                tabId: Number(mergedContext?.tabId || 0) || undefined,
+                metadata: { source: String(mergedContext?.source || "provider_request") }
             }, settings);
             return { sent: false, reason: "provider_auth_failed_metric" };
         }
         const runtime = await getSentryRuntimeContext();
-        return await reportToSentry(settings, errorInput, context, runtime);
+        return await reportToSentry(settings, errorInput, mergedContext, runtime);
     } catch (_) {
         return { sent: false, reason: "report_failed" };
     }
@@ -127,14 +142,12 @@ function attachSentryContext(errorInput, context = {}) {
 
 async function captureTaskFailureToSentry(errorInput, context = {}) {
     if (!errorInput || typeof errorInput !== "object") return { sent: false, reason: "invalid_error" };
-    if (errorInput.__sentryCaptured) return { sent: false, reason: "already_captured" };
     const baseContext = {
         ...(errorInput.sentryContext && typeof errorInput.sentryContext === "object" ? errorInput.sentryContext : {}),
         ...(context && typeof context === "object" ? context : {})
     };
     const failureContext = buildSegmentsFailureSentrySummary(errorInput, baseContext);
     const mergedContext = await enrichTaskFailureContext(failureContext);
-    errorInput.__sentryCaptured = true;
     return captureBackgroundError(errorInput, mergedContext);
 }
 
@@ -470,18 +483,20 @@ function buildUsageEventMetadata(payload = {}) {
 }
 
 function buildUsageErrorPayload(error, fallback = {}) {
+    const status = error?.code === "ABORTED" ? "cancelled" : resolveUsageStatusByError(error);
     return {
-        status: error?.code === "ABORTED" ? "cancelled" : resolveUsageStatusByError(error),
+        status,
         errorCode: resolveUsageErrorCode(error, fallback.errorCode || "TASK_FAILED"),
         durationMs: Math.max(0, Date.now() - Number(fallback.startedAt || Date.now())),
         metadata: {
             message: String(error?.message || "").slice(0, 300),
+            outcome_category: resolveTaskOutcomeCategory(error, status),
             ...(fallback.metadata && typeof fallback.metadata === "object" ? fallback.metadata : {})
         }
     };
 }
 
-async function reportClientUsageEvent(payload = {}, settingsInput = null) {
+async function sendClientUsageEvent(payload = {}, settingsInput = null) {
     try {
         if (!await hasTechnicalDataConsent()) {
             return { sent: false, reason: "technical_data_permission_denied" };
@@ -539,6 +554,17 @@ async function hasTechnicalDataConsent() {
     } catch (_) {
         return false;
     }
+}
+
+function reportClientUsageEvent(payload = {}, settingsInput = null) {
+    void sendClientUsageEvent(payload, settingsInput).catch((error) => {
+        logBackground.warn("usage_event_queue_failed", {
+            task: "usage_event",
+            code: error?.code || "USAGE_EVENT_QUEUE_FAILED",
+            detail: { message: error?.message || "usage event queue failed" }
+        });
+    });
+    return { sent: false, reason: "queued" };
 }
 
 function getUsageRecoveryState(taskContext = {}, component = "task") {
@@ -820,7 +846,7 @@ const CLOUD_TASK_FIELD_MAP = {
 };
 const DEFAULT_SETTINGS = {
     provider: "modelscope",
-    model: "deepseek-ai/DeepSeek-V4-Flash",
+    model: "Qwen/Qwen3-30B-A3B-Instruct-2507",
     apiKey: "",
     providerApiKeys: {},
     providerModels: {},
@@ -857,7 +883,8 @@ const LEGACY_MODELSCOPE_MODELS = new Set([
     "ZhipuAI/GLM-5.1",
     "ZhipuAI/GLM-4.7-Flash",
     "Qwen/Qwen3.5-27B",
-    "Qwen/Qwen2.5-72B-Instruct"
+    "Qwen/Qwen2.5-72B-Instruct",
+    "deepseek-ai/DeepSeek-V4-Flash"
 ]);
 
 const queue = [];
@@ -878,7 +905,8 @@ let remoteConfigMemory = { ...DEFAULT_REMOTE_CONFIG };
 let remoteConfigLoaded = false;
 let remoteConfigLoadPromise = null;
 let remoteConfigRefreshPromise = null;
-let remoteConfigRealtimeSubscription = null;
+let remoteConfigFetchedAt = 0;
+let remoteConfigFetchedVersion = "";
 const fallbackLoggerFactory = {
     create() {
         return {
@@ -1044,7 +1072,10 @@ async function ensureRemoteConfigLoaded() {
         remoteConfigLoadPromise = chrome.storage.local.get([REMOTE_CONFIG_STORAGE_KEY])
             .then((stored) => {
                 if (stored?.[REMOTE_CONFIG_STORAGE_KEY]) {
-                    remoteConfigMemory = normalizeRemoteConfigRow(stored[REMOTE_CONFIG_STORAGE_KEY]);
+                    const cached = stored[REMOTE_CONFIG_STORAGE_KEY];
+                    remoteConfigMemory = normalizeRemoteConfigRow(cached);
+                    remoteConfigFetchedAt = Number(cached?.fetchedAt || 0);
+                    remoteConfigFetchedVersion = String(cached?.fetchedVersion || "");
                 }
                 remoteConfigLoaded = true;
                 return remoteConfigMemory;
@@ -1076,7 +1107,6 @@ async function applyRemoteConfigRow(row, source = "rest") {
     remoteConfigMemory = next;
     remoteConfigLoaded = true;
     if (!changed) return remoteConfigMemory;
-    await chrome.storage.local.set({ [REMOTE_CONFIG_STORAGE_KEY]: next });
     logBackground.info("remote_config_applied", {
         source,
         revision: next.revision,
@@ -1084,6 +1114,18 @@ async function applyRemoteConfigRow(row, source = "rest") {
     });
     await notifyRemoteConfigUpdated(next);
     return remoteConfigMemory;
+}
+
+async function persistRemoteConfigFetchState() {
+    remoteConfigFetchedAt = Date.now();
+    remoteConfigFetchedVersion = chrome.runtime.getManifest().version;
+    await chrome.storage.local.set({
+        [REMOTE_CONFIG_STORAGE_KEY]: {
+            ...remoteConfigMemory,
+            fetchedAt: remoteConfigFetchedAt,
+            fetchedVersion: remoteConfigFetchedVersion
+        }
+    });
 }
 
 async function refreshRemoteConfig(settingsInput = null, source = "rest") {
@@ -1102,6 +1144,7 @@ async function refreshRemoteConfig(settingsInput = null, source = "rest") {
             errorMessage: "远程配置暂不可用"
         });
         if (rows[0]) await applyRemoteConfigRow(rows[0], source);
+        await persistRemoteConfigFetchState();
         return remoteConfigMemory;
     })().catch((error) => {
         logBackground.warn("remote_config_refresh_failed", { source, error: error?.message || String(error) });
@@ -1116,24 +1159,15 @@ async function initializeRemoteConfigSync() {
     await ensureRemoteConfigLoaded();
     const { settings: storedSettings } = await chrome.storage.local.get(["settings"]);
     const settings = normalizeSettings(storedSettings);
+    const currentVersion = chrome.runtime.getManifest().version;
+    if (remoteConfigFetchedVersion === currentVersion && isRemoteConfigCacheFresh(remoteConfigFetchedAt)) {
+        logBackground.debug("remote_config_cache_hit", {
+            fetched_at: remoteConfigFetchedAt,
+            version: currentVersion
+        });
+        return remoteConfigMemory;
+    }
     await refreshRemoteConfig(settings, "service_worker_start");
-    if (!isSupabaseEnabled(settings) || remoteConfigRealtimeSubscription) return;
-    remoteConfigRealtimeSubscription = createRemoteConfigRealtimeSubscription({
-        supabaseUrl: settings.supabaseUrl,
-        anonKey: settings.supabaseAnonKey,
-        table: SUPABASE_REMOTE_CONFIG_TABLE,
-        configKey: REMOTE_CONFIG_KEY,
-        onChange: (row) => {
-            applyRemoteConfigRow(row, "realtime").catch(() => {});
-        },
-        onStatus: (status, error) => {
-            logBackground.debug("remote_config_realtime_status", {
-                status: String(status || ""),
-                error: error?.message || ""
-            });
-            if (status === "SUBSCRIBED") refreshRemoteConfig(settings, "realtime_subscribed").catch(() => {});
-        }
-    });
 }
 
 let latestModelScopeRateLimitInfo = null;
@@ -1202,6 +1236,7 @@ chrome.runtime.onInstalled.addListener(async (details = {}) => {
     currentDebugMode = !!normalized.debugMode;
     syncRuntimeDebugFlag(currentDebugMode);
     logBackground.info("storage_update", { source: "on_installed", debug_mode: currentDebugMode });
+    await refreshRemoteConfig(normalized, `extension_${details.reason || "installed"}`);
     if (details.reason === "install") {
         await reportClientUsageEvent({
             eventName: "extension_installed",
@@ -2795,6 +2830,14 @@ class ContentProvider {
             }, normalizedSettings);
             return { rows: rows.length, quota: transcription.quota };
         } catch (error) {
+            attachSentryContext(error, {
+                task: "transcribe",
+                task_id: taskId,
+                tabId,
+                bvid,
+                provider: asrProvider,
+                model: asrModel
+            });
             if (!error?.__usageEventReported) {
                 await reportClientUsageEvent({
                     eventName: error?.code === "ABORTED" ? "task_cancelled" : "task_failed",
@@ -3972,7 +4015,34 @@ function makeSubtitleHash(list) {
     return `${list.length}|${first.start}|${last.end ?? last.start}|${first.text.slice(0, 24)}|${last.text.slice(0, 24)}`;
 }
 
+function resolveRunTasksFeatureName(tasks = []) {
+    if (tasks.includes("summary") && tasks.includes("segments")) return "summary_segments_merged";
+    return tasks.length === 1 ? String(tasks[0] || "task") : tasks.join("_");
+}
+
 async function runTasksForTab(tabId, tasks, force, taskContext = {}, requestedBvid = "", settingsOverride = null) {
+    const task = resolveRunTasksFeatureName(tasks);
+    const taskId = String(taskContext?.sentryTaskId || "").trim() || createUsageTaskId(task);
+    const finalTaskContext = { ...taskContext, sentryTaskId: taskId };
+    let resolvedSettings = settingsOverride;
+    try {
+        resolvedSettings = resolvedSettings || await getResolvedSettings();
+        return await executeTasksForTab(tabId, tasks, force, finalTaskContext, requestedBvid, resolvedSettings);
+    } catch (error) {
+        await captureTaskFailureToSentry(error, {
+            source: "task_final_failure",
+            task,
+            task_id: taskId,
+            tabId,
+            bvid: normalizeBvid(requestedBvid || ""),
+            provider: resolvedSettings?.provider || "",
+            model: resolvedSettings?.model || ""
+        });
+        throw error;
+    }
+}
+
+async function executeTasksForTab(tabId, tasks, force, taskContext = {}, requestedBvid = "", settingsOverride = null) {
     const tabState = await getTabState(tabId);
     const bvid = normalizeBvid(requestedBvid || tabState?.activeBvid);
     if (!bvid) throw new Error("未获取到视频字幕");
@@ -4039,7 +4109,7 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
     if (!force && cache?.[task]) return cache[task];
     const key = `${identity.partKey || bvid}|${task}`;
     const startedAt = Date.now();
-    const taskId = createUsageTaskId(task);
+    const taskId = String(taskContext?.sentryTaskId || "").trim() || createUsageTaskId(task);
     const usageTaskContext = {
         ...taskContext,
         ...identity,
@@ -4088,16 +4158,15 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
         }, settings);
         return result;
     } catch (error) {
-        const status = isTimeoutError(error) ? "timeout" : "error";
-        await captureTaskFailureToSentry(error, {
-            source: "task_failure",
+        attachSentryContext(error, {
             task,
+            task_id: taskId,
             tabId,
             bvid,
             provider: settings?.provider || "",
-            model: settings?.model || "",
-            taskContext
+            model: settings?.model || ""
         });
+        const status = isTimeoutError(error) ? "timeout" : "error";
         await reportDailyFeatureUsage(task, settings, {
             durationMs: Date.now() - startedAt,
             tokens: 0
@@ -4154,7 +4223,7 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
     }
     const key = `${identity.partKey || bvid}|summary_segments`;
     const startedAt = Date.now();
-    const taskId = createUsageTaskId("summary_segments_merged");
+    const taskId = String(taskContext?.sentryTaskId || "").trim() || createUsageTaskId("summary_segments_merged");
     const usageTaskContext = {
         ...taskContext,
         ...identity,
@@ -4256,6 +4325,7 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
         metadata: {
             summary_ok: summaryOk,
             segments_ok: segmentsOk,
+            outcome_category: summaryOk && segmentsOk ? "success" : "partial_success",
             ...buildTaskRecoveryMetadata(usageTaskContext)
         }
     }, settings);
@@ -4457,6 +4527,14 @@ async function runChatForPort(port, msg) {
         safePortPost(port, { type: "done", messageId, partKey: identity.partKey, answer, metrics: lastMetrics || null });
         logBackground.info("task_finish", { tab_id: tabId, bvid, tasks: ["chat_stream"] });
     } catch (error) {
+        attachSentryContext(error, {
+            task: "chat",
+            task_id: taskId,
+            tabId,
+            bvid,
+            provider: resolvedSettings?.provider || "",
+            model: resolvedSettings?.model || ""
+        });
         if (error?.code === "ABORTED") {
             await reportDailyFeatureUsage("chat", resolvedSettings, {
                 durationMs: Date.now() - startedAt,
@@ -5903,6 +5981,27 @@ function resolveUsageErrorCode(error, fallback = "UNKNOWN") {
     return String(error?.code || fallback || "UNKNOWN").trim() || "UNKNOWN";
 }
 
+function resolveTaskOutcomeCategory(error, status = "") {
+    const normalizedStatus = String(status || resolveUsageStatusByError(error)).toLowerCase();
+    const code = resolveUsageErrorCode(error, "UNKNOWN").toUpperCase();
+    const message = String(error?.message || "");
+    if (normalizedStatus === "cancelled" || ["ABORTED", "USER_CANCELLED"].includes(code)) return "cancelled";
+    if ([
+        "MISSING_API_KEY",
+        "CONFIG_REQUIRED",
+        "VALIDATION_ERROR",
+        "HTTP_401",
+        "CUSTOM_PROVIDER_AUTH_REQUIRED",
+        "CUSTOM_PROVIDER_BASE_URL_REQUIRED"
+    ].includes(code) || /API Key|Token.*(?:无效|失效)|Base URL|未授权访问该自定义/i.test(message)) {
+        return "user_config_failed";
+    }
+    if (/^(?:HTTP_|AI_|ASR_|PROVIDER_|NETWORK_|MODEL_|SUMMARY_EMPTY|SEGMENTS_(?:EMPTY|PARSE|NORMALIZE)|JSON_)|TIMEOUT/.test(code)) {
+        return "provider_service_failed";
+    }
+    return "plugin_logic_failed";
+}
+
 async function setTaskStatusMap(tabId, statusMap, lastError = "", errorMap = {}, partContext = {}) {
     return runWithTaskStateLock(tabId, async () => {
         const current = await getTabState(tabId);
@@ -5916,13 +6015,6 @@ async function setTaskStatusMap(tabId, statusMap, lastError = "", errorMap = {},
             taskStatus[task] = status;
             if (status === "error" || status === "timeout") {
                 const taskError = errorMap?.[task];
-                await captureTaskFailureToSentry(taskError, {
-                    source: "task_status_update",
-                    task,
-                    tabId,
-                    bvid: identity.bvid,
-                    status
-                });
                 taskErrors[task] = taskError ? serializeAppError(taskError) : {
                     message: String(lastError || "任务失败"),
                     code: "",
@@ -8028,11 +8120,12 @@ function resolveRateLimitInfo(settings, headers) {
 function getModelScopeDailyRequestLimit(model) {
     const key = String(model || "").trim().toLowerCase();
     const limits = {
-        "deepseek-ai/deepseek-v4-flash": 50,
-        "deepseek-ai/deepseek-v4-pro": 50,
-        "deepseek-ai/deepseek-v3.2": 20,
-        "zhipuai/glm-5.2": 50,
-        "stepfun-ai/step-3.7-flash": 50
+        "qwen/qwen3-30b-a3b-instruct-2507": 200,
+        "qwen/qwen3-235b-a22b-instruct-2507": 50,
+        "qwen/qwen3-coder-30b-a3b-instruct": 100,
+        "qwen/qwen3-30b-a3b": 200,
+        "deepseek-ai/deepseek-v4-pro": 20,
+        "deepseek-ai/deepseek-v4-flash-0731": 50
     };
     return limits[key] || null;
 }
@@ -9506,8 +9599,8 @@ async function reportFeatureUsage(featureName, bvid, settings, metrics) {
     if (!normalizedFeature) return false;
     try {
         const usageContext = await getUsageVideoContext(bvid, metrics);
-        await reportDailyFeatureUsage(normalizedFeature, settings, metrics, "success", "", usageContext);
-        logAI.info("usage_reported", {
+        reportDailyFeatureUsage(normalizedFeature, settings, metrics, "success", "", usageContext);
+        logAI.debug("usage_report_queued", {
             feature: normalizedFeature,
             bvid: normalizeBvid(bvid),
             tokens: tokenCount
@@ -9523,7 +9616,18 @@ async function reportFeatureUsage(featureName, bvid, settings, metrics) {
     }
 }
 
-async function reportDailyFeatureUsage(featureName, settings, metrics = {}, status = "success", errorCode = "", usageContext = {}) {
+function reportDailyFeatureUsage(featureName, settings, metrics = {}, status = "success", errorCode = "", usageContext = {}) {
+    void sendDailyFeatureUsage(featureName, settings, metrics, status, errorCode, usageContext).catch((error) => {
+        logBackground.warn("usage_daily_queue_failed", {
+            task: "usage",
+            code: error?.code || "USAGE_DAILY_QUEUE_FAILED",
+            detail: { message: error?.message || "daily usage queue failed" }
+        });
+    });
+    return true;
+}
+
+async function sendDailyFeatureUsage(featureName, settings, metrics = {}, status = "success", errorCode = "", usageContext = {}) {
     if (!isSupabaseEnabled(settings)) return false;
     if (!await hasTechnicalDataConsent()) return false;
     const normalizedFeature = String(featureName || "").trim();

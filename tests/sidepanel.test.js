@@ -33,12 +33,13 @@ describe("native side panel", () => {
     expect(buildScript).toContain('"vendor"');
   });
 
-  it("loads remote model configuration without interval polling", () => {
+  it("loads and caches remote model configuration without Realtime", () => {
     expect(background).toContain('SUPABASE_REMOTE_CONFIG_TABLE = "extension_remote_config"');
-    expect(background).toContain("createRemoteConfigRealtimeSubscription");
+    expect(background).not.toContain("createRemoteConfigRealtimeSubscription");
     expect(background).toContain("segments_ai_json_repair");
     expect(background).toContain('refreshRemoteConfig(settings, "service_worker_start")');
-    expect(background).toContain('status === "SUBSCRIBED"');
+    expect(background).toContain("isRemoteConfigCacheFresh(remoteConfigFetchedAt)");
+    expect(background).toContain("fetchedVersion: remoteConfigFetchedVersion");
     expect(content).toContain('action === "REMOTE_CONFIG_UPDATED"');
     expect(content).toContain("appState?.providers?.[key]?.models");
   });
@@ -68,7 +69,7 @@ describe("native side panel", () => {
   });
 
   it("checks database driven update availability without frequent polling", () => {
-    expect(manifest.version).toBe("1.6.0");
+    expect(manifest.version).toBe("1.6.1");
     expect(background).toContain('msg.action === "CHECK_LATEST_VERSION"');
     expect(background).toContain('msg.action === "OPEN_EXTENSION_MANAGEMENT"');
     expect(background).toContain("VERSION_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000");
@@ -89,7 +90,11 @@ describe("native side panel", () => {
     expect(sidepanel).not.toContain("有可用版本更新 v${latest}");
   });
 
-  it("ships the 1.6 release notice pages", () => {
+  it("ships the 1.6.1 release notice pages", () => {
+    expect(releaseNotice).toContain('"1.6.1"');
+    expect(releaseNotice).toContain("Bilitato 已更新至 v1.6.1");
+    expect(releaseNotice).toContain("远程配置更轻量");
+    expect(releaseNotice).toContain("更新 ModelScope 模型列表");
     expect(releaseNotice).toContain('"1.6.0"');
     expect(releaseNotice).toContain("Bilitato 已更新至 v1.6");
     expect(releaseNotice).toContain("AI 返回异常时自动恢复");
@@ -98,6 +103,7 @@ describe("native side panel", () => {
     expect(releaseNotice).toMatch(/title: "高清下载模式",[\s\S]*?highlight: true/);
     expect(releaseNotice).toMatch(/title: "新增 MiMo 语音识别",[^}]*desc:[^}]*\},/);
     expect(releaseNotice).not.toMatch(/title: "新增 MiMo 语音识别",[^}]*highlight: true/);
+    expect(releaseNotice).toContain('majorHistory.push("1.6.1", "1.6.0", "1.5.x"');
     expect(releaseNotice).toContain('majorHistory.push("1.6.0", "1.5.x"');
     expect(releaseNotice).toContain('"1.5.x"');
     expect(releaseNotice).toContain("Bilitato v1.5 系列更新回顾");
@@ -160,19 +166,33 @@ describe("native side panel", () => {
 
   it("keeps the ModelScope preset list aligned with currently supported models", () => {
     const modelScopeList = content.match(/modelscope:\s*\[([\s\S]*?)\]/)?.[1] || "";
-    expect(modelScopeList).toContain('"deepseek-ai/DeepSeek-V4-Flash"');
+    expect(modelScopeList).not.toContain('"deepseek-ai/DeepSeek-V4-Flash"');
     expect(modelScopeList).toContain('"deepseek-ai/DeepSeek-V4-Pro"');
-    expect(modelScopeList).toContain('"deepseek-ai/DeepSeek-V3.2"');
-    expect(modelScopeList).toContain('"ZhipuAI/GLM-5.2"');
+    expect(modelScopeList).toContain('"Qwen/Qwen3-30B-A3B-Instruct-2507"');
+    expect(modelScopeList).toContain('"Qwen/Qwen3-30B-A3B"');
+    expect(content).toContain("prioritizeRecommendedProviderModels(key, remoteModels)");
+    expect(content.indexOf('"Qwen/Qwen3-30B-A3B-Instruct-2507"')).toBeLessThan(content.indexOf('"Qwen/Qwen3-30B-A3B"'));
+    expect(modelScopeList).not.toContain('"deepseek-ai/DeepSeek-V3.2"');
+    expect(modelScopeList).not.toContain('"ZhipuAI/GLM-5.2"');
     expect(modelScopeList).not.toContain('"ZhipuAI/GLM-4.7-Flash"');
-    expect(modelScopeList).toContain('"stepfun-ai/Step-3.7-Flash"');
-    expect(content).toContain("DeepSeek-V4-Flash：50次/天");
-    expect(content).toContain("DeepSeek-V3.2：20次/天");
-    expect(content).toContain("GLM-5.2：50次/天");
-    expect(content).toContain("Step-3.7-Flash：50次/天");
-    expect(content).toContain("ModelScope官网近期下线了对部分模型的平台调用支持");
-    expect(sidepanel).toContain("ModelScope官网近期下线了对部分模型的平台调用支持");
-    expect(background).toContain('model: "deepseek-ai/DeepSeek-V4-Flash"');
+    expect(modelScopeList).not.toContain('"stepfun-ai/Step-3.7-Flash"');
+    expect(content).toContain("Qwen3-30B-A3B-Instruct-2507：200次/天");
+    expect(content).toContain("Qwen3-235B-A22B-Instruct-2507：50次/天");
+    expect(content).toContain("Qwen3-Coder-30B-A3B-Instruct：100次/天");
+    expect(content).toContain("Qwen3-30B-A3B：200次/天");
+    expect(content).toContain("DeepSeek-V4-Pro：20次/天");
+    expect(content).toContain("DeepSeek-V4-Flash-0731：50次/天");
+    expect(content).not.toContain("DeepSeek-V3.2：20次/天");
+    expect(content).not.toContain("GLM-5.2：50次/天");
+    expect(content).not.toContain("Step-3.7-Flash：50次/天");
+    expect(content).toContain('MODELSCOPE_RECOMMENDED_MODELS.has(model) ? "推荐"');
+    expect(content).toContain('option.querySelector(".model-recommended-tag")');
+    expect(contentCss).toContain(".model-recommended-tag");
+    expect(contentCss).toContain(".custom-option-main > span:first-child");
+    expect(contentCss).toContain("text-overflow: ellipsis");
+    expect(sidepanel).toContain('recommendedModelScopeModels.has(model) ? "（推荐）"');
+    expect(sidepanel).toContain("recommendedModelScopeModelOrder.filter");
+    expect(background).toContain('model: "Qwen/Qwen3-30B-A3B-Instruct-2507"');
     expect(background).toContain("LEGACY_MODELSCOPE_MODELS");
   });
 
@@ -184,7 +204,8 @@ describe("native side panel", () => {
     expect(background).toContain("modelscope-ratelimit-requests-limit");
     expect(background).toContain("modelscope-ratelimit-requests-remaining");
     expect(background).toContain("getModelScopeDailyRequestLimit");
-    expect(background).toContain('"deepseek-ai/deepseek-v4-flash": 50');
+    expect(background).toContain('"qwen/qwen3-30b-a3b-instruct-2507": 200');
+    expect(background).toContain('"deepseek-ai/deepseek-v4-flash-0731": 50');
     expect(background).toContain("onHeadersReceived");
     expect(background).toContain('provider === "modelscope"');
     expect(content).toContain("模型剩余");

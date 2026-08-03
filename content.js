@@ -97,19 +97,35 @@ function dedupeDisplayedLineOnlyContentSegments(segments, cache = {}) {
     });
 }
 
+const MODELSCOPE_RECOMMENDED_MODEL_ORDER = [
+    "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "Qwen/Qwen3-30B-A3B"
+];
+const MODELSCOPE_RECOMMENDED_MODELS = new Set(MODELSCOPE_RECOMMENDED_MODEL_ORDER);
+
+function prioritizeRecommendedProviderModels(providerKey, models) {
+    const list = [...new Set((models || []).map((model) => String(model || "").trim()).filter(Boolean))];
+    if (String(providerKey || "").toLowerCase() !== "modelscope") return list;
+    return [
+        ...MODELSCOPE_RECOMMENDED_MODEL_ORDER.filter((model) => list.includes(model)),
+        ...list.filter((model) => !MODELSCOPE_RECOMMENDED_MODELS.has(model))
+    ];
+}
+
 function getProviderModelOptions(providerKey) {
     const key = String(providerKey || "").toLowerCase();
     const remoteModels = appState?.providers?.[key]?.models;
     if (Array.isArray(remoteModels) && remoteModels.length) {
-        return [...new Set(remoteModels.map((model) => String(model || "").trim()).filter(Boolean))];
+        return prioritizeRecommendedProviderModels(key, remoteModels);
     }
     const options = {
         modelscope: [
-            "deepseek-ai/DeepSeek-V4-Flash",
+            "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "Qwen/Qwen3-235B-A22B-Instruct-2507",
+            "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            "Qwen/Qwen3-30B-A3B",
             "deepseek-ai/DeepSeek-V4-Pro",
-            "deepseek-ai/DeepSeek-V3.2",
-            "ZhipuAI/GLM-5.2",
-            "stepfun-ai/Step-3.7-Flash"
+            "deepseek-ai/DeepSeek-V4-Flash-0731"
         ],
         zhipu: [
             "glm-5.1",
@@ -197,7 +213,7 @@ function getProviderModelOptions(providerKey) {
             "claude-haiku-4-5"
         ]
     };
-    return options[key] || [];
+    return prioritizeRecommendedProviderModels(key, options[key] || []);
 }
 
 function getDefaultProviderModel(providerKey) {
@@ -216,7 +232,8 @@ function resolveProviderModelValue(providerKey, model) {
         "ZhipuAI/GLM-5.1",
         "ZhipuAI/GLM-4.7-Flash",
         "Qwen/Qwen3.5-27B",
-        "Qwen/Qwen2.5-72B-Instruct"
+        "Qwen/Qwen2.5-72B-Instruct",
+        "deepseek-ai/DeepSeek-V4-Flash"
     ]);
     return legacyModelScopeModels.has(value) ? getDefaultProviderModel("modelscope") : value;
 }
@@ -239,11 +256,12 @@ function getProviderFreeQuotaText(providerKey) {
     const quotaText = {
         modelscope: [
             "ModelScope 免费额度",
-            "DeepSeek-V4-Flash：50次/天",
-            "DeepSeek-V4-Pro：以官网为准",
-            "DeepSeek-V3.2：20次/天",
-            "GLM-5.2：50次/天",
-            "Step-3.7-Flash：50次/天",
+            "Qwen3-30B-A3B-Instruct-2507：200次/天",
+            "Qwen3-235B-A22B-Instruct-2507：50次/天",
+            "Qwen3-Coder-30B-A3B-Instruct：100次/天",
+            "Qwen3-30B-A3B：200次/天",
+            "DeepSeek-V4-Pro：20次/天",
+            "DeepSeek-V4-Flash-0731：50次/天",
             "RPM：每个模型约5-20"
         ],
         gemini: [
@@ -5258,11 +5276,11 @@ function renderSettings(panel) {
             </select>
             <div class="custom-select-container settings-custom-select" data-target-select="${escapeHtmlAttr(id)}">
                 <div class="custom-select-trigger">
-                    <span class="current-value">${escapeHtml(selected.label)}</span>
+                    <span class="current-value">${escapeHtml(selected.label)}</span>${selected.tag ? `<span class="model-recommended-tag">${escapeHtml(selected.tag)}</span>` : ""}
                     ${arrowIcon}
                 </div>
                 <div class="custom-select-options">
-                    ${items.map((item) => `<div class="custom-option ${String(item.value) === String(selected.value) ? "selected" : ""}" data-value="${escapeHtmlAttr(item.value)}" data-label="${escapeHtmlAttr(item.label)}"><span class="custom-option-main"><span>${escapeHtml(item.label)}</span>${item.tooltip ? `<span class="settings-info-icon custom-option-info" data-no-select="true" data-tooltip="${escapeHtmlAttr(item.tooltip)}">i</span>` : ""}</span></div>`).join("")}
+                    ${items.map((item) => `<div class="custom-option ${String(item.value) === String(selected.value) ? "selected" : ""}" data-value="${escapeHtmlAttr(item.value)}" data-label="${escapeHtmlAttr(item.label)}"><span class="custom-option-main"><span>${escapeHtml(item.label)}</span>${item.tag ? `<span class="model-recommended-tag">${escapeHtml(item.tag)}</span>` : ""}${item.tooltip ? `<span class="settings-info-icon custom-option-info" data-no-select="true" data-tooltip="${escapeHtmlAttr(item.tooltip)}">i</span>` : ""}</span></div>`).join("")}
                 </div>
             </div>
         `;
@@ -5293,7 +5311,7 @@ function renderSettings(panel) {
     const providerCustomModelVisible = hasProviderModelSelect && providerModelSelectValue === "custom" ? "" : "settings-hidden";
     const plainModelVisible = hasProviderModelSelect ? "settings-hidden" : "";
     const showOpenRouterFreeHint = providerKey === "openrouter" && currentModel === "openrouter/free";
-    const modelScopeModelInfo = "ModelScope官网近期下线了对部分模型的平台调用支持，本插件会动态更新可直接使用的模型列表。";
+    const modelScopeModelInfo = getProviderFreeQuotaText("modelscope");
     const modelLabelInfo = providerKey === "modelscope"
         ? `<span class="settings-info-icon" data-tooltip="${escapeHtmlAttr(modelScopeModelInfo)}">i</span>`
         : "";
@@ -5384,7 +5402,12 @@ function renderSettings(panel) {
                 <label class="settings-label-with-info">Model${modelLabelInfo}</label>
                 <div id="settings-provider-model-wrap" class="${providerModelWrapVisible}">
                     ${renderCustomSelect("settings-provider-model", [
-                        ...providerModelOptions.map((model) => ({ value: model, label: model, tooltip: providerKey === "modelscope" ? (MODELSCOPE_MODEL_LIMIT_TOOLTIPS[model] || "") : "" })),
+                        ...providerModelOptions.map((model) => ({
+                            value: model,
+                            label: model,
+                            tag: providerKey === "modelscope" && MODELSCOPE_RECOMMENDED_MODELS.has(model) ? "推荐" : "",
+                            tooltip: providerKey === "modelscope" ? (MODELSCOPE_MODEL_LIMIT_TOOLTIPS[model] || "") : ""
+                        })),
                         { value: "custom", label: "自定义" }
                     ], providerModelSelectValue)}
                     <input id="settings-provider-custom-model" class="${providerCustomModelVisible}" type="text" value="${escapeHtml(currentModel)}" placeholder="请输入模型名">
@@ -6664,7 +6687,6 @@ async function runTasks(tasks, options = {}) {
                 stack_preview: String(error.stack || "").split("\n").slice(0, 3).join("\n")
             }
         });
-        reportContentError?.(error, { task: tasks.join(","), source: "run_tasks" });
         const targetPage = tasks.includes("rumors") ? "real" : "summary";
         const view = setPanelError(targetPage, error, error.message || "任务失败");
         if (view?.presentation === "toast") showToast(view.message);
@@ -7512,11 +7534,12 @@ function updateSettingsProviderHint(panel) {
 
 const GROQ_ASR_LIMIT_TOOLTIP = "当前常见 Groq 转录限额：RPM 20；ASH 7.2K（每小时约 2 小时音频）。具体以 Groq 控制台 Limits 页面为准。";
 const MODELSCOPE_MODEL_LIMIT_TOOLTIPS = {
-    "deepseek-ai/DeepSeek-V4-Flash": "ModelScope 免费额度：50次/天",
-    "deepseek-ai/DeepSeek-V4-Pro": "ModelScope 当前可直接调用模型",
-    "deepseek-ai/DeepSeek-V3.2": "ModelScope 免费额度：20次/天",
-    "ZhipuAI/GLM-5.2": "ModelScope 免费额度：50次/天",
-    "stepfun-ai/Step-3.7-Flash": "ModelScope 免费额度：50次/天"
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": "Qwen/Qwen3-30B-A3B-Instruct-2507 · ModelScope 免费额度：200次/天",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": "Qwen/Qwen3-235B-A22B-Instruct-2507 · ModelScope 免费额度：50次/天",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct": "Qwen/Qwen3-Coder-30B-A3B-Instruct · ModelScope 免费额度：100次/天",
+    "Qwen/Qwen3-30B-A3B": "Qwen/Qwen3-30B-A3B · ModelScope 免费额度：200次/天",
+    "deepseek-ai/DeepSeek-V4-Pro": "deepseek-ai/DeepSeek-V4-Pro · ModelScope 免费额度：20次/天",
+    "deepseek-ai/DeepSeek-V4-Flash-0731": "deepseek-ai/DeepSeek-V4-Flash-0731 · ModelScope 免费额度：50次/天"
 };
 
 function updateSettingsAsrProviderHint(panel) {
@@ -7679,6 +7702,18 @@ function bindSettingsCustomSelects(panel) {
                 const value = String(option.dataset.value || "");
                 nativeSelect.value = value;
                 selectContainer.querySelector(".current-value").textContent = option.dataset.label || option.textContent || "";
+                const selectedTag = String(option.querySelector(".model-recommended-tag")?.textContent || "").trim();
+                let triggerTag = selectTrigger.querySelector(".model-recommended-tag");
+                if (selectedTag) {
+                    if (!triggerTag) {
+                        triggerTag = document.createElement("span");
+                        triggerTag.className = "model-recommended-tag";
+                        selectTrigger.querySelector(".custom-select-arrow")?.before(triggerTag);
+                    }
+                    triggerTag.textContent = selectedTag;
+                } else {
+                    triggerTag?.remove();
+                }
                 selectOptions.querySelectorAll(".custom-option").forEach((item) => item.classList.remove("selected"));
                 option.classList.add("selected");
                 selectContainer.classList.remove("open");

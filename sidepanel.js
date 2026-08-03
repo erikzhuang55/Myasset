@@ -994,11 +994,25 @@ function renderSettings() {
             ${row?.reply ? `<div class="feedback-reply">${escapeHtml(row.reply)}</div>` : ""}
         </div>`).join("");
     const provider = state.providers?.[settings.provider] || {};
-    const providerModels = state.settingsUiOptions.providerModels?.[settings.provider] || [];
+    const rawProviderModels = state.settingsUiOptions.providerModels?.[settings.provider] || [];
+    const recommendedModelScopeModelOrder = [
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen/Qwen3-30B-A3B"
+    ];
+    const recommendedModelScopeModels = new Set(recommendedModelScopeModelOrder);
+    const providerModels = settings.provider === "modelscope"
+        ? [
+            ...recommendedModelScopeModelOrder.filter((model) => rawProviderModels.includes(model)),
+            ...rawProviderModels.filter((model) => !recommendedModelScopeModels.has(model))
+        ]
+        : rawProviderModels;
     const currentModel = resolveProviderModelValue(settings.provider, settings.providerModels?.[settings.provider] || settings.model || provider.model || "");
     const modelIsPreset = providerModels.includes(currentModel);
-    const modelOptions = providerModels.map((model) => `<option value="${escapeHtml(model)}" ${model === currentModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("");
-    const modelScopeModelInfo = "ModelScope官网近期下线了对部分模型的平台调用支持，本插件会动态更新可直接使用的模型列表。";
+    const modelOptions = providerModels.map((model) => {
+        const recommended = settings.provider === "modelscope" && recommendedModelScopeModels.has(model) ? "（推荐）" : "";
+        return `<option value="${escapeHtml(model)}" ${model === currentModel ? "selected" : ""}>${escapeHtml(model)}${recommended}</option>`;
+    }).join("");
+    const modelScopeModelInfo = "ModelScope 免费额度：Qwen3-30B-A3B-Instruct-2507 200次/天；Qwen3-235B-A22B-Instruct-2507 50次/天；Qwen3-Coder-30B-A3B-Instruct 100次/天；Qwen3-30B-A3B 200次/天；DeepSeek-V4-Pro 20次/天；DeepSeek-V4-Flash-0731 50次/天。";
     const modelLabelInfo = settings.provider === "modelscope"
         ? `<span id="setting-model-info" class="settings-info-icon" data-tooltip="${escapeHtml(modelScopeModelInfo)}">i</span>`
         : `<span id="setting-model-info" class="settings-info-icon settings-hidden" data-tooltip="${escapeHtml(modelScopeModelInfo)}">i</span>`;
