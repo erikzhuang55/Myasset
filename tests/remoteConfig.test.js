@@ -13,7 +13,11 @@ describe("remote configuration", () => {
       revision: 7,
       updated_at: "2026-08-02T00:00:00Z",
       payload: {
-        feature_flags: { summary_empty_retry: false },
+        feature_flags: { summary_empty_retry: false, modelscope_model_fallback: false },
+        model_fallback: {
+          enabled: true,
+          tasks: { segments: ["model-segments", "model-segments"] },
+        },
         providers: {
           openai: {
             base_url: "https://proxy.example.com/v1/",
@@ -29,6 +33,12 @@ describe("remote configuration", () => {
     expect(config.featureFlags.summary_empty_retry).toBe(false);
     expect(config.featureFlags.segments_compact_retry).toBe(true);
     expect(config.featureFlags.segments_ai_json_repair).toBe(true);
+    expect(config.featureFlags.modelscope_model_fallback).toBe(false);
+    expect(config.modelFallback).toMatchObject({
+      enabled: true,
+      maxAttempts: 1,
+      tasks: { segments: ["model-segments"] },
+    });
     expect(config.providers.openai).toMatchObject({
       baseUrl: "https://proxy.example.com/v1",
       model: "gpt-test",

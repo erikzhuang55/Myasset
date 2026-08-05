@@ -26,6 +26,19 @@
         return !!current && cacheBvid === current && hasSubtitle;
     }
 
+    function getSubtitleDependencyState({
+        hasSubtitle = false,
+        playerLoading = false,
+        cloudLoading = false,
+        transcribing = false
+    } = {}) {
+        if (hasSubtitle) return { status: "ready", detail: "" };
+        if (transcribing) return { status: "pending", detail: "正在生成字幕，请稍候..." };
+        if (playerLoading) return { status: "pending", detail: "正在读取字幕，请稍候..." };
+        if (cloudLoading) return { status: "pending", detail: "正在读取字幕缓存，请稍候..." };
+        return { status: "missing", detail: "暂无字幕" };
+    }
+
     function createChatMessageId(now = Date.now(), randomText = Math.random().toString(36)) {
         return `${now}_${String(randomText || "").slice(2, 8)}`;
     }
@@ -43,6 +56,7 @@
         canRunTasksWithCache,
         createChatMessageId,
         createPendingChatMessages,
+        getSubtitleDependencyState,
         needsSubtitleForTasks
     };
 })();

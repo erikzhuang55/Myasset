@@ -15,6 +15,7 @@ const sidepanelCss = readFileSync(new URL("../sidepanel.css", import.meta.url), 
 const offscreen = readFileSync(new URL("../offscreen.js", import.meta.url), "utf8");
 const inject = readFileSync(new URL("../inject.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const videoCacheCidMigration = readFileSync(new URL("../supabase/migrations/20260710095455_add_cid_isolation_to_video_cache.sql", import.meta.url), "utf8");
+const controlledVideoCacheMigration = readFileSync(new URL("../supabase/migrations/20260806030000_add_controlled_video_cache_upsert.sql", import.meta.url), "utf8");
 
 describe("native side panel", () => {
   it("declares the Chrome side panel entry and permissions", () => {
@@ -69,7 +70,7 @@ describe("native side panel", () => {
   });
 
   it("checks database driven update availability without frequent polling", () => {
-    expect(manifest.version).toBe("1.6.1");
+    expect(manifest.version).toBe("1.6.2");
     expect(background).toContain('msg.action === "CHECK_LATEST_VERSION"');
     expect(background).toContain('msg.action === "OPEN_EXTENSION_MANAGEMENT"');
     expect(background).toContain("VERSION_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000");
@@ -90,7 +91,13 @@ describe("native side panel", () => {
     expect(sidepanel).not.toContain("有可用版本更新 v${latest}");
   });
 
-  it("ships the 1.6.1 release notice pages", () => {
+  it("ships the 1.6.2 release notice pages", () => {
+    expect(releaseNotice).toContain('"1.6.2"');
+    expect(releaseNotice).toContain("Bilitato 已更新至 v1.6.2");
+    expect(releaseNotice).toContain("兜底机制大修复");
+    expect(releaseNotice).toContain("修复已有字幕却无法总结");
+    expect(releaseNotice).toContain("修复分 P 路由误判");
+    expect(releaseNotice).toContain('majorHistory.push("1.6.2", "1.6.1", "1.6.0"');
     expect(releaseNotice).toContain('"1.6.1"');
     expect(releaseNotice).toContain("Bilitato 已更新至 v1.6.1");
     expect(releaseNotice).toContain("远程配置更轻量");
@@ -272,6 +279,9 @@ describe("native side panel", () => {
     expect(inject).toContain("const retryDelays = [0, 80, 200, 400, 800]");
     expect(inject).toContain('emitLog("subtitle_stealth_close_pending"');
     expect(inject).toContain('emitLog("subtitle_route_reset", { bvid: capturedBvid, reason });\n        performSilentAutoTrigger();\n        scheduleAutoTriggerFlow');
+    expect(inject).toContain("const routeP = Math.max(1, Number(getRouteTid() || meta.p || 1))");
+    expect(inject).toContain('`${meta.bvid}::p${routeP}`');
+    expect(inject).not.toContain('`${meta.bvid}::${meta.cid || getRouteTid()}`');
     expect(content).toContain("allowDomOpen = false");
     expect(content).toContain("if (allowDomOpen && mergeSubtitleOptions(apiOptions, domOptions).length <= 1)");
   });
@@ -305,23 +315,31 @@ describe("native side panel", () => {
     expect(content).toContain("completeSubtitleUiRequest");
     expect(content).toContain("pendingRequestUrls: new Set()");
     expect(content).toContain('scheduleSubtitleUiDeadline(routeKey, generation, 10000, "timeout")');
-    expect(content).toContain('scheduleSubtitleUiDeadline(subtitleUiCoordinator.routeKey, subtitleUiCoordinator.generation, 1500, "unavailable")');
+    expect(content).toContain('scheduleSubtitleUiDeadline(subtitleUiCoordinator.routeKey, subtitleUiCoordinator.generation, SUBTITLE_CONTROL_RESULT_GRACE_MS, "unavailable")');
     expect(content).toContain('logSubtitleDiagnostic("ui_loading_extended"');
     expect(content).toContain('emptyTip.textContent = "正在读取字幕，请稍候..."');
+  });
+
+  it("keeps summary and verification locked while subtitles are still loading", () => {
+    expect(content).toContain("function getCurrentSubtitleDependencyState()");
+    expect(content).toContain('else if (["summary", "real"].includes(appState.activePage))');
+    expect(content).toContain('if (subtitleState.status === "pending")');
+    expect(content).toContain("renderSubtitlePendingState(subtitleState.detail)");
+    expect(content).toContain('return "当前视频暂无字幕，无法开始验真"');
   });
 
   it("separates absent subtitles, capture failures, and slow subtitle responses", () => {
     expect(content).toContain('subtitleUiCoordinator.phase = "probing"');
     expect(content).toContain('source: "subtitle_control_absent"');
-    expect(content).toContain('scheduleSubtitleUiDeadline(routeKey, generation, 500, "unavailable")');
+    expect(content).toContain('scheduleSubtitleUiDeadline(routeKey, generation, SUBTITLE_CONTROL_RESULT_GRACE_MS, "unavailable")');
     expect(content).toContain("function isUsableSubtitleControl(node)");
     expect(content).toContain("function isSubtitleControlBarReady()");
     expect(content).toContain("controlProbeObserver: null");
-    expect(content).toContain('stableWindowMs: 500');
-    expect(content).toContain("Date.now() - startedAt >= 2000");
+    expect(content).toContain('stableWindowMs: SUBTITLE_CONTROL_STABLE_MS');
+    expect(content).toContain("Date.now() - startedAt >= SUBTITLE_PLAYER_READY_TIMEOUT_MS");
     expect(content).toContain('scheduleSubtitleUiDeadline(routeKey, generation, 10000, "timeout")');
     expect(content).toContain('data-action="${buttonAction}"');
-    expect(content).toContain('const buttonAction = retryableSubtitleLoad ? "subtitle-load-retry" : "transcription-start"');
+    expect(content).toContain('const buttonAction = retryableSubtitleLoad ? "subtitle-load-retry" : (missingAsrApiKey ? "asr-open-settings" : "transcription-start")');
     expect(content).toContain('window.postMessage({ type: "BILI_RETRY_SUBTITLE_CAPTURE" }, "*")');
     expect(inject).toContain('event.data?.type === "BILI_RETRY_SUBTITLE_CAPTURE"');
   });
@@ -409,8 +427,8 @@ describe("native side panel", () => {
     expect(content).toContain('reason: "usable_subtitle_cache_arrived"');
     expect(background).toContain('const hasExplicitCid = Object.prototype.hasOwnProperty.call(msg || {}, "cid")');
     expect(background).toContain("cid: Number(hasExplicitCid ? msg.cid : (tabState?.activeCid || 0))");
-    expect(background).toContain("if (!(cid > 0)) return null");
-    expect(background).toContain("if (!identity.bvid || !(identity.cid > 0)) return null");
+    expect(background).toContain("Number(context?.partCount || 0) !== 1");
+    expect(background).toContain("allowPendingSinglePartCid");
   });
 
   it("adds confirmed local cache cleanup actions in settings", () => {
@@ -529,6 +547,25 @@ describe("native side panel", () => {
     expect(sidepanelCss).not.toContain("border-bottom: 1px solid #f1f2f3");
   });
 
+  it("blocks transcription before task creation when the selected ASR key is missing", () => {
+    expect(content).toContain("function getAsrApiKeyRequirement");
+    expect(content).toContain('`请先填写${escapeHtml(asrKeyRequirement.providerName)}的API Key，再开始转录`');
+    expect(content).toContain('missingAsrApiKey ? "去设置" : "开始在线转录"');
+    expect(content).toContain('if (action === "asr-open-settings")');
+    expect(sidepanel).toContain('asrKeyRequirement.missing ? `请先填写${escapeHtml(asrKeyRequirement.providerName)}的API Key，再开始转录`');
+    expect(sidepanel).toContain('data-action="${asrKeyRequirement.missing && !running ? "go-asr-settings" : "transcribe"}"');
+    expect(background.indexOf('if (!asrApiKey) {')).toBeLessThan(background.indexOf('const taskId = createUsageTaskId("transcribe")'));
+    expect(background).toContain('eventName: "transcribe_preflight_blocked"');
+  });
+
+  it("caches feedback for six hours but refreshes once when the plugin opens", () => {
+    expect(background).toContain("const FEEDBACK_CACHE_TTL_MS = 6 * 60 * 60 * 1000");
+    expect(background).toContain("async function readCachedFeedbackState");
+    expect(background).toContain("if (!force && !markSeen && cacheFresh) return cached");
+    expect(content).toContain('refreshFeedback: true');
+    expect(sidepanel).toContain('refreshState({ hydrate: true, refreshFeedback: true })');
+  });
+
   it("migrates the bundled Sentry DSN without overwriting custom DSNs", () => {
     expect(background).toContain('const DEFAULT_SENTRY_DSN = "https://440bce86f646672341586eb09c859631@o4511769099501568.ingest.de.sentry.io/4511769123029072"');
     expect(background).toContain("const LEGACY_SENTRY_DSNS = new Set([");
@@ -553,6 +590,21 @@ describe("native side panel", () => {
     expect(sidepanel).toContain("function isMeaningfulFeedbackText(value)");
     expect(sidepanel).toContain("if (!isMeaningfulFeedbackText(title))");
     expect(sidepanel).toContain("if (!isMeaningfulFeedbackText(content))");
+  });
+
+  it("keeps transcription and AI generation mutually exclusive", () => {
+    expect(content).toContain('code: "ASR_IN_PROGRESS"');
+    expect(content).toContain('showToast("字幕转录中，请等待完成后再生成总结")');
+    expect(content).toContain('code: "AI_TASK_IN_PROGRESS"');
+    expect(content).toContain('showToast("总结生成中，请完成后再转录字幕")');
+  });
+
+  it("submits deduplicated feedback diagnostics with route and cache context", () => {
+    expect(content).toContain("function buildFeedbackDiagnosticContext()");
+    expect(content).toContain("diagnosticContext: buildFeedbackDiagnosticContext()");
+    expect(background).toContain("function dedupeFeedbackLogs(");
+    expect(background).toContain("route_context: msg?.diagnosticContext");
+    expect(background).toContain("background_context:");
   });
 
   it("supports a default-collapsed embedded panel that expands after summary success", () => {
@@ -655,7 +707,10 @@ describe("native side panel", () => {
     expect(background).toContain('msg.action === "SET_ACTIVE_PART"');
     expect(background).toContain('cid: identity.cid > 0 ? `eq.${identity.cid}` : "is.null"');
     expect(background).toContain("buildSupabaseVideoPatch(bvid, settings, patch, partContext = {})");
-    expect(background).toContain("params: hasExisting ? rowFilter : {}");
+    expect(background).toContain('supabaseRpc(settings, "upsert_video_cache_controlled"');
+    expect(controlledVideoCacheMigration).toContain("security definer");
+    expect(controlledVideoCacheMigration).toContain("set search_path = ''");
+    expect(controlledVideoCacheMigration).toContain("grant execute on function public.upsert_video_cache_controlled(jsonb) to anon");
     expect(videoCacheCidMigration).toContain("video_cache_bvid_cid_unique");
     expect(videoCacheCidMigration).toContain("where cid is not null");
     expect(background).toContain('safePortPost(port, { type: "done", messageId, partKey: identity.partKey');

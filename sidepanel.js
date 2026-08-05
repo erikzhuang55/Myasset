@@ -3,6 +3,7 @@ const DEFAULT_GROQ_ASR_BASE_URL = "https://api.groq.com/openai/v1";
 const DEFAULT_SILICONFLOW_ASR_BASE_URL = "https://api.siliconflow.cn/v1";
 const DEFAULT_MIMO_ASR_BASE_URL = "https://api.xiaomimimo.com/v1";
 const DEFAULT_MIMO_ASR_MODEL = "mimo-v2.5-asr";
+const SUMMARY_DRAFT_TTL_MS = 10 * 60 * 1000;
 const state = {
     tabId: 0,
     activePage: "CC",
@@ -41,7 +42,9 @@ const state = {
     initialized: false,
     activeBvid: "",
     activePartKey: "",
-    switchingToEmbedded: false
+    switchingToEmbedded: false,
+    summaryDraftExpiryTimer: null,
+    summaryDraftExpiryAt: 0
 };
 
 const app = document.getElementById("app");
@@ -161,6 +164,16 @@ function normalizeCloudCachePrefs(value = {}) {
     };
 }
 
+function getAsrApiKeyRequirement(settings = {}) {
+    const requested = String(settings.asrProvider || "groq").toLowerCase();
+    const provider = ["groq", "siliconflow", "mimo"].includes(requested) ? requested : "groq";
+    const providerName = provider === "siliconflow" ? "硅基流动" : (provider === "mimo" ? "Mimo" : "Groq");
+    const apiKey = provider === "siliconflow"
+        ? settings.siliconFlowApiKey
+        : (provider === "mimo" ? settings.mimoApiKey : settings.groqApiKey);
+    return { provider, providerName, missing: !String(apiKey || "").trim() };
+}
+
 function renderVersionUpdateBadge() {
     if (!state.versionState?.hasUpdate) return "";
     return `<button type="button" class="version-update-badge" data-action="open-extension-management" data-tooltip="跳转插件页后请在左上角找到“更新”按钮以更新插件" data-tooltip-placement="bottom">有可用版本更新</button>`;
@@ -232,7 +245,7 @@ async function getActiveTab() {
     return tabs.find(isBiliTab) || null;
 }
 
-async function refreshState({ quiet = false, hydrate = false } = {}) {
+async function refreshState({ quiet = false, hydrate = false, refreshFeedback = false } = {}) {
     try {
         const tab = await getActiveTab();
         if (!tab?.id) {
@@ -251,7 +264,8 @@ async function refreshState({ quiet = false, hydrate = false } = {}) {
         const result = await chrome.runtime.sendMessage({
             action: "GET_BOOTSTRAP",
             tabId: tab.id,
-            skipCloud: !hydrate
+            skipCloud: !hydrate,
+            refreshFeedback
         });
         if (!result?.ok) throw new Error(result?.error || "读取视频状态失败");
         const nextBvid = String(result.tabState?.activeBvid || result.cache?.bvid || result.bvid || "");
@@ -764,6 +778,7 @@ function renderCC() {
     const isAsrSubtitle = ["groq", "whisper", "siliconflow", "funasr", "mimo", "custom_asr"].includes(source.toLowerCase());
     const sourceText = subtitleCacheSource === "cloud" ? "云端缓存" : (isAsrSubtitle ? "ASR转录生成" : "官方AI字幕");
     const running = Number(state.tabState?.transcriptionProgress || 0) > 0;
+    const asrKeyRequirement = getAsrApiKeyRequirement(state.settings || {});
     const canSwitchOfficialSubtitle = rows.length > 0 && !isAsrSubtitle && !running;
     const languageButton = canSwitchOfficialSubtitle
         ? `<button class="panel-icon-btn cc-language-btn" data-action="subtitle-language-menu" data-tooltip="切换字幕语言" data-tooltip-placement="bottom" aria-label="切换字幕语言"><img class="icon-default" src="assets/ui/default/language.png" alt=""><img class="icon-active" src="assets/ui/active/language.png" alt=""></button>`
@@ -795,13 +810,28 @@ function renderCC() {
             </div>
             ${rows.length
                 ? `<div class="cc-viewport"><div class="cc-list">${list || `<div class="empty">没有匹配结果</div>`}</div><button class="follow-fab direction-down" data-action="follow-now" aria-label="回到当前" style="display:none;"><img class="follow-fab-icon" src="assets/ui/default/up.png" alt=""></button></div>`
-                : `<div class="subtitle-empty-container"><div class="action-container"><p class="action-tip">${running ? "正在转录音轨..." : "未检测到字幕，可开启在线转录"}</p><button class="action-btn" data-action="transcribe" ${running ? "disabled" : ""}>${running ? `转录中 ${Number(state.tabState?.transcriptionProgress || 0)}%` : "开始在线转录"}</button></div></div>`}
+                : `<div class="subtitle-empty-container"><div class="action-container"><p class="action-tip">${running ? "正在转录音轨..." : (asrKeyRequirement.missing ? `请先填写${escapeHtml(asrKeyRequirement.providerName)}的API Key，再开始转录` : "未检测到字幕，可开启在线转录")}</p><button class="action-btn" data-action="${asrKeyRequirement.missing && !running ? "go-asr-settings" : "transcribe"}" ${running ? "disabled" : ""}>${running ? `转录中 ${Number(state.tabState?.transcriptionProgress || 0)}%` : (asrKeyRequirement.missing ? "去设置" : "开始在线转录")}</button></div></div>`}
         </section>
     </section>`;
 }
 
 function renderSummary() {
-    const summary = String(state.cache?.summary || "").trim();
+    const summaryDraft = state.cache?.summaryDraft;
+    const freshDraft = taskStatus("summary") === "processing"
+        && summaryDraft && typeof summaryDraft === "object"
+        && String(summaryDraft.text || "").trim()
+        && Date.now() - Number(summaryDraft.updatedAt || 0) < SUMMARY_DRAFT_TTL_MS;
+    const draftExpiryAt = freshDraft ? Number(summaryDraft.updatedAt || 0) + SUMMARY_DRAFT_TTL_MS : 0;
+    if (draftExpiryAt !== state.summaryDraftExpiryAt) {
+        if (state.summaryDraftExpiryTimer) clearTimeout(state.summaryDraftExpiryTimer);
+        state.summaryDraftExpiryAt = draftExpiryAt;
+        state.summaryDraftExpiryTimer = draftExpiryAt ? setTimeout(() => {
+            state.summaryDraftExpiryTimer = null;
+            state.summaryDraftExpiryAt = 0;
+            refreshState({ quiet: true, hydrate: false }).catch(() => {});
+        }, Math.max(0, draftExpiryAt - Date.now()) + 20) : null;
+    }
+    const summary = String(freshDraft ? summaryDraft.text : (state.cache?.summary || "")).trim();
     const segments = Array.isArray(state.cache?.segments) ? state.cache.segments : [];
     logPartScopeDiagnostic("ui_render_read", {
         feature: "summary_segments",
@@ -1048,7 +1078,7 @@ function renderSettings() {
                 </div>
             </div>
             <div class="settings-group">
-                <div class="settings-group-title">ASR 音频识别</div>
+                <div class="settings-group-title" id="setting-asr-section">ASR 音频识别</div>
                 <div class="field"><label>Provider</label><div class="settings-provider-row"><select id="setting-asr-provider"><option value="groq" ${asrProvider === "groq" ? "selected" : ""}>Groq</option><option value="siliconflow" ${asrProvider === "siliconflow" ? "selected" : ""}>硅基流动</option><option value="mimo" ${asrProvider === "mimo" ? "selected" : ""}>小米 MiMo</option></select><button id="setting-asr-register" type="button" class="panel-btn ghost" data-action="open-register" data-url="${asrRegisterUrl}" ${asrRegisterUrl ? "" : "disabled"}>注册</button></div></div>
                 <div id="setting-asr-groq-fields" class="${asrProvider === "groq" ? "" : "settings-hidden"}">
                     <div class="field"><label>Base URL</label><div class="settings-asr-base-url-row"><input id="setting-groq-base-url" data-manual-save="true" value="${escapeHtml(settings.groqBaseUrl || DEFAULT_GROQ_ASR_BASE_URL)}" readonly><button type="button" class="panel-btn ghost" data-action="edit-groq-base-url">修改</button><button type="button" class="panel-btn ghost" data-action="reset-groq-base-url">重置</button></div></div>
@@ -1610,6 +1640,14 @@ async function handleAction(actionNode) {
         return;
     }
     if (action === "transcribe") return contentAction("transcribe");
+    if (action === "go-asr-settings") {
+        state.activePage = "settings";
+        render();
+        requestAnimationFrame(() => {
+            document.getElementById("setting-asr-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
+        });
+        return;
+    }
     if (action === "retranscribe") return contentAction("retranscribe");
     if (action === "subtitle-language-menu") return showSubtitleLanguageMenu(actionNode);
     if (action === "run-summary") return runTask(["summary", "segments"], "生成总结");
@@ -2042,7 +2080,7 @@ window.addEventListener("beforeunload", () => {
     restoreHiddenEmbedded();
 });
 
-refreshState({ hydrate: true });
+refreshState({ hydrate: true, refreshFeedback: true });
 setInterval(() => refreshState({ quiet: true }), 1500);
 setInterval(async () => {
     if (state.activePage !== "CC" || !state.tabId || document.hidden) return;

@@ -15,17 +15,31 @@ describe("CID-scoped AI cache with legacy subtitle flow", () => {
   it("selects the active CID before content consumes a storage change", () => {
     expect(contentSource).toContain("function selectCacheDirectoryPart(");
     expect(contentSource).toMatch(/cache: selectCacheDirectoryPart\([\s\S]*?getCurrentRouteCid\(\)/);
-    expect(contentSource).toContain("if (!(cid > 0)) return null");
+    expect(contentSource).toContain("const pendingPartKey = `${bvid.toLowerCase()}::single-pending`");
+    expect(contentSource).toContain("if (allowPendingSinglePart && pendingPart");
     expect(contentSource).toContain('reason: "route_cid_pending"');
     expect(contentSource).toContain('console.log("[CACHE_DIRECTORY]"');
   });
 
   it("only allows a missing route CID for a confirmed single-part video", () => {
-    expect(backgroundSource).toContain("if (!(cid > 0)) return null");
+    expect(backgroundSource).toContain("Number(context?.partCount || 0) !== 1");
+    expect(backgroundSource).toContain("function isPendingSinglePartContext");
+    expect(backgroundSource).toContain("promotePendingSinglePartCache");
+    expect(backgroundSource).toContain("Object.values(cache.parts)");
+    expect(backgroundSource).toContain("allowPendingSinglePartCid");
     expect(backgroundSource).toContain('reason: "route_cid_pending"');
     expect(contentSource).toContain("return getCurrentRouteCid();");
     expect(contentSource).toContain("const isConfirmedSinglePartVideo = !routeTid && getCurrentRoutePartCount() === 1");
     expect(contentSource).toContain("if (routeCid !== cacheCid) return false");
+    expect(contentSource).toContain("allowPendingSinglePartCid");
+  });
+
+  it("preserves current subtitles while the route CID is still unresolved", () => {
+    expect(contentSource).toContain("const canPreserveCurrentSubtitleCache = !acceptedCache");
+    expect(contentSource).toContain("&& !(routeCid > 0)");
+    expect(contentSource).toContain("&& normalizeBvidCase(appState.cache?.bvid || \"\") === target");
+    expect(contentSource).toContain("&& hasSubtitleInCache(appState.cache)");
+    expect(contentSource).toContain('logPartScopeDiagnostic("cache_preserved_while_cid_pending"');
   });
 
   it("keeps subtitle variants in the legacy top-level cache", () => {

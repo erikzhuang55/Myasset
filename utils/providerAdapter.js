@@ -166,6 +166,10 @@ function isQwenModel(model) {
     return /qwen/i.test(String(model || ""));
 }
 
+function isDeepSeekV4Model(model) {
+    return /(?:^|\/)deepseek-v4(?:-|$)/i.test(String(model || "").trim());
+}
+
 function shouldUseJsonResponseFormat(messages) {
     const text = Array.isArray(messages)
         ? messages.map((item) => String(item?.content || "")).join("\n")
@@ -466,6 +470,9 @@ function resolveProviderRequest(providerKey, config, messages, streaming) {
         if (isOpenRouter) {
             body.reasoning = { effort: "none", exclude: true };
         }
+        if (config?.deepSeekV4ThinkingDisabled === true && isDeepSeekV4Model(model)) {
+            body.thinking = { type: "disabled" };
+        }
         if (streaming && shouldIncludeStreamUsage(providerKey || config.provider, isCustom, protocol)) {
             body.stream_options = { include_usage: true };
         }
@@ -493,7 +500,8 @@ export async function callAI(providerKey, config, messages, signal) {
         detail: {
             message_count: Array.isArray(requestBody.messages) ? requestBody.messages.length : 0,
             max_tokens: Number(requestBody.max_tokens || 0),
-            stream: !!requestBody.stream
+            stream: !!requestBody.stream,
+            thinking_disabled: requestBody.thinking?.type === "disabled"
         }
     });
     let res;
@@ -546,6 +554,7 @@ export async function callAI(providerKey, config, messages, signal) {
             throw createInvalidProviderResponseError(req, res, errText, false);
         }
         throw createHttpError(res.status, `API Error ${res.status}: ${errText}`, {
+            responseHeaders: res.headers,
             provider: providerKey,
             model: req.model || "",
             requestEndpoint: req.finalUrl,
@@ -597,7 +606,8 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
         detail: {
             message_count: Array.isArray(requestBody.messages) ? requestBody.messages.length : 0,
             max_tokens: Number(requestBody.max_tokens || 0),
-            stream: !!requestBody.stream
+            stream: !!requestBody.stream,
+            thinking_disabled: requestBody.thinking?.type === "disabled"
         }
     });
     let res;
@@ -630,6 +640,7 @@ export async function callAIStream(providerKey, config, messages, signal, onDelt
             throw createInvalidProviderResponseError(req, res, errText, true);
         }
         throw createHttpError(res.status, `API Error ${res.status}: ${errText}`, {
+            responseHeaders: res.headers,
             provider: providerKey,
             model: req.model || "",
             requestEndpoint: req.finalUrl,

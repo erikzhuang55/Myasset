@@ -11,7 +11,7 @@ describe("product analytics instrumentation", () => {
     expect(background).toContain('task_id: String(payload.taskId || "").trim() || undefined');
     expect(background).toContain('eventName: "task_attempt_failed"');
     expect(background).toContain('eventName: "task_recovery_finished"');
-    expect(background).toContain('strategy: "summary_empty_retry"');
+    expect(background).toContain('"summary_empty_retry"');
     expect(background).toContain('strategy: "local_json_extract"');
     expect(background).toContain('strategy = "ai_json_repair"');
     expect(background).toContain("markSegmentsAIRepairAttempted(taskContext)");
@@ -67,7 +67,7 @@ describe("product analytics instrumentation", () => {
 
   it("reports summary success only after a non-empty result", () => {
     expect(background).toContain('if (task !== "summary") {\n        await reportFeatureUsage(task, bvid, settings, aiRes.metrics);');
-    expect(background).toMatch(/if \(task === "summary"\)[\s\S]*?if \(!summaryText\)[\s\S]*?await reportFeatureUsage\(task, bvid, settings, aiRes\.metrics\);[\s\S]*?return summaryText;/);
+    expect(background).toMatch(/if \(task === "summary"\)[\s\S]*?if \(!summaryText \|\| shouldDisableDeepSeekV4ThinkingForRetry\(settings, aiRes\)\)[\s\S]*?await reportFeatureUsage\(task, bvid, settings, aiRes\.metrics\);[\s\S]*?return summaryText;/);
   });
 
   it("records response metadata when a summary is empty", () => {
@@ -77,5 +77,15 @@ describe("product analytics instrumentation", () => {
     expect(background).toContain("reasoning_chars:");
     expect(background).toContain("raw_response:");
     expect(background).toContain('source: "summary_retry_empty"');
+  });
+
+  it("turns off DeepSeek V4 thinking only for a length-truncated reasoning retry", () => {
+    expect(background).toContain("function shouldDisableDeepSeekV4ThinkingForRetry");
+    expect(background).toContain("if (!isDeepSeekV4ModelName(settings?.model)) return false");
+    expect(background).toContain("if (!isOutputLengthFinishReason({ finishReason: diagnostics.finishReason })) return false");
+    expect(background).toContain("if (!(diagnostics.reasoningChars > 0)) return false");
+    expect(background).toContain("return { ...settings, deepSeekV4ThinkingDisabled: true }");
+    expect(background).toContain('strategy: retryStrategy');
+    expect(background).toContain('const expandedRetrySettings = buildDeepSeekV4RetrySettings(settings, latestError)');
   });
 });

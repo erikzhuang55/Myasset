@@ -63,7 +63,7 @@ describe("usageEvents", () => {
             expect.objectContaining({
                 method: "POST",
                 requestName: "usage_event_report",
-                timeoutMs: 5000
+                timeoutMs: 2000
             })
         );
     });

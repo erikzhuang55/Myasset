@@ -9,6 +9,15 @@ import {
     normalizeRemoteConfigRow
 } from "./utils/remoteConfig.js";
 import {
+    MODELSCOPE_QUOTA_LEDGER_STORAGE_KEY,
+    classifyModelScopeFallbackError,
+    markModelScopeModelUnavailable,
+    normalizeModelScopeQuotaLedger,
+    selectModelScopeFallbackModel,
+    updateModelScopeQuotaLedger,
+    shouldUseImmediateModelScopeFallback
+} from "./utils/modelScopeFallback.js";
+import {
     MAX_SEGMENTS_REPAIR_INPUT_CHARS,
     buildSegmentsAIRepairPrompt,
     shouldAttemptSegmentsAIRepair
@@ -48,6 +57,7 @@ import { createAppError, createHttpError, serializeAppError } from "./utils/appE
 import { isSupabaseEnabled, supabaseRpc, supabaseSelect, supabaseWrite } from "./utils/supabaseClient.js";
 import { reportUsageEvent } from "./utils/usageEvents.js";
 import { createProviderRequestTiming } from "./utils/providerRequestTiming.js";
+import { runWithProvider429Backoff } from "./utils/provider429Retry.js";
 import "./logger.js";
 
 let IS_DEBUG_MODE = false;
@@ -483,7 +493,8 @@ function buildUsageEventMetadata(payload = {}) {
 }
 
 function buildUsageErrorPayload(error, fallback = {}) {
-    const status = error?.code === "ABORTED" ? "cancelled" : resolveUsageStatusByError(error);
+    const status = String(fallback.status || "").trim()
+        || (error?.code === "ABORTED" ? "cancelled" : resolveUsageStatusByError(error));
     return {
         status,
         errorCode: resolveUsageErrorCode(error, fallback.errorCode || "TASK_FAILED"),
@@ -590,11 +601,27 @@ function buildTaskRecoveryMetadata(taskContext = {}) {
         : [];
     const attempts = states.reduce((total, state) => total + Math.max(0, Number(state?.attempts || 0)), 0);
     const strategies = [...new Set(states.flatMap((state) => Array.isArray(state?.strategies) ? state.strategies : []).filter(Boolean))];
+    const fallbackModels = taskContext?.modelFallbackModels && typeof taskContext.modelFallbackModels === "object"
+        ? Object.entries(taskContext.modelFallbackModels)
+            .map(([task, model]) => `${task}=${String(model || "").trim()}`)
+            .filter((item) => !item.endsWith("="))
+            .join(",")
+        : "";
     return {
         recovered: states.some((state) => state?.succeeded === true),
         recovery_attempts: attempts,
-        recovery_strategies: strategies.join(",")
+        recovery_strategies: strategies.join(","),
+        model_fallback_used: !!fallbackModels,
+        model_fallback_models: fallbackModels
     };
+}
+
+function getSettingsForTaskResult(settings, taskContext = {}, task = "default") {
+    const models = taskContext?.modelFallbackModels && typeof taskContext.modelFallbackModels === "object"
+        ? taskContext.modelFallbackModels
+        : {};
+    const fallbackModel = String(models[task] || models.default || "").trim();
+    return fallbackModel ? { ...settings, model: fallbackModel } : settings;
 }
 
 async function reportTaskInitialFailure({ settings, taskContext, component, bvid, error, durationMs = 0 } = {}) {
@@ -631,7 +658,8 @@ async function reportTaskRecoveryFinished({
     resultError = null,
     success = false,
     durationMs = 0,
-    metrics = {}
+    metrics = {},
+    metadata = {}
 } = {}) {
     const state = getUsageRecoveryState(taskContext, component);
     if (!state) return false;
@@ -655,10 +683,121 @@ async function reportTaskRecoveryFinished({
             component: String(component || "task"),
             attempt_no: state.attempts + 1,
             strategy: normalizedStrategy,
-            trigger_error_code: resolveUsageErrorCode(triggerError)
+            trigger_error_code: resolveUsageErrorCode(triggerError),
+            ...(metadata && typeof metadata === "object" ? metadata : {})
         }
     }, settings);
     return true;
+}
+
+async function reportProvider429RetryAttempt(settings, options, event = {}) {
+    const taskContext = options?.taskContext && typeof options.taskContext === "object" ? options.taskContext : null;
+    const component = String(options?.component || taskContext?.usageFeatureName || "ai").trim() || "ai";
+    const bvid = normalizeBvid(options?.bvid || taskContext?.bvid || "");
+    const taskId = String(taskContext?.usageTaskId || options?.provider429TaskId || "").trim() || createUsageTaskId(component);
+    if (options && typeof options === "object" && !options.provider429TaskId) options.provider429TaskId = taskId;
+    const durationMs = Math.max(0, Number(event?.attempt === 1 ? event?.attemptDurationMs : event?.recoveryDurationMs || 0));
+    if (taskContext) {
+        if (Number(event?.attempt || 0) === 1) {
+            await reportTaskInitialFailure({
+                settings,
+                taskContext,
+                component,
+                bvid,
+                error: event.error,
+                durationMs
+            });
+            return;
+        }
+        await reportTaskRecoveryFinished({
+            settings,
+            taskContext,
+            component,
+            bvid,
+            strategy: "provider_429_backoff",
+            triggerError: event.firstError,
+            resultError: event.error,
+            success: false,
+            durationMs,
+            metadata: {
+                retry_attempt: Number(event.attempt || 0) - 1,
+                max_retries: Math.max(0, Number(event.maxAttempts || 0) - 1),
+                applied_delay_ms: Number(event.appliedDelayMs || 0),
+                next_delay_ms: Number(event.nextDelayMs || 0),
+                exhausted: !!event.exhausted
+            }
+        });
+        return;
+    }
+    reportClientUsageEvent({
+        eventName: Number(event?.attempt || 0) === 1 ? "task_attempt_failed" : "task_recovery_finished",
+        featureName: component,
+        taskId,
+        status: "failed",
+        errorCode: resolveUsageErrorCode(event.error, "HTTP_429"),
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        bvid,
+        durationMs,
+        tabId: options?.tabId,
+        metadata: {
+            component,
+            strategy: "provider_429_backoff",
+            attempt_no: Number(event.attempt || 0),
+            max_attempts: Number(event.maxAttempts || 0),
+            applied_delay_ms: Number(event.appliedDelayMs || 0),
+            next_delay_ms: Number(event.nextDelayMs || 0),
+            exhausted: !!event.exhausted
+        }
+    }, settings);
+}
+
+async function reportProvider429Recovered(settings, options, event = {}, metrics = {}) {
+    const taskContext = options?.taskContext && typeof options.taskContext === "object" ? options.taskContext : null;
+    const component = String(options?.component || taskContext?.usageFeatureName || "ai").trim() || "ai";
+    const bvid = normalizeBvid(options?.bvid || taskContext?.bvid || "");
+    const taskId = String(taskContext?.usageTaskId || options?.provider429TaskId || "").trim() || createUsageTaskId(component);
+    if (options && typeof options === "object" && !options.provider429TaskId) options.provider429TaskId = taskId;
+    const durationMs = Math.max(0, Number(event?.recoveryDurationMs || 0));
+    if (taskContext) {
+        await reportTaskRecoveryFinished({
+            settings,
+            taskContext,
+            component,
+            bvid,
+            strategy: "provider_429_backoff",
+            triggerError: event.firstError,
+            success: true,
+            durationMs,
+            metrics,
+            metadata: {
+                retry_attempt: Number(event.attempt || 0) - 1,
+                max_retries: Math.max(0, Number(event.maxAttempts || 0) - 1),
+                applied_delay_ms: Number(event.appliedDelayMs || 0)
+            }
+        });
+        return;
+    }
+    reportClientUsageEvent({
+        eventName: "task_recovery_finished",
+        featureName: component,
+        taskId,
+        status: "success",
+        errorCode: "",
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        bvid,
+        durationMs,
+        tokenCount: Math.max(0, Number(metrics?.tokens || 0)),
+        tabId: options?.tabId,
+        metadata: {
+            component,
+            strategy: "provider_429_backoff",
+            attempt_no: Number(event.attempt || 0),
+            max_attempts: Number(event.maxAttempts || 0),
+            applied_delay_ms: Number(event.appliedDelayMs || 0)
+        }
+    }, settings);
 }
 
 function isMeaningfulFeedbackText(value) {
@@ -675,9 +814,9 @@ function normalizeFeedbackRow(row = {}) {
         status: String(row.status || "open"),
         reply: String(row.reply || ""),
         bvid: String(row.bvid || ""),
-        createdAt: String(row.created_at || ""),
-        updatedAt: String(row.updated_at || ""),
-        seenAt: String(row.seen_at || "")
+        createdAt: String(row.created_at || row.createdAt || ""),
+        updatedAt: String(row.updated_at || row.updatedAt || ""),
+        seenAt: String(row.seen_at || row.seenAt || "")
     };
 }
 
@@ -699,40 +838,80 @@ function getFeedbackUnreadCount(rows = []) {
     }).length;
 }
 
-async function fetchFeedbackState(settings, { markSeen = false } = {}) {
+async function readCachedFeedbackState(clientId) {
+    try {
+        const stored = await chrome.storage.local.get([FEEDBACK_CACHE_STORAGE_KEY]);
+        const cache = stored?.[FEEDBACK_CACHE_STORAGE_KEY];
+        if (!cache || String(cache.clientId || "") !== String(clientId || "")) return null;
+        return {
+            rows: Array.isArray(cache.rows) ? cache.rows.map((row) => ({ ...row })) : [],
+            unreadCount: Number(cache.unreadCount || 0),
+            clientId: String(clientId || ""),
+            enabled: true,
+            errorText: "",
+            statusText: "",
+            fetchedAt: Number(cache.fetchedAt || 0)
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
+async function writeCachedFeedbackState(state) {
+    try {
+        await chrome.storage.local.set({
+            [FEEDBACK_CACHE_STORAGE_KEY]: {
+                clientId: String(state?.clientId || ""),
+                rows: Array.isArray(state?.rows) ? state.rows : [],
+                unreadCount: Number(state?.unreadCount || 0),
+                fetchedAt: Number(state?.fetchedAt || Date.now())
+            }
+        });
+    } catch (_) {}
+}
+
+async function fetchFeedbackState(settings, { markSeen = false, force = false } = {}) {
     if (!isSupabaseEnabled(settings)) {
         return { rows: [], unreadCount: 0, clientId: "", enabled: false };
     }
     const clientId = await getFeedbackClientId();
     const table = settings.supabaseFeedbackTable || SUPABASE_DEFAULT_FEEDBACK_TABLE;
+    const cached = await readCachedFeedbackState(clientId);
+    const cacheFresh = cached && Date.now() - Number(cached.fetchedAt || 0) < FEEDBACK_CACHE_TTL_MS;
+    if (!force && !markSeen && cacheFresh) return cached;
     let rows = [];
-    try {
-        rows = await supabaseSelect(settings, table, {
-            select: "id,type,title,content,status,reply,bvid,created_at,updated_at,seen_at",
-            client_id: `eq.${clientId}`,
-            order: "updated_at.desc",
-            limit: 20
-        }, {
-            headers: getFeedbackHeaders(clientId),
-            requestName: "feedback_select",
-            errorMessage: "读取反馈失败"
-        });
-    } catch (error) {
-        logBackground.warn("feedback_select_unavailable", {
-            task: "feedback",
-            code: error?.code || "",
-            detail: {
-                error_message: error?.message || "读取反馈失败"
-            }
-        });
-        return {
-            rows: [],
-            unreadCount: 0,
-            clientId,
-            enabled: false,
-            errorText: "反馈服务暂时不可用",
-            statusText: ""
-        };
+    if (markSeen && cached) {
+        rows = cached.rows;
+    } else {
+        try {
+            rows = await supabaseSelect(settings, table, {
+                select: "id,type,title,content,status,reply,bvid,created_at,updated_at,seen_at",
+                client_id: `eq.${clientId}`,
+                order: "updated_at.desc",
+                limit: 20
+            }, {
+                headers: getFeedbackHeaders(clientId),
+                requestName: "feedback_select",
+                errorMessage: "读取反馈失败"
+            });
+        } catch (error) {
+            logBackground.warn("feedback_select_unavailable", {
+                task: "feedback",
+                code: error?.code || "",
+                detail: {
+                    error_message: error?.message || "读取反馈失败"
+                }
+            });
+            if (cached) return { ...cached, errorText: "反馈服务暂时不可用" };
+            return {
+                rows: [],
+                unreadCount: 0,
+                clientId,
+                enabled: false,
+                errorText: "反馈服务暂时不可用",
+                statusText: ""
+            };
+        }
     }
     const normalizedRows = rows.map(normalizeFeedbackRow);
     if (markSeen && normalizedRows.length) {
@@ -758,14 +937,17 @@ async function fetchFeedbackState(settings, { markSeen = false } = {}) {
             });
         }
     }
-    return {
+    const state = {
         rows: normalizedRows,
         unreadCount: getFeedbackUnreadCount(normalizedRows),
         clientId,
         enabled: true,
         errorText: "",
-        statusText: ""
+        statusText: "",
+        fetchedAt: markSeen && cached ? Number(cached.fetchedAt || Date.now()) : Date.now()
     };
+    await writeCachedFeedbackState(state);
+    return state;
 }
 
 async function submitFeedbackFromContent(msg, sender) {
@@ -783,7 +965,7 @@ async function submitFeedbackFromContent(msg, sender) {
     const includeLogs = msg.includeLogs !== false;
     const contentLogs = Array.isArray(msg.logs) ? msg.logs.filter(isFeedbackDiagnosticLog).slice(-80) : [];
     const backgroundLogs = globalLogs.filter(isFeedbackDiagnosticLog).slice(-120);
-    const logs = includeLogs ? [...backgroundLogs, ...contentLogs].slice(-160) : null;
+    const logs = includeLogs ? dedupeFeedbackLogs([...backgroundLogs, ...contentLogs], 160) : null;
     const now = new Date().toISOString();
     const table = settings.supabaseFeedbackTable || SUPABASE_DEFAULT_FEEDBACK_TABLE;
     await supabaseWrite(settings, table, {
@@ -799,7 +981,19 @@ async function submitFeedbackFromContent(msg, sender) {
         metadata: {
             tab_id: tabId || 0,
             url: sender?.tab?.url || "",
-            user_agent: navigator.userAgent || ""
+            user_agent: navigator.userAgent || "",
+            route_context: msg?.diagnosticContext && typeof msg.diagnosticContext === "object"
+                ? msg.diagnosticContext
+                : {},
+            background_context: {
+                active_bvid: normalizeBvid(tabState?.activeBvid || ""),
+                active_cid: Number(tabState?.activeCid || 0),
+                active_tid: String(tabState?.activeTid || ""),
+                active_part_count: Number(tabState?.activePartCount || 0),
+                task_status: tabState?.taskStatus || {},
+                task_errors: tabState?.taskErrors || {},
+                last_error: String(tabState?.lastError || "")
+            }
         },
         seen_at: now
     }, {
@@ -807,7 +1001,7 @@ async function submitFeedbackFromContent(msg, sender) {
         requestName: "feedback_submit",
         errorMessage: "提交反馈失败"
     });
-    return fetchFeedbackState(settings);
+    return fetchFeedbackState(settings, { force: true });
 }
 
 const MAX_GLOBAL_CONCURRENCY = 1;
@@ -827,6 +1021,8 @@ const pendingDownloadFilenames = new Map();
 const BILI_PLAYURL_API = "https://api.bilibili.com/x/player/playurl";
 const SUPABASE_DEFAULT_VIDEO_CACHE_TABLE = "video_cache";
 const SUPABASE_DEFAULT_FEEDBACK_TABLE = "feedback";
+const FEEDBACK_CACHE_STORAGE_KEY = "feedbackStateCache";
+const FEEDBACK_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const SUPABASE_DEFAULT_USAGE_DAILY_RPC = "increment_feature_usage_daily";
 const SUPABASE_DEFAULT_VERSION_TABLE = "extension_versions";
 const SUPABASE_REMOTE_CONFIG_TABLE = "extension_remote_config";
@@ -899,6 +1095,8 @@ const tabStateCache = new Map();
 const tabStateWriteTimers = new Map();
 const cacheMemory = new Map();
 const VIDEO_CACHE_SCHEMA_VERSION = 3;
+const SINGLE_PART_PENDING_SUFFIX = "single-pending";
+const SUMMARY_DRAFT_TTL_MS = 10 * 60 * 1000;
 const recentAsrAudioFingerprints = new Map();
 let currentDebugMode = false;
 let remoteConfigMemory = { ...DEFAULT_REMOTE_CONFIG };
@@ -907,6 +1105,9 @@ let remoteConfigLoadPromise = null;
 let remoteConfigRefreshPromise = null;
 let remoteConfigFetchedAt = 0;
 let remoteConfigFetchedVersion = "";
+let modelScopeQuotaLedgerMemory = null;
+let modelScopeQuotaLedgerLoadPromise = null;
+let modelScopeQuotaLedgerWritePromise = Promise.resolve();
 const fallbackLoggerFactory = {
     create() {
         return {
@@ -1088,6 +1289,24 @@ async function ensureRemoteConfigLoaded() {
     return remoteConfigLoadPromise;
 }
 
+function dedupeFeedbackLogs(entries = [], limit = 160) {
+    const seen = new Set();
+    return entries.filter((entry) => {
+        const key = JSON.stringify([
+            entry?.time || entry?.ts || "",
+            entry?.module || entry?.source || "",
+            entry?.event || "",
+            entry?.task_id || entry?.taskId || "",
+            entry?.bvid || "",
+            entry?.code || "",
+            entry?.detail || null
+        ]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    }).slice(-Math.max(1, Number(limit || 160)));
+}
+
 async function notifyRemoteConfigUpdated(config) {
     const tabs = await chrome.tabs.query({}).catch(() => []);
     await Promise.all((tabs || []).map((tab) => {
@@ -1208,6 +1427,249 @@ function registerModelScopeRateLimitObserver() {
 }
 
 registerModelScopeRateLimitObserver();
+
+async function getModelScopeQuotaLedger() {
+    if (modelScopeQuotaLedgerMemory) {
+        modelScopeQuotaLedgerMemory = normalizeModelScopeQuotaLedger(modelScopeQuotaLedgerMemory);
+        return modelScopeQuotaLedgerMemory;
+    }
+    if (!modelScopeQuotaLedgerLoadPromise) {
+        modelScopeQuotaLedgerLoadPromise = chrome.storage.local
+            .get([MODELSCOPE_QUOTA_LEDGER_STORAGE_KEY])
+            .then((stored) => {
+                modelScopeQuotaLedgerMemory = normalizeModelScopeQuotaLedger(stored?.[MODELSCOPE_QUOTA_LEDGER_STORAGE_KEY]);
+                return modelScopeQuotaLedgerMemory;
+            })
+            .finally(() => {
+                modelScopeQuotaLedgerLoadPromise = null;
+            });
+    }
+    return modelScopeQuotaLedgerLoadPromise;
+}
+
+function persistModelScopeQuotaLedger(ledger) {
+    modelScopeQuotaLedgerMemory = normalizeModelScopeQuotaLedger(ledger);
+    const snapshot = structuredClone(modelScopeQuotaLedgerMemory);
+    modelScopeQuotaLedgerWritePromise = modelScopeQuotaLedgerWritePromise
+        .catch(() => {})
+        .then(() => chrome.storage.local.set({ [MODELSCOPE_QUOTA_LEDGER_STORAGE_KEY]: snapshot }))
+        .catch((error) => {
+            logBackground.warn("modelscope_quota_ledger_write_failed", {
+                error: error?.message || String(error)
+            });
+        });
+}
+
+async function rememberModelScopeRateLimit(settings, rateLimitInfo) {
+    if (String(settings?.provider || "").toLowerCase() !== "modelscope" || !rateLimitInfo) return null;
+    const ledger = updateModelScopeQuotaLedger(
+        await getModelScopeQuotaLedger(),
+        settings?.model || "",
+        rateLimitInfo
+    );
+    persistModelScopeQuotaLedger(ledger);
+    return ledger;
+}
+
+function getModelScopeFallbackTask(options = {}) {
+    const component = String(options?.component || options?.taskContext?.usageFeatureName || "default").trim().toLowerCase();
+    if (component.includes("summary") && component.includes("segment")) return "default";
+    if (component.includes("segment")) return "segments";
+    if (component.includes("summary")) return "summary";
+    if (component.includes("rumor")) return "rumors";
+    if (component.includes("chat")) return "chat";
+    return "default";
+}
+
+function getModelScopeAvailableModels(settings = {}) {
+    const configured = settings?.providerCatalog?.modelscope?.models;
+    if (Array.isArray(configured) && configured.length) return configured;
+    return Array.isArray(PROVIDERS.modelscope?.models) ? PROVIDERS.modelscope.models : [];
+}
+
+async function reportModelScopeFallbackInitial(settings, options, error, fallbackModel, reason) {
+    const taskContext = options?.taskContext;
+    const component = getModelScopeFallbackTask(options);
+    const bvid = normalizeBvid(options?.bvid || taskContext?.bvid || "");
+    if (taskContext) {
+        await reportTaskInitialFailure({ settings, taskContext, component, bvid, error });
+        return;
+    }
+    const taskId = String(options?.provider429TaskId || "").trim() || createUsageTaskId(component);
+    reportClientUsageEvent({
+        eventName: "task_attempt_failed",
+        featureName: component,
+        taskId,
+        status: "failed",
+        errorCode: resolveUsageErrorCode(error),
+        provider: settings?.provider || "",
+        model: settings?.model || "",
+        bvid,
+        tabId: options?.tabId,
+        metadata: {
+            component,
+            strategy: "model_fallback",
+            fallback_model: fallbackModel,
+            trigger_reason: reason
+        }
+    }, settings);
+}
+
+async function reportModelScopeFallbackFinished(settings, options, triggerError, resultError, result, fallbackModel, reason) {
+    const taskContext = options?.taskContext;
+    const component = getModelScopeFallbackTask(options);
+    const bvid = normalizeBvid(options?.bvid || taskContext?.bvid || "");
+    const success = !resultError;
+    const metadata = {
+        from_model: String(settings?.model || ""),
+        to_model: fallbackModel,
+        trigger_reason: reason
+    };
+    if (taskContext) {
+        await reportTaskRecoveryFinished({
+            settings: { ...settings, model: fallbackModel },
+            taskContext,
+            component,
+            bvid,
+            strategy: "model_fallback",
+            triggerError,
+            resultError,
+            success,
+            durationMs: Number(result?.metrics?.latencyMs || 0),
+            metrics: result?.metrics || {},
+            metadata
+        });
+        return;
+    }
+    const taskId = String(options?.provider429TaskId || "").trim() || createUsageTaskId(component);
+    reportClientUsageEvent({
+        eventName: "task_recovery_finished",
+        featureName: component,
+        taskId,
+        status: success ? "success" : "failed",
+        errorCode: success ? "" : resolveUsageErrorCode(resultError),
+        provider: settings?.provider || "",
+        model: fallbackModel,
+        bvid,
+        durationMs: Number(result?.metrics?.latencyMs || 0),
+        tokenCount: Number(result?.metrics?.tokens || 0),
+        tabId: options?.tabId,
+        metadata: { component, strategy: "model_fallback", ...metadata }
+    }, { ...settings, model: fallbackModel });
+}
+
+async function tryModelScopeFallback(settings, options, triggerError, runFallback) {
+    if (options?.disableModelFallback
+        || String(settings?.provider || "").toLowerCase() !== "modelscope"
+        || !isRemoteFeatureEnabled(remoteConfigMemory, "modelscope_model_fallback", true)
+        || remoteConfigMemory?.modelFallback?.enabled === false) {
+        return null;
+    }
+    const errorRateLimitInfo = resolveRateLimitInfo(settings, triggerError?.responseHeaders, { allowObservedFallback: false });
+    let ledger = hasModelScopeRateLimitInfo(errorRateLimitInfo)
+        ? await rememberModelScopeRateLimit(settings, errorRateLimitInfo)
+        : await getModelScopeQuotaLedger();
+    const classification = classifyModelScopeFallbackError(triggerError, ledger, {
+        currentModel: settings?.model || ""
+    });
+    if (!classification?.eligible) return null;
+    if (classification.markUnavailable || classification.markQuotaExhausted) {
+        ledger = markModelScopeModelUnavailable(
+            ledger,
+            settings?.model || "",
+            classification.markQuotaExhausted ? "quota_exhausted" : classification.reason
+        );
+        persistModelScopeQuotaLedger(ledger);
+    }
+    const component = getModelScopeFallbackTask(options);
+    if (options && typeof options === "object" && !options.provider429TaskId) {
+        options.provider429TaskId = String(options?.taskContext?.usageTaskId || "").trim() || createUsageTaskId(component);
+    }
+    const fallbackModel = selectModelScopeFallbackModel({
+        currentModel: settings?.model || "",
+        task: component,
+        availableModels: getModelScopeAvailableModels(settings),
+        fallbackConfig: remoteConfigMemory?.modelFallback,
+        ledger
+    });
+    if (!fallbackModel) {
+        logAI.warn("model_fallback_skipped", {
+            task: component,
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            code: resolveUsageErrorCode(triggerError),
+            detail: {
+                reason: ledger?.user?.remaining === 0 ? "user_quota_exhausted" : "no_eligible_model"
+            }
+        });
+        return null;
+    }
+    const fallbackSettings = { ...settings, model: fallbackModel };
+    await reportModelScopeFallbackInitial(settings, options, triggerError, fallbackModel, classification.reason);
+    logAI.warn("model_fallback_started", {
+        task: component,
+        provider: "modelscope",
+        model: settings?.model || "",
+        code: resolveUsageErrorCode(triggerError),
+        detail: { fallback_model: fallbackModel, trigger_reason: classification.reason }
+    });
+    try {
+        const result = await runFallback(fallbackSettings);
+        if (result?.metrics) {
+            result.metrics = {
+                ...result.metrics,
+                modelFallback: true,
+                fallbackFromModel: String(settings?.model || ""),
+                fallbackTrigger: classification.reason
+            };
+        }
+        if (options?.taskContext) {
+            options.taskContext.modelFallbackModels = {
+                ...(options.taskContext.modelFallbackModels || {}),
+                [component]: fallbackModel
+            };
+        }
+        await reportModelScopeFallbackFinished(settings, options, triggerError, null, result, fallbackModel, classification.reason);
+        logAI.info("model_fallback_succeeded", {
+            task: component,
+            provider: "modelscope",
+            model: fallbackModel,
+            duration_ms: Number(result?.metrics?.latencyMs || 0),
+            detail: { from_model: settings?.model || "", trigger_reason: classification.reason }
+        });
+        return result;
+    } catch (fallbackError) {
+        const fallbackRateLimitInfo = resolveRateLimitInfo(fallbackSettings, fallbackError?.responseHeaders, { allowObservedFallback: false });
+        const latestLedger = hasModelScopeRateLimitInfo(fallbackRateLimitInfo)
+            ? await rememberModelScopeRateLimit(fallbackSettings, fallbackRateLimitInfo)
+            : await getModelScopeQuotaLedger();
+        const fallbackClassification = classifyModelScopeFallbackError(fallbackError, latestLedger, {
+            currentModel: fallbackModel
+        });
+        if (fallbackClassification?.markUnavailable || fallbackClassification?.markQuotaExhausted) {
+            persistModelScopeQuotaLedger(markModelScopeModelUnavailable(
+                latestLedger,
+                fallbackModel,
+                fallbackClassification.markQuotaExhausted ? "quota_exhausted" : fallbackClassification.reason
+            ));
+        }
+        attachSentryContext(fallbackError, {
+            model_fallback_from: String(settings?.model || ""),
+            model_fallback_to: fallbackModel,
+            model_fallback_trigger: classification.reason,
+            model_fallback_original_code: resolveUsageErrorCode(triggerError)
+        });
+        await reportModelScopeFallbackFinished(settings, options, triggerError, fallbackError, null, fallbackModel, classification.reason);
+        logAI.warn("model_fallback_failed", {
+            task: component,
+            provider: "modelscope",
+            model: fallbackModel,
+            code: resolveUsageErrorCode(fallbackError),
+            detail: { from_model: settings?.model || "", trigger_reason: classification.reason }
+        });
+        throw fallbackError;
+    }
+}
 
 function enableSidePanelActionClick() {
     if (chrome.sidePanel?.setPanelBehavior) {
@@ -1543,7 +2005,7 @@ async function handleMessage(msg, sender) {
     }
     if (msg.action === "GET_FEEDBACK") {
         const settings = await getResolvedSettings();
-        return { feedback: await fetchFeedbackState(settings, { markSeen: !!msg.markSeen }) };
+        return { feedback: await fetchFeedbackState(settings, { markSeen: !!msg.markSeen, force: !!msg.force }) };
     }
     if (msg.action === "SUBMIT_FEEDBACK") {
         return { feedback: await submitFeedbackFromContent(msg, sender) };
@@ -1587,6 +2049,10 @@ async function handleMessage(msg, sender) {
             activePartCount: Math.max(0, Math.floor(Number(msg?.partCount || 0))),
             updatedAt: Date.now()
         });
+        if (Number.isFinite(cid) && cid > 0 && Number(msg?.partCount || 0) === 1 && !String(msg?.tid || "").trim()) {
+            await promotePendingSinglePartCache(bvid, cid).catch(() => {});
+            await promotePendingSinglePartTaskState(tabId, bvid, cid).catch(() => {});
+        }
         return {};
     }
     if (msg.action === "RUN_TRANSCRIBE_FALLBACK" || msg.action === "GET_AUDIO_URL") {
@@ -1690,9 +2156,11 @@ async function handleMessage(msg, sender) {
         const rawCache = tabState?.activeBvid ? await getCache(tabState.activeBvid) : null;
         const cache = selectCachePart(rawCache, {
             bvid: tabState?.activeBvid || "",
-            cid: Number(tabState?.activeCid || 0)
+            cid: Number(tabState?.activeCid || 0),
+            tid: String(tabState?.activeTid || ""),
+            partCount: Number(tabState?.activePartCount || 0)
         });
-        const feedback = await fetchFeedbackState(settings).catch(() => ({ rows: [], unreadCount: 0, enabled: false }));
+        const feedback = await fetchFeedbackState(settings, { force: !!msg.refreshFeedback }).catch(() => ({ rows: [], unreadCount: 0, enabled: false }));
         const cloudCachePrefs = await getCloudCacheReadPrefs(tabState?.activeBvid, settings);
         logPartScopeDiagnostic("ui_cache_response", {
             channel: "bootstrap",
@@ -1720,7 +2188,9 @@ async function handleMessage(msg, sender) {
             const rawCache = bvid ? await getCache(bvid) : null;
             const cache = selectCachePart(rawCache, {
                 bvid,
-                cid: Number(tabState?.activeCid || 0)
+                cid: Number(tabState?.activeCid || 0),
+                tid: String(tabState?.activeTid || ""),
+                partCount: Number(tabState?.activePartCount || 0)
             });
             logPartScopeDiagnostic("ui_cache_response", {
                 channel: "get_cache_active",
@@ -1745,7 +2215,9 @@ async function handleMessage(msg, sender) {
         const rawCache = await getCache(expected);
         const cache = selectCachePart(rawCache, {
             bvid: expected,
-            cid: cacheContext.cid
+            cid: cacheContext.cid,
+            tid: cacheContext.tid,
+            partCount: cacheContext.partCount
         });
         logPartScopeDiagnostic("ui_cache_response", {
             channel: "get_cache_explicit",
@@ -1787,6 +2259,25 @@ async function handleMessage(msg, sender) {
         await runTasksForTab(tabId, ["segments"], true, {
             ...normalizeTaskContext(msg.taskContext),
             debugForceFirstSegmentsTruncation: true
+        }, requestedBvid);
+        return {};
+    }
+    if (msg.action === "RUN_PROVIDER_429_RETRY_TEST") {
+        if (!tabId) throw new Error("tabId 缺失");
+        const requestedBvid = normalizeBvid(msg.bvid);
+        logBackground.info("provider_429_retry_test_start", { tab_id: tabId, bvid: requestedBvid });
+        await recordSegmentsDebugState(tabId, {
+            status: "running",
+            stage: "provider_429_wait",
+            strategy: "provider_429_backoff",
+            attempt: 0,
+            total: 4,
+            code: "HTTP_429",
+            message: "测试模式：准备模拟 Provider 429"
+        }, "测试模式：将依次等待 2 秒、5 秒、10 秒后重试", { resetEvents: true });
+        await runTasksForTab(tabId, ["segments"], true, {
+            ...normalizeTaskContext(msg.taskContext),
+            debugForceProvider429Retries: true
         }, requestedBvid);
         return {};
     }
@@ -2536,6 +3027,24 @@ class ContentProvider {
         const asrDisplayName = asrProvider === "siliconflow" ? "硅基流动" : (asrProvider === "mimo" ? "小米 MiMo" : "Groq");
         const subtitleSource = asrProvider;
         const startedAt = Date.now();
+        if (!asrApiKey) {
+            const asrPromptName = asrProvider === "siliconflow" ? "硅基流动" : (asrProvider === "mimo" ? "Mimo" : "Groq");
+            const error = createAppError("MISSING_API_KEY", `请先填写${asrPromptName}的API Key，再开始转录`);
+            await reportClientUsageEvent({
+                eventName: "transcribe_preflight_blocked",
+                featureName: "transcribe",
+                status: "blocked",
+                errorCode: "MISSING_API_KEY",
+                provider: asrProvider,
+                model: asrModel,
+                bvid,
+                title,
+                tabId,
+                metadata: { reason: "missing_api_key", outcome_category: "usage_blocked" }
+            }, normalizedSettings);
+            error.__usageEventReported = true;
+            throw error;
+        }
         const taskId = createUsageTaskId("transcribe");
         await reportClientUsageEvent({
             eventName: "task_started",
@@ -2548,24 +3057,6 @@ class ContentProvider {
             title,
             tabId
         }, normalizedSettings);
-        if (!asrApiKey) {
-            const error = createAppError("MISSING_API_KEY", asrProvider === "siliconflow"
-                ? "请先在设置中填写硅基流动 API Key"
-                : (asrProvider === "mimo" ? "请先在设置中填写小米 MiMo API Key" : "请先在设置中填写 Groq API Key"));
-            await reportClientUsageEvent({
-                eventName: "task_failed",
-                featureName: "transcribe",
-                taskId,
-                provider: asrProvider,
-                model: asrModel,
-                bvid,
-                title,
-                tabId,
-                ...buildUsageErrorPayload(error, { startedAt, errorCode: "MISSING_API_KEY" })
-            }, normalizedSettings);
-            error.__usageEventReported = true;
-            throw error;
-        }
         const asrRunId = String(payload?.asrRunId || `asr_${bvid}_${startedAt.toString(36)}`).trim();
         const payloadAudioSummary = await summarizeMediaLocator(payload?.audioUrl || "");
         const operationController = new AbortController();
@@ -2830,6 +3321,7 @@ class ContentProvider {
             }, normalizedSettings);
             return { rows: rows.length, quota: transcription.quota };
         } catch (error) {
+            const usageBlocked = isNonSoftwareTaskBlocker(error);
             attachSentryContext(error, {
                 task: "transcribe",
                 task_id: taskId,
@@ -2840,7 +3332,7 @@ class ContentProvider {
             });
             if (!error?.__usageEventReported) {
                 await reportClientUsageEvent({
-                    eventName: error?.code === "ABORTED" ? "task_cancelled" : "task_failed",
+                    eventName: error?.code === "ABORTED" ? "task_cancelled" : (usageBlocked ? "task_blocked" : "task_failed"),
                     featureName: "transcribe",
                     taskId,
                     provider: asrProvider,
@@ -2848,7 +3340,12 @@ class ContentProvider {
                     bvid,
                     title,
                     tabId,
-                    ...buildUsageErrorPayload(error, { startedAt, errorCode: "ASR_FAILED" })
+                    ...buildUsageErrorPayload(error, {
+                        startedAt,
+                        errorCode: "ASR_FAILED",
+                        status: usageBlocked ? "blocked" : "",
+                        metadata: usageBlocked ? { outcome_category: "usage_blocked" } : {}
+                    })
                 }, normalizedSettings);
             }
             await updateTabState(tabId, { activeBvid: bvid, transcriptionProgress: 0, updatedAt: Date.now() });
@@ -2862,11 +3359,11 @@ class ContentProvider {
             await reportDailyFeatureUsage("transcribe", normalizedSettings, {
                 durationMs: Date.now() - startedAt,
                 tokens: 0
-            }, resolveUsageStatusByError(error), resolveUsageErrorCode(error, "ASR_FAILED"), {
+            }, usageBlocked ? "blocked" : resolveUsageStatusByError(error), resolveUsageErrorCode(error, "ASR_FAILED"), {
                 bvid,
                 title: title || media.title || ""
             });
-            logASR.error("asr_failed", buildFailureLog(error, {
+            const failureLog = buildFailureLog(error, {
                 bvid,
                 task: "asr",
                 provider: asrProvider,
@@ -2877,7 +3374,9 @@ class ContentProvider {
                     tab_id: tabId,
                     cid: Number.isFinite(cid) ? cid : 0
                 }
-            }));
+            });
+            if (usageBlocked) logASR.warn("asr_blocked", failureLog);
+            else logASR.error("asr_failed", failureLog);
             throw error;
         } finally {
             unregisterAbort();
@@ -3731,13 +4230,14 @@ async function handleSubtitleCaptured(tabId, payload) {
     }
     const cid = Number(payload.cid || 0);
     const tid = payload.tid || null;
+    const partCount = Math.max(0, Math.floor(Number(payload?.partCount || 0)));
     const subtitleSource = String(payload?.source || "official");
     const subtitleLanguage = String(payload?.subtitleLanguage || "").trim();
     const subtitleLanguageLabel = String(payload?.subtitleLanguageLabel || subtitleLanguage || "").trim();
     const clearDerived = payload?.clearDerived === true;
     logBackground.info("subtitle_detected", { tab_id: tabId, bvid, cid, tid });
     const existing = await getCache(bvid);
-    const existingPart = selectCachePart(existing, { bvid, cid }) || {};
+    const existingPart = selectCachePart(existing, { bvid, cid, tid, partCount }) || {};
     const rawSubtitle = normalizeRawSubtitle(payload.subtitle || []);
     const rawHash = makeSubtitleHash(rawSubtitle);
     if (existingPart?.rawHash && existingPart.rawHash === rawHash) {
@@ -3757,6 +4257,7 @@ async function handleSubtitleCaptured(tabId, payload) {
             await mergeCacheByBvid(bvid, {
                 cid: Number.isFinite(cid) ? cid : 0,
                 tid,
+                partCount,
                 title: payload.title || existingPart?.title || "",
                 subtitleSource,
                 subtitleLanguage,
@@ -3791,7 +4292,7 @@ async function handleSubtitleCaptured(tabId, payload) {
                 tid
             });
         }
-        const nextPartCache = selectCachePart(nextCache, { bvid, cid });
+        const nextPartCache = selectCachePart(nextCache, { bvid, cid, tid, partCount });
         if (nextPartCache) await pushSubtitleSyncToTab(tabId, bvid, nextPartCache, "duplicate");
         return;
     }
@@ -3815,6 +4316,7 @@ async function handleSubtitleCaptured(tabId, payload) {
         bvid,
         cid: Number.isFinite(cid) ? cid : 0,
         tid,
+        partCount,
         title: payload.title || "",
         subtitleSource,
         subtitleLanguage,
@@ -3851,7 +4353,7 @@ async function handleSubtitleCaptured(tabId, payload) {
         updatedAt: Date.now()
     });
     const latestCache = await getCache(bvid);
-    const latestPartCache = selectCachePart(latestCache, { bvid, cid });
+    const latestPartCache = selectCachePart(latestCache, { bvid, cid, tid, partCount });
     if (isAsrSubtitleSource(subtitleSource)) {
         const settings = await getResolvedSettings();
         await persistCloudSubtitlePatch(bvid, settings, latestCache, {
@@ -3929,12 +4431,13 @@ function normalizeTaskContext(raw) {
     const formattedTime = String(duration.formattedTime || "").trim();
     const cid = Number(source.cid || 0);
     const bvid = normalizeBvid(source.bvid || "");
-    const partKey = createVideoCachePartKey(bvid, cid);
     const partCount = Math.max(0, Math.floor(Number(source.partCount || 0)));
+    const tid = String(source.tid || "").trim();
+    const partKey = createVideoCachePartKeyForContext(bvid, { cid, tid, partCount });
     return {
         bvid,
         cid: Number.isFinite(cid) && cid > 0 ? cid : 0,
-        tid: String(source.tid || "").trim(),
+        tid,
         partCount,
         partKey,
         videoDuration: {
@@ -3960,16 +4463,35 @@ function createVideoCachePartKey(bvid, cid) {
     return normalizedBvid && normalizedCid ? `${normalizedBvid}::${normalizedCid}` : "";
 }
 
+function isPendingSinglePartContext(context = {}) {
+    return !(Number(context?.cid || 0) > 0)
+        && Number(context?.partCount || 0) === 1
+        && !String(context?.tid || "").trim();
+}
+
+function createVideoCachePartKeyForContext(bvid, context = {}) {
+    const normalKey = createVideoCachePartKey(bvid, context?.cid);
+    if (normalKey) return normalKey;
+    const normalizedBvid = normalizeBvid(context?.bvid || bvid);
+    return normalizedBvid && isPendingSinglePartContext(context)
+        ? `${normalizedBvid}::${SINGLE_PART_PENDING_SUFFIX}`
+        : "";
+}
+
 function resolvePartContext(bvid, context = {}) {
     const normalizedBvid = normalizeBvid(context?.bvid || bvid);
     const cid = Number(context?.cid || 0);
     const normalizedCid = Number.isFinite(cid) && cid > 0 ? cid : 0;
-    return {
+    const identity = {
         bvid: normalizedBvid,
         cid: normalizedCid,
         tid: String(context?.tid || "").trim(),
-        partCount: Math.max(0, Math.floor(Number(context?.partCount || 0))),
-        partKey: createVideoCachePartKey(normalizedBvid, normalizedCid)
+        partCount: Math.max(0, Math.floor(Number(context?.partCount || 0)))
+    };
+    return {
+        ...identity,
+        pendingSinglePart: isPendingSinglePartContext(identity),
+        partKey: createVideoCachePartKeyForContext(normalizedBvid, identity)
     };
 }
 
@@ -3992,7 +4514,27 @@ function getPartCacheFields(cache = {}) {
 function selectCachePart(cache = {}, context = {}) {
     if (!cache || typeof cache !== "object") return cache;
     const cid = Number(context?.cid || 0);
-    if (!(cid > 0)) return null;
+    if (!(cid > 0)) {
+        if (Number(context?.partCount || 0) !== 1 || String(context?.tid || "").trim()) return null;
+        const pendingPartKey = createVideoCachePartKeyForContext(cache.bvid || context.bvid, context);
+        const pendingPart = pendingPartKey && cache.parts && typeof cache.parts === "object"
+            ? cache.parts[pendingPartKey]
+            : null;
+        if (pendingPart && typeof pendingPart === "object") {
+            return { ...cache, ...cloneData(pendingPart), parts: cache.parts, subtitleVariants: cache.subtitleVariants };
+        }
+        const parts = cache.parts && typeof cache.parts === "object"
+            ? Object.values(cache.parts).filter((part) => part && Number(part.cid || 0) > 0)
+            : [];
+        if (parts.length === 1) {
+            return { ...cache, ...cloneData(parts[0]), parts: cache.parts, subtitleVariants: cache.subtitleVariants };
+        }
+        const hasRootSubtitle = Array.isArray(cache?.rawSubtitle) && cache.rawSubtitle.length
+            || Array.isArray(cache?.processedSubtitle) && cache.processedSubtitle.length;
+        return parts.length === 0 && (Number(cache.cid || 0) > 0 || hasRootSubtitle)
+            ? { ...cache, cid: Number(cache.cid || 0), pendingSinglePart: !(Number(cache.cid || 0) > 0) }
+            : null;
+    }
     const partKey = createVideoCachePartKey(cache.bvid || context.bvid, cid);
     const part = partKey && cache.parts && typeof cache.parts === "object" ? cache.parts[partKey] : null;
     if (part && typeof part === "object") {
@@ -4046,9 +4588,8 @@ async function executeTasksForTab(tabId, tasks, force, taskContext = {}, request
     const tabState = await getTabState(tabId);
     const bvid = normalizeBvid(requestedBvid || tabState?.activeBvid);
     if (!bvid) throw new Error("未获取到视频字幕");
-    const contextCid = Number(taskContext?.cid || 0);
-    if (!(contextCid > 0)) throw createAppError("PART_IDENTITY_PENDING", "正在识别当前分 P，请稍候再试");
     const requestIdentity = resolvePartContext(bvid, taskContext);
+    if (!requestIdentity.partKey) throw createAppError("PART_IDENTITY_PENDING", "正在识别当前分 P，请稍候再试");
     logPartScopeDiagnostic("task_request_identity", {
         tabId,
         feature: tasks.join(","),
@@ -4133,29 +4674,29 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
     try {
         const result = await runWithDedup(key, () => requestTaskResult(bvid, task, settings, usageTaskContext));
         await mergeCacheByBvid(bvid, {
-            ...(identity.cid > 0 ? { cid: identity.cid } : {}),
-            ...(identity.tid ? { tid: identity.tid } : {}),
+            cid: identity.cid,
+            tid: identity.tid,
+            partCount: identity.partCount,
             [task]: result,
             ...buildTaskSourcePatch([task], "local"),
             updatedAt: Date.now()
         });
-        const cloudSaved = await persistCloudFeaturePatch(bvid, settings, { [task]: result }, identity);
-        if (cloudSaved) {
-            await incrementCloudVideoCallCount(bvid, settings, task, identity);
-        }
+        await promotePendingSinglePartCacheForTab(bvid, tabId);
+        const resultSettings = getSettingsForTaskResult(settings, usageTaskContext, task);
+        await persistCloudFeaturePatch(bvid, resultSettings, { [task]: result }, identity);
         await reportClientUsageEvent({
             eventName: "task_success",
             featureName: task,
             taskId,
             status: "success",
-            provider: settings?.provider || "",
-            model: settings?.model || "",
+            provider: resultSettings?.provider || "",
+            model: resultSettings?.model || "",
             bvid,
             title: cache?.title || "",
             durationMs: Date.now() - startedAt,
             tabId,
             metadata: buildTaskRecoveryMetadata(usageTaskContext)
-        }, settings);
+        }, resultSettings);
         return result;
     } catch (error) {
         attachSentryContext(error, {
@@ -4232,6 +4773,13 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
         usageFeatureName: "summary_segments_merged",
         usageRecoveryState: {}
     };
+    await mergeCacheByBvid(bvid, {
+        cid: identity.cid,
+        tid: identity.tid,
+        partCount: identity.partCount,
+        summaryDraft: null,
+        updatedAt: Date.now()
+    });
     logBackground.info("task_start", { tab_id: tabId, bvid, task: "summary_segments", mode: settings.prefMode });
     await reportClientUsageEvent({
         eventName: "task_started",
@@ -4273,14 +4821,18 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
     if (results?.summary?.ok) cloudPatch.summary = results.summary.data;
     if (results?.segments?.ok) cloudPatch.segments = results.segments.data;
     if (Object.keys(cloudPatch).length) {
-        const cloudSaved = await persistCloudFeaturePatch(bvid, settings, cloudPatch, identity);
-        if (cloudSaved) {
-            if (Object.prototype.hasOwnProperty.call(cloudPatch, "summary")) {
-                await incrementCloudVideoCallCount(bvid, settings, "summary", identity);
-            }
-            if (Object.prototype.hasOwnProperty.call(cloudPatch, "segments")) {
-                await incrementCloudVideoCallCount(bvid, settings, "segments", identity);
-            }
+        const summarySettings = getSettingsForTaskResult(settings, usageTaskContext, "summary");
+        const segmentsSettings = getSettingsForTaskResult(settings, usageTaskContext, "segments");
+        if (cloudPatch.summary && cloudPatch.segments && summarySettings.model !== segmentsSettings.model) {
+            await persistCloudFeaturePatch(bvid, summarySettings, { summary: cloudPatch.summary }, identity);
+            await persistCloudFeaturePatch(bvid, segmentsSettings, { segments: cloudPatch.segments }, identity);
+        } else {
+            await persistCloudFeaturePatch(
+                bvid,
+                cloudPatch.summary ? summarySettings : segmentsSettings,
+                cloudPatch,
+                identity
+            );
         }
     }
     const summaryOk = !!results?.summary?.ok;
@@ -4337,7 +4889,7 @@ async function runChatForTab(tabId, text, messageId, requestedBvid = "", taskCon
     const bvid = normalizeBvid(requestedBvid || tabState?.activeBvid);
     if (!bvid) throw new Error("未获取到视频字幕");
     const identity = resolvePartContext(bvid, taskContext);
-    if (!(identity.cid > 0)) throw createAppError("PART_IDENTITY_PENDING", "正在识别当前分 P，请稍候再试");
+    if (!identity.partKey) throw createAppError("PART_IDENTITY_PENDING", "正在识别当前分 P，请稍候再试");
     await setTaskStatus(tabId, ["chat"], "processing", "", identity);
     const resolvedSettings = await getResolvedSettings();
     await hydrateCloudCacheIfNeeded(bvid, ["subtitle"], resolvedSettings, identity);
@@ -4378,7 +4930,7 @@ async function runChatForTab(tabId, text, messageId, requestedBvid = "", taskCon
             const conversation = recent.map((item) => `${item.role === "assistant" ? "助手" : "用户"}：${item.content}`).join("\n");
             const prompt = `你是 B 站视频助手。基于字幕回答用户的问题，回答要准确、简洁。\n字幕：\n${subtitleText}\n历史：\n${conversation}\n用户问题：${text}`;
             logAIPromptBuilt({ bvid, task: "chat", provider: resolvedSettings.provider, mode: "chat", prompt, promptSettings: resolvedSettings.promptSettings });
-            const aiRes = await callAIWithTimeout(resolvedSettings, [{ role: "user", content: prompt }], TASK_TIMEOUT_MS, { tabId });
+            const aiRes = await callAIWithTimeout(resolvedSettings, [{ role: "user", content: prompt }], TASK_TIMEOUT_MS, { tabId, component: "chat", bvid });
             lastMetrics = aiRes.metrics || null;
             await appendMetrics(bvid, tabId, "chat", aiRes.metrics, identity);
             await reportFeatureUsage("chat", bvid, resolvedSettings, aiRes.metrics);
@@ -4389,7 +4941,8 @@ async function runChatForTab(tabId, text, messageId, requestedBvid = "", taskCon
             { id: `u_${messageId}`, role: "user", content: text, createdAt: Date.now() },
             { id: `a_${messageId}`, role: "assistant", content: answer, metrics: lastMetrics || null, createdAt: Date.now() }
         ];
-        await mergeCacheByBvid(bvid, { cid: identity.cid, tid: identity.tid, history: mergedHistory, updatedAt: Date.now() });
+        await mergeCacheByBvid(bvid, { cid: identity.cid, tid: identity.tid, partCount: identity.partCount, history: mergedHistory, updatedAt: Date.now() });
+        await promotePendingSinglePartCacheForTab(bvid, tabId);
         await setTaskStatus(tabId, ["chat"], "done", "", identity);
         await reportClientUsageEvent({
             eventName: "task_success",
@@ -4446,7 +4999,7 @@ async function runChatForPort(port, msg) {
     const bvid = normalizeBvid(msg?.bvid || tabState?.activeBvid);
     if (!bvid) throw new Error("未获取到视频字幕");
     const identity = resolvePartContext(bvid, normalizeTaskContext(msg?.taskContext));
-    if (!(identity.cid > 0)) throw createAppError("PART_IDENTITY_PENDING", "正在识别当前分 P，请稍候再试");
+    if (!identity.partKey) throw createAppError("PART_IDENTITY_PENDING", "正在识别当前分 P，请稍候再试");
     await setTaskStatus(tabId, ["chat"], "processing", "", identity);
     const resolvedSettings = await getResolvedSettings();
     await hydrateCloudCacheIfNeeded(bvid, ["subtitle"], resolvedSettings, identity);
@@ -4497,7 +5050,7 @@ async function runChatForPort(port, msg) {
                 streamedAnswerText += chunk;
                 safePortPost(port, { type: "delta", messageId, partKey: identity.partKey, delta: chunk });
 
-            }, abortController, { tabId });
+            }, abortController, { tabId, component: "chat", bvid });
             lastMetrics = aiRes.metrics || null;
             await appendMetrics(bvid, tabId, "chat", aiRes.metrics, identity);
             await reportFeatureUsage("chat", bvid, resolvedSettings, aiRes.metrics);
@@ -4508,7 +5061,8 @@ async function runChatForPort(port, msg) {
             { id: `u_${messageId}`, role: "user", content: text, createdAt: Date.now() },
             { id: `a_${messageId}`, role: "assistant", content: answer, metrics: lastMetrics || null, createdAt: Date.now() }
         ];
-        await mergeCacheByBvid(bvid, { cid: identity.cid, tid: identity.tid, history: mergedHistory, updatedAt: Date.now() });
+        await mergeCacheByBvid(bvid, { cid: identity.cid, tid: identity.tid, partCount: identity.partCount, history: mergedHistory, updatedAt: Date.now() });
+        await promotePendingSinglePartCacheForTab(bvid, tabId);
         await setTaskStatus(tabId, ["chat"], "done", "", identity);
         await reportClientUsageEvent({
             eventName: "task_success",
@@ -4705,7 +5259,12 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
             });
         }
     }
-    let aiRes = await callAIWithTimeout(settings, [{ role: "user", content: prompt }], TASK_TIMEOUT_MS, { tabId: taskContext.tabId });
+    let aiRes = await callAIWithTimeout(settings, [{ role: "user", content: prompt }], TASK_TIMEOUT_MS, {
+        tabId: taskContext.tabId,
+        taskContext,
+        component: task,
+        bvid
+    });
     logAI.info("ai_request_success", {
         bvid,
         task,
@@ -4738,7 +5297,7 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
                 message: "测试模式：首轮总结已强制判定为空"
             }, "测试模式：首轮总结判定为空，准备自动重试");
         }
-        if (!summaryText) {
+        if (!summaryText || shouldDisableDeepSeekV4ThinkingForRetry(settings, aiRes)) {
             const retried = await retryEmptySummaryOnce({
                 settings,
                 prompt,
@@ -4920,6 +5479,47 @@ function isOutputLengthFinishReason(responseMeta = {}) {
     return ["length", "max_tokens", "max_output_tokens", "max_tokens_reached", "token_limit"].includes(reason);
 }
 
+function isDeepSeekV4ModelName(model) {
+    return /(?:^|\/)deepseek-v4(?:-|$)/i.test(String(model || "").trim());
+}
+
+function getDeepSeekV4RetryDiagnostics(response = {}) {
+    if (response?.responseMeta) {
+        return {
+            finishReason: String(response.responseMeta.finishReason || ""),
+            reasoningChars: Number(response.responseMeta.reasoningChars || 0) || 0,
+            contentState: String(response.responseMeta.contentState || ""),
+            responseChars: String(response.text || "").length
+        };
+    }
+    const attempts = Array.isArray(response?.sentryContext?.ai_response_attempts)
+        ? response.sentryContext.ai_response_attempts
+        : [];
+    const attempt = attempts[attempts.length - 1] || {};
+    return {
+        finishReason: String(attempt.finish_reason || ""),
+        reasoningChars: Number(attempt.reasoning_chars || 0) || 0,
+        contentState: String(attempt.content_state || ""),
+        responseChars: Number(attempt.response_chars || 0) || 0
+    };
+}
+
+function shouldDisableDeepSeekV4ThinkingForRetry(settings = {}, response = {}) {
+    if (!isDeepSeekV4ModelName(settings?.model)) return false;
+    const diagnostics = getDeepSeekV4RetryDiagnostics(response);
+    if (!isOutputLengthFinishReason({ finishReason: diagnostics.finishReason })) return false;
+    if (!(diagnostics.reasoningChars > 0)) return false;
+    const contentEmpty = ["", "missing", "null", "empty"].includes(diagnostics.contentState.toLowerCase())
+        && !(diagnostics.responseChars > 0);
+    const contentTruncated = diagnostics.responseChars > 0;
+    return contentEmpty || contentTruncated;
+}
+
+function buildDeepSeekV4RetrySettings(settings = {}, response = {}) {
+    if (!shouldDisableDeepSeekV4ThinkingForRetry(settings, response)) return settings;
+    return { ...settings, deepSeekV4ThinkingDisabled: true };
+}
+
 function isLikelyTruncatedSegmentOutput(text, metrics = {}, responseMeta = {}) {
     const value = String(text || "").trim();
     if (isOutputLengthFinishReason(responseMeta)) return true;
@@ -5055,21 +5655,42 @@ function createSummaryEmptyError({ settings, bvid, mode, source, aiRes } = {}) {
     );
 }
 
+function createSummaryTruncatedError({ settings, bvid, mode, source, aiRes } = {}) {
+    return attachSentryContext(
+        createAppError("SUMMARY_OUTPUT_TRUNCATED", "总结输出被截断"),
+        buildAIResponseSentryContext({
+            task: "summary",
+            bvid,
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            mode,
+            source,
+            responseText: aiRes?.text || "",
+            responseMeta: aiRes?.responseMeta,
+            metrics: aiRes?.metrics
+        })
+    );
+}
+
 async function retryEmptySummaryOnce({ settings, prompt, tabId, bvid, mode, requestStream = false, taskContext = {}, initialAIResponse = null, initialDurationMs = 0 }) {
-    const triggerError = createSummaryEmptyError({
-        settings,
-        bvid,
-        mode,
-        source: "summary_initial_empty",
-        aiRes: initialAIResponse
-    });
-    logSummaryEmptyResponse({
-        settings,
-        bvid,
-        mode,
-        source: "initial",
-        aiRes: initialAIResponse
-    });
+    const retrySettings = buildDeepSeekV4RetrySettings(settings, initialAIResponse);
+    const thinkingDisabledForRetry = retrySettings !== settings;
+    const retryStrategy = thinkingDisabledForRetry ? "deepseek_v4_no_thinking_retry" : "summary_empty_retry";
+    const triggerError = thinkingDisabledForRetry
+        ? createSummaryTruncatedError({ settings, bvid, mode, source: "summary_initial_truncated", aiRes: initialAIResponse })
+        : createSummaryEmptyError({ settings, bvid, mode, source: "summary_initial_empty", aiRes: initialAIResponse });
+    if (thinkingDisabledForRetry) {
+        logAI.warn("summary_output_truncated", {
+            bvid,
+            task: "summary",
+            code: "SUMMARY_OUTPUT_TRUNCATED",
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            detail: { mode, ...getSummaryEmptyResponseDiagnostics(initialAIResponse), thinking_disabled_on_retry: true }
+        });
+    } else {
+        logSummaryEmptyResponse({ settings, bvid, mode, source: "initial", aiRes: initialAIResponse });
+    }
     if (!isRemoteFeatureEnabled(settings?.remoteConfig, "summary_empty_retry", true)) throw triggerError;
     await reportTaskInitialFailure({
         settings,
@@ -5084,26 +5705,33 @@ async function retryEmptySummaryOnce({ settings, prompt, tabId, bvid, mode, requ
         task: "summary",
         provider: settings.provider,
         model: settings.model || "",
-        detail: { mode, attempt: 1, max_attempts: 1, prompt_chars: prompt.length, request_stream: requestStream }
+        detail: {
+            mode,
+            attempt: 1,
+            max_attempts: 1,
+            prompt_chars: prompt.length,
+            request_stream: requestStream,
+            thinking_disabled: thinkingDisabledForRetry
+        }
     });
     await recordSummaryRetryDebugState(tabId, {
         status: "retrying",
         stage: "summary_retry",
         attempt: 1,
         total: 1,
-        code: "SUMMARY_EMPTY_RESPONSE",
+        code: triggerError.code || "SUMMARY_EMPTY_RESPONSE",
         mode,
-        message: "总结为空，正在自动重试"
-    }, "开始第 1/1 次总结空响应自动重试").catch(() => {});
+        message: thinkingDisabledForRetry ? "总结输出被截断，正在关闭思考重试" : "总结为空，正在自动重试"
+    }, thinkingDisabledForRetry ? "DeepSeek V4 输出截断，关闭思考进行第 1/1 次重试" : "开始第 1/1 次总结空响应自动重试").catch(() => {});
     const recoveryStartedAt = Date.now();
     try {
         let streamedSummaryText = "";
         const messages = [{ role: "user", content: prompt }];
         const aiRes = requestStream
-            ? await callAIWithTimeoutStream(settings, messages, TASK_TIMEOUT_MS, (delta) => {
+            ? await callAIWithTimeoutStream(retrySettings, messages, TASK_TIMEOUT_MS, (delta) => {
                 streamedSummaryText += String(delta || "");
-            }, null, { tabId })
-            : await callAIWithTimeout(settings, messages, TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+            }, null, { tabId, taskContext, component: "summary", bvid })
+            : await callAIWithTimeout(retrySettings, messages, TASK_TIMEOUT_MS, { bypassQueue: true, tabId, taskContext, component: "summary", bvid });
         const summaryText = sanitizeSummaryOutput(aiRes.text || streamedSummaryText);
         if (!summaryText) {
             logSummaryEmptyResponse({ settings, bvid, mode, source: "retry", aiRes });
@@ -5120,7 +5748,7 @@ async function retryEmptySummaryOnce({ settings, prompt, tabId, bvid, mode, requ
             taskContext,
             component: "summary",
             bvid,
-            strategy: "summary_empty_retry",
+            strategy: retryStrategy,
             triggerError,
             success: true,
             durationMs: Date.now() - recoveryStartedAt,
@@ -5149,7 +5777,7 @@ async function retryEmptySummaryOnce({ settings, prompt, tabId, bvid, mode, requ
             taskContext,
             component: "summary",
             bvid,
-            strategy: "summary_empty_retry",
+            strategy: retryStrategy,
             triggerError,
             resultError: error,
             success: false,
@@ -5493,7 +6121,7 @@ async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, ta
             prompt_chars: compactPrompt.length
         }
     });
-    const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: compactPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+    const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: compactPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId, taskContext, component: "segments", bvid });
     const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
         ? null
         : robustJSONParse(aiRes.text);
@@ -5595,7 +6223,7 @@ async function retrySegmentsWithAIRepair({ tabId, bvid, cache, settings, mode, o
         settings,
         [{ role: "user", content: repairPrompt }],
         TASK_TIMEOUT_MS,
-        { bypassQueue: true, tabId }
+        { bypassQueue: true, tabId, taskContext, component: "segments", bvid }
     );
     const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
         ? null
@@ -5693,7 +6321,7 @@ async function retrySegmentsWithPrimaryPrompt({
             compact_segments: !!segmentPromptPlan.compact
         }
     });
-    const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: segmentPromptPlan.prompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+    const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: segmentPromptPlan.prompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId, taskContext, component: "segments", bvid });
     const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
         ? null
         : robustJSONParse(aiRes.text);
@@ -5811,11 +6439,12 @@ async function retrySegmentsWithAutoFallbacks({
             strategy = "expanded_tokens";
             expandedTokensUsed = true;
             primaryUsed = true;
+            const expandedRetrySettings = buildDeepSeekV4RetrySettings(settings, latestError);
             retryStep = () => retrySegmentsWithPrimaryPrompt({
                 tabId,
                 bvid,
                 cache,
-                settings: { ...settings, maxOutputTokens: EXPANDED_SEGMENTS_MAX_OUTPUT_TOKENS },
+                settings: { ...expandedRetrySettings, maxOutputTokens: EXPANDED_SEGMENTS_MAX_OUTPUT_TOKENS },
                 taskContext,
                 subtitleText,
                 promptMode,
@@ -5873,6 +6502,7 @@ async function retrySegmentsWithAutoFallbacks({
             mode,
             startedAt: Date.now(),
             maxOutputTokens: strategy === "expanded_tokens" ? EXPANDED_SEGMENTS_MAX_OUTPUT_TOKENS : undefined,
+            thinkingDisabled: strategy === "expanded_tokens" && shouldDisableDeepSeekV4ThinkingForRetry(settings, latestError),
             message: `${strategyLabel}自动重试中`
         }, `开始第 ${attempt} 次自动重试：${strategyLabel}`);
         const recoveryStartedAt = Date.now();
@@ -5981,11 +6611,30 @@ function resolveUsageErrorCode(error, fallback = "UNKNOWN") {
     return String(error?.code || fallback || "UNKNOWN").trim() || "UNKNOWN";
 }
 
+function isNonSoftwareTaskBlocker(error) {
+    const code = resolveUsageErrorCode(error, "UNKNOWN").toUpperCase();
+    const status = Number(error?.status || 0);
+    return [
+        "MISSING_API_KEY",
+        "HTTP_401",
+        "HTTP_402",
+        "HTTP_403",
+        "HTTP_429",
+        "ASR_FORBIDDEN",
+        "ASR_GROQ_ACCESS_BLOCKED",
+        "ASR_GROQ_UNREACHABLE",
+        "ASR_RATE_LIMIT",
+        "CUSTOM_PROVIDER_AUTH_REQUIRED",
+        "CUSTOM_PROVIDER_BASE_URL_REQUIRED"
+    ].includes(code) || [401, 402, 403, 429].includes(status);
+}
+
 function resolveTaskOutcomeCategory(error, status = "") {
     const normalizedStatus = String(status || resolveUsageStatusByError(error)).toLowerCase();
     const code = resolveUsageErrorCode(error, "UNKNOWN").toUpperCase();
     const message = String(error?.message || "");
     if (normalizedStatus === "cancelled" || ["ABORTED", "USER_CANCELLED"].includes(code)) return "cancelled";
+    if (normalizedStatus === "blocked" || isNonSoftwareTaskBlocker(error)) return "usage_blocked";
     if ([
         "MISSING_API_KEY",
         "CONFIG_REQUIRED",
@@ -6037,21 +6686,27 @@ async function applySummarySegmentsResults(tabId, bvid, results, options = {}) {
     const errorMap = {};
     const cachePatch = {};
     const tabState = tabId ? await getTabState(tabId).catch(() => null) : null;
-    const contextCid = Number(options?.taskContext?.cid || tabState?.activeCid || 0);
-    const contextTid = String(options?.taskContext?.tid || tabState?.activeTid || "").trim();
-    if (!(contextCid > 0)) throw createAppError("PART_IDENTITY_PENDING", "当前分 P 身份未就绪");
-    if (contextCid > 0) cachePatch.cid = contextCid;
-    if (contextTid) cachePatch.tid = contextTid;
+    const identity = resolvePartContext(bvid, {
+        cid: Number(options?.taskContext?.cid || tabState?.activeCid || 0),
+        tid: String(options?.taskContext?.tid || tabState?.activeTid || "").trim(),
+        partCount: Number(options?.taskContext?.partCount || tabState?.activePartCount || 0)
+    });
+    if (!identity.partKey) throw createAppError("PART_IDENTITY_PENDING", "当前分 P 身份未就绪");
+    cachePatch.cid = identity.cid;
+    cachePatch.tid = identity.tid;
+    cachePatch.partCount = identity.partCount;
     let lastError = "";
 
     if (summaryResult) {
         if (summaryResult.ok) {
             cachePatch.summary = String(summaryResult.data || "");
+            cachePatch.summaryDraft = null;
             cachePatch.summaryCacheSource = "local";
             statusMap.summary = "done";
         } else if (keepProcessingTasks.has("summary")) {
             statusMap.summary = "processing";
         } else if (summaryResult.error) {
+            cachePatch.summaryDraft = null;
             statusMap.summary = resolveStatusByError(summaryResult.error);
             errorMap.summary = summaryResult.error;
             lastError = lastError || summaryResult.error.message || "任务失败";
@@ -6074,9 +6729,10 @@ async function applySummarySegmentsResults(tabId, bvid, results, options = {}) {
 
     if (Object.keys(cachePatch).length) {
         await mergeCacheByBvid(bvid, { ...cachePatch, updatedAt: Date.now() });
+        await promotePendingSinglePartCacheForTab(bvid, tabId);
     }
     if (Object.keys(statusMap).length) {
-        await setTaskStatusMap(tabId, statusMap, lastError, errorMap, { bvid, cid: contextCid, tid: contextTid });
+        await setTaskStatusMap(tabId, statusMap, lastError, errorMap, identity);
     }
 }
 
@@ -6105,8 +6761,13 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
         await mergeCacheByBvid(bvid, {
             cid: Number(taskContext.cid || 0),
             tid: String(taskContext.tid || ""),
-            summary: value,
-            summaryCacheSource: "local",
+            partCount: Number(taskContext.partCount || 0),
+            summaryDraft: {
+                taskId: String(taskContext?.usageTaskId || taskContext?.sentryTaskId || ""),
+                attempt: 1,
+                text: value,
+                updatedAt: now
+            },
             updatedAt: now
         });
     }
@@ -6164,10 +6825,10 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                     partialWritePromise = partialWritePromise
                         .catch(() => {})
                         .then(() => writeStreamingSummaryPartial(streamedSummaryText, partialState, false));
-                }, null, { tabId });
+                }, null, { tabId, taskContext, component: "summary", bvid });
                 await partialWritePromise.catch(() => {});
                 let summaryText = sanitizeSummaryOutput(aiRes.text || streamedSummaryText);
-                if (!summaryText) {
+                if (!summaryText || shouldDisableDeepSeekV4ThinkingForRetry(settings, aiRes)) {
                     const retried = await retryEmptySummaryOnce({
                         settings,
                         prompt: summaryPrompt,
@@ -6271,7 +6932,7 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                     mode: "quality",
                     message: segmentPromptPlan.compact ? "保守 Prompt 主请求生成中" : "原 Prompt 主请求生成中"
                 }, "开始 quality 分段主请求", { resetEvents: true });
-                const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: segmentsPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+                const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: segmentsPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId, taskContext, component: "segments", bvid });
                 initialAttemptDurationMs = aiRes.metrics?.latencyMs || 0;
                 await recordSegmentsDebugState(tabId, {
                     status: "running",
@@ -6529,7 +7190,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
             summaryApplied = true;
             results.summary = { ok: true, data: summaryText, error: null };
             summaryApplyPromise = applySummarySegmentsResults(tabId, bvid, { summary: results.summary }, { keepProcessingTasks: ["segments"], taskContext });
-        }, null, { tabId });
+        }, null, { tabId, taskContext, component: "summary_segments_merged", bvid });
         await summaryApplyPromise;
         const fullText = String(streamBuffer || aiRes.text || "");
         logAI.debug("ai_stream_buffer_summary", {
@@ -6797,7 +7458,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                         merged_output_chars: fullText.length
                     }
                 });
-                const fallbackRes = await callAIWithTimeout(settings, [{ role: "user", content: fallbackPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId });
+                const fallbackRes = await callAIWithTimeout(settings, [{ role: "user", content: fallbackPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId, taskContext, component: "segments", bvid });
                 fallbackRecoveryMetrics = fallbackRes.metrics || {};
                 const parsed = isLikelyTruncatedSegmentOutput(fallbackRes.text, fallbackRes.metrics, fallbackRes.responseMeta)
                     ? null
@@ -7839,7 +8500,123 @@ function createUserAbortedError() {
     return error;
 }
 
+async function waitForProvider429RetryDelay(delayMs, tabId) {
+    const controller = new AbortController();
+    const unregister = registerTabAbortController(tabId, controller);
+    try {
+        await waitForAbortableDelay(delayMs, controller.signal);
+    } finally {
+        unregister();
+    }
+}
+
+async function runAIRequestWith429Backoff(settings, options, runAttempt) {
+    const isDebugSimulation = options?.taskContext?.debugForceProvider429Retries === true;
+    if (options?.disableProvider429Retry) {
+        return runAttempt({ attempt: 1, maxAttempts: 1 });
+    }
+    return runWithProvider429Backoff(async (attemptContext) => {
+        if (isDebugSimulation && Number(attemptContext?.attempt || 0) <= 3) {
+            throw createAppError("HTTP_429", "测试模式：模拟 Provider 返回 429", { status: 429 });
+        }
+        if (isDebugSimulation && options?.taskContext) {
+            options.taskContext.debugForceProvider429Retries = false;
+        }
+        return runAttempt(attemptContext);
+    }, {
+        shouldRetry: (error) => !(String(settings?.provider || "").toLowerCase() === "modelscope"
+            && shouldUseImmediateModelScopeFallback(error)),
+        wait: (delayMs) => waitForProvider429RetryDelay(delayMs, options?.tabId),
+        onRateLimit: async (event) => {
+            if (event?.error && typeof event.error === "object") {
+                event.error.requestAttempt = Number(event.attempt || 0);
+                event.error.requestMaxAttempts = Number(event.maxAttempts || 0);
+                event.error.retryDelaysMs = [2000, 5000, 10000];
+                event.error.retryStrategy = "provider_429_backoff";
+            }
+            logAI.warn("provider_429_retry", {
+                task: String(options?.component || "ai"),
+                bvid: normalizeBvid(options?.bvid || options?.taskContext?.bvid || ""),
+                provider: settings?.provider || "",
+                model: settings?.model || "",
+                code: resolveUsageErrorCode(event?.error, "HTTP_429"),
+                detail: {
+                    attempt: Number(event?.attempt || 0),
+                    max_attempts: Number(event?.maxAttempts || 0),
+                    next_delay_ms: Number(event?.nextDelayMs || 0),
+                    exhausted: !!event?.exhausted
+                }
+            });
+            if (isDebugSimulation) {
+                await recordSegmentsDebugState(options?.tabId, {
+                    status: event?.exhausted ? "retry_failed" : "retrying",
+                    stage: event?.exhausted ? "provider_429_exhausted" : "provider_429_wait",
+                    strategy: "provider_429_backoff",
+                    attempt: Number(event?.attempt || 0),
+                    total: Number(event?.maxAttempts || 4),
+                    code: "HTTP_429",
+                    message: event?.exhausted
+                        ? "429 自动重试已耗尽"
+                        : `第 ${Number(event?.attempt || 0)} 次收到 429，${Number(event?.nextDelayMs || 0) / 1000} 秒后重试`
+                }, event?.exhausted
+                    ? "模拟 429 自动重试已耗尽"
+                    : `模拟第 ${Number(event?.attempt || 0)} 次 429，等待 ${Number(event?.nextDelayMs || 0) / 1000} 秒`);
+                return;
+            }
+            await reportProvider429RetryAttempt(settings, options, event);
+        },
+        onRecovered: async (event) => {
+            logAI.info("provider_429_recovered", {
+                task: String(options?.component || "ai"),
+                bvid: normalizeBvid(options?.bvid || options?.taskContext?.bvid || ""),
+                provider: settings?.provider || "",
+                model: settings?.model || "",
+                duration_ms: Number(event?.recoveryDurationMs || 0),
+                detail: {
+                    successful_attempt: Number(event?.attempt || 0),
+                    retry_count: Math.max(0, Number(event?.attempt || 0) - 1),
+                    applied_delay_ms: Number(event?.appliedDelayMs || 0)
+                }
+            });
+            if (isDebugSimulation) {
+                await recordSegmentsDebugState(options?.tabId, {
+                    status: "recovered",
+                    stage: "provider_429_recovered",
+                    strategy: "provider_429_backoff",
+                    attempt: Number(event?.attempt || 0),
+                    total: Number(event?.maxAttempts || 4),
+                    code: "HTTP_429",
+                    message: "429 自动重试成功，任务继续执行"
+                }, `第 ${Number(event?.attempt || 0)} 次请求成功，429 已自动恢复`);
+                return;
+            }
+            await reportProvider429Recovered(settings, options, event, event?.result?.metrics || {});
+        }
+    });
+}
+
 async function callAIWithTimeout(settings, messages, timeoutMs, options = {}) {
+    const runRequest = (requestSettings, requestOptions = options) => runAIRequestWith429Backoff(
+        requestSettings,
+        requestOptions,
+        () => callAIWithTimeoutOnce(requestSettings, messages, timeoutMs, {
+            ...requestOptions,
+            suppress429FailureLog: true
+        })
+    );
+    try {
+        return await runRequest(settings);
+    } catch (error) {
+        const fallbackResult = await tryModelScopeFallback(settings, options, error, (fallbackSettings) => runRequest(
+            fallbackSettings,
+            { ...options, disableModelFallback: true, disableProvider429Retry: true }
+        ));
+        if (fallbackResult) return fallbackResult;
+        throw error;
+    }
+}
+
+async function callAIWithTimeoutOnce(settings, messages, timeoutMs, options = {}) {
     const controller = new AbortController();
     const unregister = registerTabAbortController(options?.tabId, controller);
     const queueSizeAtStart = queue.length;
@@ -7867,6 +8644,7 @@ async function callAIWithTimeout(settings, messages, timeoutMs, options = {}) {
         const latencyMs = requestTiming.providerRequestMs || 0;
         const tokenInfo = resolveTokenInfo(res.usage, res.text, messages);
         const rateLimitInfo = resolveRateLimitInfo(settings, res.headers);
+        void rememberModelScopeRateLimit(settings, rateLimitInfo);
         logAI.debug("provider_response", {
             provider: settings.provider,
             model: settings.model || "",
@@ -7892,7 +8670,7 @@ async function callAIWithTimeout(settings, messages, timeoutMs, options = {}) {
         };
     } catch (error) {
         const requestTiming = timing.snapshot();
-        logAI.error("ai_request_failed", buildFailureLog(error, {
+        logAI[options?.suppress429FailureLog && Number(error?.status || 0) === 429 ? "warn" : "error"]("ai_request_failed", buildFailureLog(error, {
             task: "ai",
             provider: settings.provider,
             model: settings.model || "",
@@ -7944,6 +8722,37 @@ async function callAIWithTimeout(settings, messages, timeoutMs, options = {}) {
 }
 
 async function callAIWithTimeoutStream(settings, messages, timeoutMs, onDelta, externalController, options = {}) {
+    let emittedChars = 0;
+    const trackedOnDelta = (delta) => {
+        emittedChars += String(delta || "").length;
+        if (typeof onDelta === "function") onDelta(delta);
+    };
+    const runRequest = (requestSettings, requestOptions = options) => runAIRequestWith429Backoff(
+        requestSettings,
+        requestOptions,
+        () => callAIWithTimeoutStreamOnce(
+            requestSettings,
+            messages,
+            timeoutMs,
+            trackedOnDelta,
+            externalController,
+            requestOptions
+        )
+    );
+    try {
+        return await runRequest(settings);
+    } catch (error) {
+        if (emittedChars > 0 || externalController?.signal?.aborted) throw error;
+        const fallbackResult = await tryModelScopeFallback(settings, options, error, (fallbackSettings) => runRequest(
+            fallbackSettings,
+            { ...options, disableModelFallback: true, disableProvider429Retry: true }
+        ));
+        if (fallbackResult) return fallbackResult;
+        throw error;
+    }
+}
+
+async function callAIWithTimeoutStreamOnce(settings, messages, timeoutMs, onDelta, externalController, options = {}) {
     const controller = externalController || new AbortController();
     const unregister = externalController ? () => {} : registerTabAbortController(options?.tabId, controller);
     let firstResponseReceived = false;
@@ -8010,6 +8819,7 @@ async function callAIWithTimeoutStream(settings, messages, timeoutMs, onDelta, e
         const latencyMs = requestTiming.providerRequestMs || 0;
         const tokenInfo = resolveTokenInfo(res.usage, res.text, messages);
         const rateLimitInfo = resolveRateLimitInfo(settings, res.headers);
+        void rememberModelScopeRateLimit(settings, rateLimitInfo);
         logAI.debug("provider_response", {
             provider: settings.provider,
             model: settings.model || "",
@@ -8100,7 +8910,12 @@ function parseHeaderNumber(value) {
     return Number.isFinite(number) ? number : null;
 }
 
-function resolveRateLimitInfo(settings, headers) {
+function hasModelScopeRateLimitInfo(info) {
+    return !!info && [info.modelLimit, info.modelRemaining, info.userLimit, info.userRemaining]
+        .some((value) => value !== null && value !== undefined);
+}
+
+function resolveRateLimitInfo(settings, headers, { allowObservedFallback = true } = {}) {
     if (String(settings?.provider || "").toLowerCase() !== "modelscope") return null;
     const direct = {
         modelLimit: readAnyHeaderNumber(headers, ["modelscope-ratelimit-model-requests-limit", "x-modelscope-ratelimit-model-requests-limit", "x-ratelimit-model-requests-limit"]),
@@ -8111,7 +8926,7 @@ function resolveRateLimitInfo(settings, headers) {
     if ([direct.modelLimit, direct.modelRemaining, direct.userLimit, direct.userRemaining].some((value) => value !== null)) {
         return direct;
     }
-    if (latestModelScopeRateLimitInfo && Date.now() - Number(latestModelScopeRateLimitInfo.capturedAt || 0) < 30000) {
+    if (allowObservedFallback && latestModelScopeRateLimitInfo && Date.now() - Number(latestModelScopeRateLimitInfo.capturedAt || 0) < 30000) {
         return { ...latestModelScopeRateLimitInfo };
     }
     return direct;
@@ -8236,7 +9051,12 @@ function getTaskStateForPart(tabState = {}, context = {}) {
             lastError: String(stored.lastError || "")
         };
     }
-    const isActivePart = identity.partKey && identity.partKey === createVideoCachePartKey(tabState?.activeBvid, tabState?.activeCid);
+    const activePartKey = createVideoCachePartKeyForContext(tabState?.activeBvid, {
+        cid: tabState?.activeCid,
+        tid: tabState?.activeTid,
+        partCount: tabState?.activePartCount
+    });
+    const isActivePart = identity.partKey && identity.partKey === activePartKey;
     return {
         taskStatus: isActivePart ? { ...createIdleTaskStatus(), ...(tabState?.taskStatus || {}) } : createIdleTaskStatus(),
         taskErrors: isActivePart ? { ...(tabState?.taskErrors || {}) } : {},
@@ -8255,7 +9075,11 @@ async function writeTaskStateForPart(tabId, current, identity, nextState) {
         ...(latest?.taskStateByPart || current?.taskStateByPart || {}),
         [identity.partKey]: { ...nextState, updatedAt: Date.now() }
     };
-    const activePartKey = createVideoCachePartKey(latest?.activeBvid, latest?.activeCid);
+    const activePartKey = createVideoCachePartKeyForContext(latest?.activeBvid, {
+        cid: latest?.activeCid,
+        tid: latest?.activeTid,
+        partCount: latest?.activePartCount
+    });
     const visiblePatch = activePartKey === identity.partKey ? nextState : {};
     await updateTabState(tabId, { taskStateByPart, ...visiblePatch, updatedAt: Date.now() });
 }
@@ -8301,12 +9125,13 @@ async function setTaskStatus(tabId, tasks, status, lastError = "", partContext =
 async function appendMetrics(bvid, tabId, task, metrics, partContext = {}) {
     const rawCache = await getCache(bvid);
     const identity = resolvePartContext(bvid, partContext);
-    const cache = identity.cid > 0 ? (getPartCacheForContext(rawCache, bvid, identity) || {}) : rawCache;
+    const cache = getPartCacheForContext(rawCache, bvid, identity) || {};
     const cacheMetrics = Array.isArray(cache.metrics) ? cache.metrics : [];
     const entry = { task, ...metrics, at: Date.now() };
     await mergeCacheByBvid(bvid, {
-        ...(identity.cid > 0 ? { cid: identity.cid } : {}),
-        ...(identity.tid ? { tid: identity.tid } : {}),
+        cid: identity.cid,
+        tid: identity.tid,
+        partCount: identity.partCount,
         metrics: [...cacheMetrics, entry].slice(-30),
         updatedAt: Date.now()
     });
@@ -8350,8 +9175,16 @@ async function updateTabState(tabId, patch) {
     const routeIdentityChanged = Object.prototype.hasOwnProperty.call(patch || {}, "activeBvid")
         || Object.prototype.hasOwnProperty.call(patch || {}, "activeCid");
     if (routeIdentityChanged) {
-        const nextPartKey = createVideoCachePartKey(merged.activeBvid, merged.activeCid);
-        const previousPartKey = createVideoCachePartKey(current?.activeBvid, current?.activeCid);
+        const nextPartKey = createVideoCachePartKeyForContext(merged.activeBvid, {
+            cid: merged.activeCid,
+            tid: merged.activeTid,
+            partCount: merged.activePartCount
+        });
+        const previousPartKey = createVideoCachePartKeyForContext(current?.activeBvid, {
+            cid: current?.activeCid,
+            tid: current?.activeTid,
+            partCount: current?.activePartCount
+        });
         const stored = nextPartKey && merged.taskStateByPart?.[nextPartKey];
         const hasExplicitTaskState = Object.prototype.hasOwnProperty.call(patch || {}, "taskStatus");
         const projected = hasExplicitTaskState
@@ -8413,7 +9246,13 @@ async function getCache(bvid) {
     const normalized = normalizeBvid(bvid);
     if (!normalized) return {};
     if (cacheMemory.has(normalized)) {
-        return cloneData(cacheMemory.get(normalized));
+        const cached = cacheMemory.get(normalized);
+        const refreshed = normalizeVideoCacheDirectory(cached, normalized);
+        if (!isEqualJSON(cached, refreshed)) {
+            cacheMemory.set(normalized, cloneData(refreshed));
+            await chrome.storage.local.set({ [`cache_${normalized}`]: refreshed });
+        }
+        return cloneData(refreshed);
     }
     const key = `cache_${normalized}`;
     const legacyKey = `cache_${String(bvid || "").toUpperCase()}`;
@@ -8433,7 +9272,7 @@ async function getCache(bvid) {
 }
 
 const DERIVED_PART_CACHE_FIELDS = [
-    "summary", "segments", "rumors", "history", "metrics",
+    "summary", "summaryDraft", "segments", "rumors", "history", "metrics",
     "summaryCacheSource", "segmentsCacheSource", "rumorsCacheSource",
     "summaryModel", "segmentsModel", "rumorsModel",
     "summaryUpdatedAt", "segmentsUpdatedAt", "rumorsUpdatedAt"
@@ -8469,13 +9308,22 @@ function normalizeVideoCacheDirectory(cache = {}, bvid = "") {
     Object.entries(rawParts).forEach(([storedKey, rawPart]) => {
         if (!rawPart || typeof rawPart !== "object") return;
         const cid = Number(rawPart.cid || String(storedKey).split("::").pop() || 0);
-        if (!(cid > 0)) return;
-        const partKey = createVideoCachePartKey(normalizedBvid, cid);
+        const isPendingSinglePart = !(cid > 0)
+            && String(storedKey).endsWith(`::${SINGLE_PART_PENDING_SUFFIX}`)
+            && (rawPart.pendingSinglePart === true || Number(rawPart.partCount || 0) === 1);
+        if (!(cid > 0) && !isPendingSinglePart) return;
+        const partKey = cid > 0
+            ? createVideoCachePartKey(normalizedBvid, cid)
+            : `${normalizedBvid}::${SINGLE_PART_PENDING_SUFFIX}`;
         const source = hasTrustedPartScope ? cloneData(rawPart) : clearDerivedPartCacheFields(rawPart);
+        const summaryDraft = normalizeSummaryDraft(source.summaryDraft);
+        if (summaryDraft) source.summaryDraft = summaryDraft;
+        else delete source.summaryDraft;
         parts[partKey] = {
             ...source,
             bvid: normalizedBvid,
-            cid,
+            cid: cid > 0 ? cid : 0,
+            ...(isPendingSinglePart ? { pendingSinglePart: true, partCount: 1 } : {}),
             updatedAt: Number(source.updatedAt || cache.updatedAt || Date.now())
         };
     });
@@ -8687,6 +9535,11 @@ async function mergeCacheByBvid(bvid, patch) {
         const patchCid = Object.prototype.hasOwnProperty.call(patch || {}, "cid")
             ? Number(patch?.cid || 0)
             : 0;
+        const patchIdentity = resolvePartContext(normalized, {
+            cid: patchCid,
+            tid: String(patch?.tid || ""),
+            partCount: Number(patch?.partCount || 0)
+        });
         const subtitleWriteFields = [
             "rawSubtitle", "processedSubtitle", "rawHash", "processedHash",
             "subtitleSource", "subtitleLanguage", "subtitleLanguageLabel", "subtitleUrl"
@@ -8698,12 +9551,12 @@ async function mergeCacheByBvid(bvid, patch) {
                 return acc;
             }, {})
             : {};
-        const aiFields = ["summary", "segments", "rumors", "history"].filter((field) => Object.prototype.hasOwnProperty.call(patch || {}, field));
+        const aiFields = ["summary", "summaryDraft", "segments", "rumors", "history"].filter((field) => Object.prototype.hasOwnProperty.call(patch || {}, field));
         if (aiFields.length) {
             logPartScopeDiagnostic("cache_write_target", {
                 bvid: normalized,
                 patchCid,
-                partKey: createVideoCachePartKey(normalized, patchCid),
+                partKey: patchIdentity.partKey,
                 aiFields,
                 patchSummaryLength: String(patch?.summary || "").length,
                 patchSegmentsCount: Array.isArray(patch?.segments) ? patch.segments.length : null,
@@ -8711,12 +9564,13 @@ async function mergeCacheByBvid(bvid, patch) {
                 patchHistoryCount: Array.isArray(patch?.history) ? patch.history.length : null
             });
         }
-        if (patchCid > 0) {
-            const partKey = createVideoCachePartKey(normalized, patchCid);
+        if (patchIdentity.partKey) {
+            const partKey = patchIdentity.partKey;
             const currentPart = parts[partKey] && typeof parts[partKey] === "object" ? parts[partKey] : {};
             const partPatch = getPartCacheFields(patch);
             const currentRootCid = Number(current?.cid || 0);
-            const inheritedRootSubtitle = hasSubtitlePatch && (currentRootCid === 0 || currentRootCid === patchCid)
+            const inheritedRootSubtitle = (hasSubtitlePatch || patchIdentity.pendingSinglePart)
+                && (currentRootCid === 0 || currentRootCid === patchCid)
                 ? TOP_LEVEL_SUBTITLE_CACHE_FIELDS.reduce((acc, field) => {
                     if (Object.prototype.hasOwnProperty.call(current, field)) acc[field] = cloneData(current[field]);
                     return acc;
@@ -8728,10 +9582,11 @@ async function mergeCacheByBvid(bvid, patch) {
                 ...partPatch,
                 bvid: normalized,
                 cid: patchCid,
+                ...(patchIdentity.pendingSinglePart ? { pendingSinglePart: true, partCount: 1 } : {}),
                 tid: Object.prototype.hasOwnProperty.call(patch, "tid") ? patch.tid : (currentPart.tid || null),
                 updatedAt: Number(patch?.updatedAt || Date.now())
             };
-            if (Array.isArray(patch?.rawSubtitle) && patch.rawSubtitle.length) {
+            if (patchCid > 0 && Array.isArray(patch?.rawSubtitle) && patch.rawSubtitle.length) {
                 const language = String(patch.subtitleLanguage || parts[partKey].subtitleLanguage || "default").trim() || "default";
                 const subtitleKey = createSubtitleCacheKey({ bvid: normalized, cid: patchCid, language });
                 const variants = current.subtitleVariants && typeof current.subtitleVariants === "object"
@@ -9042,7 +9897,8 @@ function buildCloudPartFilter(bvid, partContext = {}) {
 async function fetchCloudVideoCacheRow(bvid, tasks, settings, partContext = {}) {
     if (!isSupabaseEnabled(settings)) return null;
     const { identity, params } = buildCloudPartFilter(bvid, partContext);
-    if (!identity.bvid || !(identity.cid > 0)) return null;
+    const allowPendingSinglePartCid = !(identity.cid > 0) && identity.partCount === 1 && !identity.tid;
+    if (!identity.bvid || (!(identity.cid > 0) && !allowPendingSinglePartCid)) return null;
     logPartScopeDiagnostic("cloud_read_query", {
         bvid: identity.bvid,
         cid: identity.cid || null,
@@ -9055,13 +9911,17 @@ async function fetchCloudVideoCacheRow(bvid, tasks, settings, partContext = {}) 
     const select = buildCloudSelectColumns(tasks).join(",");
     let rows = await supabaseSelect(settings, table, {
         select,
-        ...params,
+        ...(allowPendingSinglePartCid ? {
+            bvid: `eq.${identity.bvid}`,
+            cid: "not.is.null",
+            order: "updated_at.desc"
+        } : params),
         limit: "1"
     }, {
         requestName: "cloud_video_cache_fetch",
         errorMessage: "Supabase 查询失败"
     });
-    let source = "exact_cid";
+    let source = allowPendingSinglePartCid ? "single_part_latest_cid" : "exact_cid";
     if ((!Array.isArray(rows) || !rows.length) && identity.partCount === 1) {
         source = "legacy_bvid";
         logPartScopeDiagnostic("cloud_read_legacy_fallback", {
@@ -9096,7 +9956,8 @@ async function fetchCloudVideoCacheRow(bvid, tasks, settings, partContext = {}) 
 
 async function hydrateCloudCacheIfNeeded(bvid, tasks, settings, partContext = {}) {
     const identity = resolvePartContext(bvid, partContext);
-    if (!(identity.cid > 0)) {
+    const allowPendingSinglePartCid = !(identity.cid > 0) && identity.partCount === 1 && !identity.tid;
+    if (!(identity.cid > 0) && !allowPendingSinglePartCid) {
         logPartScopeDiagnostic("cloud_hydrate_deferred", {
             bvid: identity.bvid,
             reason: "route_cid_pending",
@@ -9105,7 +9966,7 @@ async function hydrateCloudCacheIfNeeded(bvid, tasks, settings, partContext = {}
         return { hydratedTasks: [], cache: null };
     }
     const rawCache = await getCache(bvid);
-    const current = getPartCacheForContext(rawCache, bvid, identity) || {};
+    const current = selectCachePart(rawCache, identity) || {};
     if (!isSupabaseEnabled(settings)) return { hydratedTasks: [], cache: current };
     if (await shouldSkipCloudCacheRead(bvid, settings)) return { hydratedTasks: [], cache: current };
     const requestedTasks = Array.isArray(tasks) ? tasks : [];
@@ -9126,8 +9987,9 @@ async function hydrateCloudCacheIfNeeded(bvid, tasks, settings, partContext = {}
         const patch = buildCloudPatchFromRow(row, missingTasks);
         const hydratedTasks = missingTasks.filter((task) => hasTaskResult(patch, task));
         if (!hydratedTasks.length) return { hydratedTasks: [], cache: current };
+        const resolvedCid = Number(row?.cid || identity.cid || 0);
         await mergeCacheByBvid(bvid, {
-            ...(identity.cid > 0 ? { cid: identity.cid } : {}),
+            ...(resolvedCid > 0 ? { cid: resolvedCid } : {}),
             ...(identity.tid ? { tid: identity.tid } : {}),
             ...patch,
             ...buildTaskSourcePatch(hydratedTasks, "cloud"),
@@ -9138,7 +10000,10 @@ async function hydrateCloudCacheIfNeeded(bvid, tasks, settings, partContext = {}
         const latest = await getCache(bvid);
         return {
             hydratedTasks,
-            cache: getPartCacheForContext(latest, bvid, identity) || {}
+            cache: selectCachePart(latest, {
+                ...identity,
+                cid: resolvedCid
+            }) || {}
         };
     } catch (error) {
         logBackground.error("cloud_cache_fetch_fail", {
@@ -9168,20 +10033,8 @@ function buildSupabaseVideoPatch(bvid, settings, patch, partContext = {}) {
     if (Object.prototype.hasOwnProperty.call(patch, "subtitleSource")) {
         row.subtitle_source = String(patch.subtitleSource || "");
     }
-    if (Object.prototype.hasOwnProperty.call(patch, "subtitleUploadCount")) {
-        row.subtitle_upload_count = Math.max(0, Number(patch.subtitleUploadCount || 0));
-    }
     if (Object.prototype.hasOwnProperty.call(patch, "subtitleUploadedAt")) {
         row.subtitle_uploaded_at = String(patch.subtitleUploadedAt || "");
-    }
-    if (Object.prototype.hasOwnProperty.call(patch, "summaryCallCount")) {
-        row.summary_call_count = Math.max(0, Number(patch.summaryCallCount || 0));
-    }
-    if (Object.prototype.hasOwnProperty.call(patch, "segmentsCallCount")) {
-        row.segments_call_count = Math.max(0, Number(patch.segmentsCallCount || 0));
-    }
-    if (Object.prototype.hasOwnProperty.call(patch, "rumorsCallCount")) {
-        row.rumors_call_count = Math.max(0, Number(patch.rumorsCallCount || 0));
     }
     if (Object.prototype.hasOwnProperty.call(patch, "summary")) {
         row.summary = String(patch.summary || "");
@@ -9229,76 +10082,20 @@ function filterCloudFeaturePatch(patch) {
     return next;
 }
 
-async function fetchVideoCacheMetaRow(bvid, settings, columns = [], partContext = {}) {
-    if (!isSupabaseEnabled(settings)) return null;
-    const { identity, params } = buildCloudPartFilter(bvid, partContext);
-    const fieldList = ["bvid", "cid", ...(Array.isArray(columns) ? columns : [])]
-        .filter(Boolean)
-        .filter((value, index, arr) => arr.indexOf(value) === index);
-    if (!identity.bvid || !(identity.cid > 0)) return null;
-    const table = settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE;
-    logCache.debug("cloud_meta_fetch_start", {
-        bvid: identity.bvid,
-        cid: identity.cid || null,
-        detail: {
-            table,
-            fields: fieldList
-        }
-    });
-    const rows = await supabaseSelect(settings, table, {
-        select: fieldList.join(","),
-        ...params,
-        limit: "1"
-    }, {
-        requestName: "video_cache_meta_fetch",
-        errorMessage: "video_cache 查询失败"
-    });
-    const row = Array.isArray(rows) && rows.length ? rows[0] : null;
-    logCache.debug("cloud_meta_fetch_success", {
-        bvid: identity.bvid,
-        cid: identity.cid || null,
-        detail: {
-            table,
-            found: !!row,
-            fields: fieldList
-        }
-    });
-    return row;
-}
-
 function getVideoCacheUploadFields(row) {
     return Object.keys(row || {}).filter((key) => key !== "bvid" && key !== "cid" && key !== "updated_at");
 }
 
-function isSupabaseDuplicateKeyError(error) {
-    const text = [
-        error?.code,
-        error?.message,
-        error?.responseText,
-        error?.details
-    ].filter(Boolean).join("\n");
-    return /23505|duplicate key|already exists|violates unique constraint/i.test(text);
-}
-
-async function saveVideoCacheRow(bvid, settings, row, existingRow = null) {
+async function saveVideoCacheRow(bvid, settings, row) {
     const normalizedBvid = normalizeBvid(bvid);
     if (!isSupabaseEnabled(settings) || !normalizedBvid || !row || typeof row !== "object") return false;
-    const table = settings.supabaseVideoCacheTable || SUPABASE_DEFAULT_VIDEO_CACHE_TABLE;
     const rowCid = Number(row?.cid || 0);
-    const rowFilter = {
-        bvid: `eq.${normalizedBvid}`,
-        cid: rowCid > 0 ? `eq.${rowCid}` : "is.null"
-    };
-    const hasExisting = !!(existingRow && typeof existingRow === "object" && String(existingRow.bvid || "").trim());
-    const method = hasExisting ? "PATCH" : "POST";
     const fields = getVideoCacheUploadFields(row);
     logCache.info("cloud_cache_upload_start", {
         task: "cloud",
         bvid: normalizedBvid,
         detail: {
-            table,
-            method,
-            has_existing: hasExisting,
+            rpc: "upsert_video_cache_controlled",
             fields
         }
     });
@@ -9306,63 +10103,29 @@ async function saveVideoCacheRow(bvid, settings, row, existingRow = null) {
         bvid: normalizedBvid,
         cid: rowCid || null,
         partKey: createVideoCachePartKey(normalizedBvid, rowCid),
-        method,
-        filters: method === "PATCH" ? rowFilter : {},
+        method: "RPC",
         fields
     });
     try {
-        await supabaseWrite(settings, table, row, {
-            method,
-            params: hasExisting ? rowFilter : {},
-            requestName: "video_cache_write",
-            errorMessage: `video_cache ${method} 失败`
+        await supabaseRpc(settings, "upsert_video_cache_controlled", { p_payload: { ...row, bvid: normalizedBvid } }, {
+            requestName: "video_cache_controlled_upsert",
+            errorMessage: "video_cache 受控写入失败"
         });
         logCache.info("cloud_cache_upload_success", {
             task: "cloud",
             bvid: normalizedBvid,
             detail: {
-                table,
-                method,
+                rpc: "upsert_video_cache_controlled",
                 fields
             }
         });
     } catch (error) {
-        if (method === "POST" && isSupabaseDuplicateKeyError(error)) {
-            logCache.warn("cloud_cache_upload_retry_update", {
-                task: "cloud",
-                bvid: normalizedBvid,
-                code: "SUPABASE_DUPLICATE_POST_RETRY_PATCH",
-                detail: {
-                    table,
-                    fields,
-                    reason: "post_duplicate_key"
-                }
-            });
-            await supabaseWrite(settings, table, row, {
-                method: "PATCH",
-                params: rowFilter,
-                requestName: "video_cache_write_retry_patch",
-                errorMessage: "video_cache POST 冲突后 PATCH 失败"
-            });
-            logCache.info("cloud_cache_upload_success", {
-                task: "cloud",
-                bvid: normalizedBvid,
-                detail: {
-                    table,
-                    method: "PATCH",
-                    retry_from: "POST_DUPLICATE",
-                    fields
-                }
-            });
-            return true;
-        }
         logBackground.error("cloud_cache_upload_failed", {
             task: "cloud",
             bvid: normalizedBvid,
             code: "SUPABASE_VIDEO_CACHE_UPLOAD_FAILED",
             detail: {
-                table,
-                method,
+                rpc: "upsert_video_cache_controlled",
                 fields,
                 error_message: error.message || "video_cache upload failed"
             }
@@ -9398,15 +10161,14 @@ async function persistCloudSubtitlePatch(bvid, settings, cache, extra = {}) {
         return false;
     }
     try {
-        const current = await fetchVideoCacheMetaRow(identity.bvid, settings, ["subtitle_upload_count"], identity);
         const row = buildSupabaseVideoPatch(identity.bvid, settings, {
             title: String(extra.title || partCache?.title || ""),
             rawSubtitle,
             processedSubtitle,
             subtitleSource,
-            subtitleUploadCount: Math.max(0, Number(current?.subtitle_upload_count || 0)) + 1,
             subtitleUploadedAt: new Date().toISOString()
         }, identity);
+        row.increment_subtitle_upload_count = true;
         const meaningfulKeys = getVideoCacheUploadFields(row);
         if (!meaningfulKeys.length) return false;
         logCache.info("cloud_subtitle_write_start", {
@@ -9418,10 +10180,10 @@ async function persistCloudSubtitlePatch(bvid, settings, cache, extra = {}) {
                 raw_count: rawSubtitle.length,
                 processed_count: processedSubtitle.length,
                 subtitle_source: subtitleSource,
-                next_upload_count: row.subtitle_upload_count || 0
+                increment_upload_count: true
             }
         });
-        await saveVideoCacheRow(identity.bvid, settings, row, current);
+        await saveVideoCacheRow(identity.bvid, settings, row);
         logCache.info("cloud_subtitle_write", {
             task: "cloud",
             bvid: identity.bvid,
@@ -9431,7 +10193,7 @@ async function persistCloudSubtitlePatch(bvid, settings, cache, extra = {}) {
                 raw_count: rawSubtitle.length,
                 processed_count: processedSubtitle.length,
                 subtitle_source: subtitleSource,
-                upload_count: row.subtitle_upload_count || 0
+                increment_upload_count: true
             }
         });
         return true;
@@ -9440,62 +10202,6 @@ async function persistCloudSubtitlePatch(bvid, settings, cache, extra = {}) {
             bvid: identity.bvid,
             cid: identity.cid,
             error: error.message || "cloud subtitle write failed"
-        });
-        return false;
-    }
-}
-
-async function incrementCloudVideoCallCount(bvid, settings, task, partContext = {}) {
-    if (!isSupabaseEnabled(settings)) return false;
-    const normalizedTask = String(task || "").trim();
-    const fieldMap = {
-        summary: "summary_call_count",
-        segments: "segments_call_count",
-        rumors: "rumors_call_count"
-    };
-    const targetField = fieldMap[normalizedTask];
-    const identity = resolvePartContext(bvid, partContext);
-    if (!targetField || !identity.bvid || !(identity.cid > 0)) return false;
-    try {
-        const current = await fetchVideoCacheMetaRow(identity.bvid, settings, [targetField], identity);
-        const nextValue = Math.max(0, Number(current?.[targetField] || 0)) + 1;
-        const patchKey = normalizedTask === "summary"
-            ? "summaryCallCount"
-            : normalizedTask === "segments"
-                ? "segmentsCallCount"
-                : "rumorsCallCount";
-        const row = buildSupabaseVideoPatch(identity.bvid, settings, {
-            [patchKey]: nextValue
-        }, identity);
-        logCache.info("cloud_call_count_increment_start", {
-            task: "cloud",
-            bvid: identity.bvid,
-            cid: identity.cid,
-            detail: {
-                feature: normalizedTask,
-                field: targetField,
-                previous_value: Math.max(0, Number(current?.[targetField] || 0)),
-                next_value: nextValue
-            }
-        });
-        await saveVideoCacheRow(identity.bvid, settings, row, current);
-        logCache.info("cloud_call_count_increment", {
-            task: "cloud",
-            bvid: identity.bvid,
-            cid: identity.cid,
-            detail: {
-                feature: normalizedTask,
-                field: targetField,
-                value: nextValue
-            }
-        });
-        return true;
-    } catch (error) {
-        logBackground.error("cloud_call_count_increment_fail", {
-            bvid: identity.bvid,
-            cid: identity.cid,
-            task: normalizedTask,
-            error: error.message || "cloud call count increment failed"
         });
         return false;
     }
@@ -9513,6 +10219,11 @@ async function persistCloudFeaturePatch(bvid, settings, patch, partContext = {})
         ...filteredPatch,
         ...(title ? { title } : {})
     }, identity);
+    Object.keys(filteredPatch).forEach((task) => {
+        if (["summary", "segments", "rumors"].includes(task)) {
+            row[`increment_${task}_call_count`] = true;
+        }
+    });
     const meaningfulKeys = getVideoCacheUploadFields(row);
     if (!row.bvid || !meaningfulKeys.length) {
         logCache.info("cloud_cache_skip", {
@@ -9523,26 +10234,23 @@ async function persistCloudFeaturePatch(bvid, settings, patch, partContext = {})
         return false;
     }
     try {
-        const current = await fetchVideoCacheMetaRow(row.bvid, settings, ["updated_at"], identity);
         logCache.info("cloud_feature_write_start", {
             task: "cloud",
             bvid: row.bvid,
             cid: identity.cid,
             detail: {
                 fields: meaningfulKeys,
-                feature_fields: Object.keys(filteredPatch),
-                has_existing: !!current
+                feature_fields: Object.keys(filteredPatch)
             }
         });
-        await saveVideoCacheRow(row.bvid, settings, row, current);
+        await saveVideoCacheRow(row.bvid, settings, row);
         logCache.info("cloud_cache_write", {
             task: "cloud",
             bvid: row.bvid,
             cid: identity.cid,
             detail: {
                 fields: meaningfulKeys,
-                feature_fields: Object.keys(filteredPatch),
-                has_existing: !!current
+                feature_fields: Object.keys(filteredPatch)
             }
         });
         return true;
@@ -9614,6 +10322,64 @@ async function reportFeatureUsage(featureName, bvid, settings, metrics) {
         });
         return false;
     }
+}
+
+async function promotePendingSinglePartTaskState(tabId, bvid, cid) {
+    const pendingKey = createVideoCachePartKeyForContext(bvid, { cid: 0, partCount: 1, tid: "" });
+    const resolvedKey = createVideoCachePartKey(bvid, cid);
+    const current = await getTabState(tabId);
+    const pendingState = pendingKey && current?.taskStateByPart?.[pendingKey];
+    if (!pendingState || !resolvedKey) return false;
+    const taskStateByPart = { ...(current.taskStateByPart || {}), [resolvedKey]: cloneData(pendingState) };
+    delete taskStateByPart[pendingKey];
+    await updateTabState(tabId, { taskStateByPart, ...pendingState, updatedAt: Date.now() });
+    return true;
+}
+
+async function promotePendingSinglePartCache(bvid, cid) {
+    const normalizedBvid = normalizeBvid(bvid);
+    const resolvedCid = Number(cid || 0);
+    if (!normalizedBvid || !(resolvedCid > 0)) return false;
+    const directory = await getCache(normalizedBvid);
+    const parts = directory?.parts && typeof directory.parts === "object" ? cloneData(directory.parts) : {};
+    const pendingKey = `${normalizedBvid}::${SINGLE_PART_PENDING_SUFFIX}`;
+    const resolvedKey = createVideoCachePartKey(normalizedBvid, resolvedCid);
+    const pendingPart = parts[pendingKey];
+    if (!pendingPart || !resolvedKey) return false;
+    const resolvedPart = parts[resolvedKey] && typeof parts[resolvedKey] === "object" ? parts[resolvedKey] : {};
+    const promotedPart = { ...cloneData(pendingPart), ...cloneData(resolvedPart), bvid: normalizedBvid, cid: resolvedCid };
+    DERIVED_PART_CACHE_FIELDS.forEach((field) => {
+        if (Object.prototype.hasOwnProperty.call(pendingPart, field)) promotedPart[field] = cloneData(pendingPart[field]);
+    });
+    delete promotedPart.pendingSinglePart;
+    delete promotedPart.partCount;
+    parts[resolvedKey] = promotedPart;
+    delete parts[pendingKey];
+    await mergeCacheByBvid(normalizedBvid, { parts, updatedAt: Date.now() });
+    return true;
+}
+
+async function promotePendingSinglePartCacheForTab(bvid, tabId) {
+    if (!tabId) return false;
+    const tabState = await getTabState(tabId).catch(() => null);
+    if (normalizeBvid(tabState?.activeBvid || "") !== normalizeBvid(bvid)
+        || !(Number(tabState?.activeCid || 0) > 0)
+        || Number(tabState?.activePartCount || 0) !== 1
+        || String(tabState?.activeTid || "").trim()) return false;
+    return promotePendingSinglePartCache(bvid, Number(tabState.activeCid));
+}
+
+function normalizeSummaryDraft(value, now = Date.now()) {
+    if (!value || typeof value !== "object") return null;
+    const text = String(value.text || "").trim();
+    const updatedAt = Number(value.updatedAt || 0);
+    if (!text || !updatedAt || now - updatedAt >= SUMMARY_DRAFT_TTL_MS) return null;
+    return {
+        taskId: String(value.taskId || ""),
+        attempt: Math.max(1, Math.floor(Number(value.attempt || 1))),
+        text,
+        updatedAt
+    };
 }
 
 function reportDailyFeatureUsage(featureName, settings, metrics = {}, status = "success", errorCode = "", usageContext = {}) {

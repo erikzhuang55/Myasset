@@ -4,6 +4,70 @@
   const STORAGE_KEY = "bilitato_last_seen_version";
 
   const RELEASE_NOTES = {
+    "1.6.2": {
+      title: "Bilitato 已更新至 v1.6.2",
+      displayVersion: "v1.6.2",
+      subtitle: "兜底机制大修复：集中提升字幕读取、AI 总结和模型调用的稳定性。",
+      groups: [
+        {
+          tag: "优化",
+          items: [
+            {
+              title: "AI 重试更有针对性",
+              desc: "根据输出截断、内容为空和格式异常采用不同的恢复方式，大多数临时异常会在后台自动处理。",
+              highlight: true,
+            },
+            {
+              title: "ModelScope 调用更稳定",
+              desc: "模型限流或暂时不可用时自动尝试其他可用模型，并避开当天已经确认额度不足的模型。",
+            },
+            {
+              title: "优化 DeepSeek V4 重试",
+              desc: "思考内容占满输出空间时，第二次重试会优先保证总结正文完整返回。",
+            },
+            {
+              title: "字幕读取状态更清楚",
+              desc: "字幕读取期间，总结与事实核查会同步等待，不再提前显示“暂无字幕”。",
+            },
+            {
+              title: "错误提示与统计更准确",
+              desc: "用户配置、主动取消等情况不再作为插件故障处理，减少无效错误提示。",
+            },
+          ],
+        },
+        {
+          tag: "修复",
+          items: [
+            {
+              title: "修复已有字幕却无法总结",
+              desc: "修复字幕已经显示，但总结页仍提示“暂无字幕”的问题。",
+              highlight: true,
+            },
+            {
+              title: "修复字幕缓存被错误清空",
+              desc: "CID 暂时未获取到时，不再清空同一视频已有的有效字幕缓存。",
+            },
+            {
+              title: "修复分 P 路由误判",
+              desc: "播放器加载时的 CID 波动不再被误认为切换分 P，同时继续严格隔离不同分 P 的字幕与总结。",
+            },
+            {
+              title: "修复快速切换分 P 串线",
+              desc: "快速切换选集时，字幕、总结和视频分段会继续对应当前分 P。",
+            },
+            {
+              title: "修复异常输出直接失败",
+              desc: "总结为空、输出被截断、JSON 格式或字段结构异常时，会自动修复或重试。",
+            },
+            {
+              title: "修复失败状态重复统计",
+              desc: "同一次任务只按最终结果记录，避免中间重试被重复计为任务失败。",
+            },
+          ],
+        },
+      ],
+      privacy: "Bilitato 不会上传您的 API Key、Prompt 或与 AI 的聊天内容。自动重试仅使用当前任务所需的字幕和用户已有配置。",
+    },
     "1.6.1": {
       title: "Bilitato 已更新至 v1.6.1",
       displayVersion: "v1.6.1",
@@ -1060,7 +1124,9 @@
 
   function buildReleasePageVersions(version) {
     const majorHistory = [];
-    if (version === "1.6.1") {
+    if (version === "1.6.2") {
+      majorHistory.push("1.6.2", "1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");
+    } else if (version === "1.6.1") {
       majorHistory.push("1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");
     } else if (version === "1.6.0") {
       majorHistory.push("1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");

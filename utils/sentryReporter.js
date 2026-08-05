@@ -1,4 +1,5 @@
 import { PROVIDERS } from "./providerAdapter.js";
+import { classifyProvider429Error } from "./provider429Retry.js";
 
 const SENSITIVE_KEY_PATTERN = /(api[_-]?key|authorization|token|secret|password|cookie|prompt|subtitle|content|message|messages|base[_-]?url|download[_-]?url|dsn|url)/i;
 const UNFILTERED_RAW_KEYS = new Set([
@@ -49,7 +50,13 @@ const IGNORED_ERROR_CODES = new Set([
   "VALIDATION_ERROR",
   "MISSING_API_KEY",
   "MISSING_SUBTITLE",
-  "HTTP_401"
+  "HTTP_401",
+  "HTTP_402",
+  "HTTP_403",
+  "ASR_FORBIDDEN",
+  "ASR_GROQ_ACCESS_BLOCKED",
+  "ASR_GROQ_UNREACHABLE",
+  "ASR_RATE_LIMIT"
 ]);
 
 export function shouldReportToSentry(errorInput, context = {}) {
@@ -115,6 +122,13 @@ export function createSentryEvent(errorInput, context = {}, runtime = {}) {
   const taskId = String(safeContext.task_id || safeContext.taskId || "").trim();
   const bvid = String(safeContext.bvid || "").trim();
   const pageType = String(safeContext.pageType || "").trim();
+  const is429 = Number(errorMeta.status || 0) === 429 || String(errorMeta.code || "").startsWith("HTTP_429");
+  const failureReason = is429 ? classifyProvider429Error({
+    message: error.message,
+    responseText: errorInput?.responseText,
+    code: errorMeta.code,
+    status: errorMeta.status
+  }) : "";
 
   return {
     event_id: createEventId(),
@@ -123,6 +137,9 @@ export function createSentryEvent(errorInput, context = {}, runtime = {}) {
     level: "error",
     release: extensionVersion ? `bilitato@${extensionVersion}` : undefined,
     environment: String(runtime.environment || "production"),
+    fingerprint: is429
+      ? ["bilitato-429", task || "unknown-task", provider || "unknown-provider", failureReason]
+      : undefined,
     tags: removeEmpty({
       extension_version: extensionVersion,
       provider,
@@ -132,6 +149,7 @@ export function createSentryEvent(errorInput, context = {}, runtime = {}) {
       bvid,
       code: errorMeta.code,
       status: errorMeta.status,
+      failure_reason: failureReason,
       page_type: pageType,
       source: safeContext.source,
       timeout_phase: safeContext.timeout_phase,

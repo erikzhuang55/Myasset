@@ -307,6 +307,7 @@ const {
     canRunTasksWithCache,
     createChatMessageId,
     createPendingChatMessages,
+    getSubtitleDependencyState,
     needsSubtitleForTasks
 } = globalThis.BilitatoContentAi || {};
 const {
@@ -363,12 +364,27 @@ const UI_ICON_BASE_DIR = "assets/ui";
 const FOLLOW_RESUME_MS = 5000;
 const SUBTITLE_CHECK_DELAY_MS = 1000;
 const SUBTITLE_DETECT_TIMEOUT_MS = 5000;
+const SUBTITLE_CONTROL_STABLE_MS = 3000;
+const SUBTITLE_CONTROL_RESULT_GRACE_MS = 5000;
+const SUBTITLE_PLAYER_READY_TIMEOUT_MS = 8000;
 const CACHE_SYNC_THROTTLE_MS = 500;
 const SUBTITLE_OBSERVE_GRACE_MS = 3500;
 const STEP_PROGRESS_TIMEOUT_MS = 60000;
-const CLOUD_READ_TIMEOUT_MS = 1000;
+const CLOUD_READ_TIMEOUT_MS = 2000;
+const SUMMARY_DRAFT_TTL_MS = 10 * 60 * 1000;
 const FEEDBACK_SUBMITTED_STORAGE_KEY = "feedbackSubmitted";
 const FEEDBACK_PENDING_REPLY_TEXT = "感谢你的反馈！我会尽量在24小时内回复。";
+
+function getAsrApiKeyRequirement(settings = {}) {
+    const requested = String(settings.asrProvider || "groq").toLowerCase();
+    const provider = ["groq", "siliconflow", "mimo"].includes(requested) ? requested : "groq";
+    const providerName = provider === "siliconflow" ? "硅基流动" : (provider === "mimo" ? "Mimo" : "Groq");
+    const apiKey = provider === "siliconflow"
+        ? settings.siliconFlowApiKey
+        : (provider === "mimo" ? settings.mimoApiKey : settings.groqApiKey);
+    return { provider, providerName, missing: !String(apiKey || "").trim() };
+}
+
 const appState = {
     tabId: null,
     activePage: "CC",
@@ -395,6 +411,8 @@ const appState = {
     chatPending: [],
     chatStreamingId: "",
     chatStreamTimer: null,
+    summaryDraftExpiryTimer: null,
+    summaryDraftExpiryAt: 0,
     chatPort: null,
     chatActiveMessageId: "",
     debugLogPollTimer: null,
@@ -686,8 +704,12 @@ function scheduleSubtitleRender(reason = "state_change") {
     subtitleUiCoordinator.renderScheduled = true;
     const run = () => {
         subtitleUiCoordinator.renderScheduled = false;
-        const container = panelShadowRoot?.getElementById?.("page-CC");
-        renderSubtitleIfNeeded(container, reason);
+        if (appState.activePage === "CC") {
+            const container = panelShadowRoot?.getElementById?.("page-CC");
+            renderSubtitleIfNeeded(container, reason);
+        } else if (["summary", "real"].includes(appState.activePage)) {
+            renderContent();
+        }
     };
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
     else Promise.resolve().then(run);
@@ -916,7 +938,7 @@ function startSubtitleControlProbe(routeKey, generation) {
         if (isUsableSubtitleControl(subtitleButton)) {
             subtitleUiCoordinator.phase = "loading";
             stopSubtitleControlProbe();
-            scheduleSubtitleUiDeadline(routeKey, generation, 500, "unavailable");
+            scheduleSubtitleUiDeadline(routeKey, generation, SUBTITLE_CONTROL_RESULT_GRACE_MS, "unavailable");
             logSubtitleDiagnostic("ui_phase_changed", { phase: "loading", routeKey, generation, source: "subtitle_control_found" });
             markSubtitleStateChanged("subtitle_control_found");
             return;
@@ -924,9 +946,14 @@ function startSubtitleControlProbe(routeKey, generation) {
         if (isSubtitlePlayerReady() && isSubtitleControlBarReady()) {
             if (!controlBarReadyAt) {
                 controlBarReadyAt = Date.now();
-                logSubtitleDiagnostic("subtitle_probe_started", { routeKey, generation, stableWindowMs: 500 });
+                logSubtitleDiagnostic("subtitle_probe_started", { routeKey, generation, stableWindowMs: SUBTITLE_CONTROL_STABLE_MS });
             }
-            if (Date.now() - controlBarReadyAt >= 500) {
+            if (Date.now() - controlBarReadyAt >= SUBTITLE_CONTROL_STABLE_MS) {
+                const currentBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
+                if (hasUsableSubtitleCache(appState.cache, currentBvid)) {
+                    markSubtitleUiReady("cache", currentBvid, getRoutePartId());
+                    return;
+                }
                 subtitleUiCoordinator.phase = "unavailable";
                 stopSubtitleControlProbe();
                 logSubtitleDiagnostic("ui_phase_changed", { phase: "unavailable", routeKey, generation, source: "subtitle_control_absent" });
@@ -935,7 +962,7 @@ function startSubtitleControlProbe(routeKey, generation) {
             return;
         }
         controlBarReadyAt = 0;
-        if (Date.now() - startedAt >= 2000) {
+        if (Date.now() - startedAt >= SUBTITLE_PLAYER_READY_TIMEOUT_MS) {
             subtitleUiCoordinator.phase = "probe_failed";
             stopSubtitleControlProbe();
             logSubtitleDiagnostic("ui_phase_changed", { phase: "probe_failed", routeKey, generation, source: "player_not_ready" });
@@ -981,8 +1008,8 @@ function completeSubtitleUiRequest(detail = {}) {
     const requestUrl = String(detail?.url || "unknown");
     subtitleUiCoordinator.pendingRequestUrls.delete(requestUrl);
     if (subtitleUiCoordinator.pendingRequestUrls.size > 0) return;
-    scheduleSubtitleUiDeadline(subtitleUiCoordinator.routeKey, subtitleUiCoordinator.generation, 1500, "unavailable");
-    logSubtitleDiagnostic("ui_request_completed", { source: detail?.source || "inject", routeKey: subtitleUiCoordinator.routeKey, graceMs: 1500 });
+    scheduleSubtitleUiDeadline(subtitleUiCoordinator.routeKey, subtitleUiCoordinator.generation, SUBTITLE_CONTROL_RESULT_GRACE_MS, "unavailable");
+    logSubtitleDiagnostic("ui_request_completed", { source: detail?.source || "inject", routeKey: subtitleUiCoordinator.routeKey, graceMs: SUBTITLE_CONTROL_RESULT_GRACE_MS });
 }
 
 function markSubtitleUiReady(source = "unknown", bvid = "", p = "") {
@@ -2659,7 +2686,7 @@ function syncStepProgressByTaskState(tabState) {
 }
 
 async function loadBootstrapData() {
-    const res = await chrome.runtime.sendMessage({ action: "GET_BOOTSTRAP", skipCloud: true });
+    const res = await chrome.runtime.sendMessage({ action: "GET_BOOTSTRAP", skipCloud: true, refreshFeedback: true });
     if (!res?.ok) {
         showToast(res?.error || "初始化失败");
         return;
@@ -2866,6 +2893,15 @@ function syncRuntimeDebugModeToBackground() {
         });
         if (result && typeof result.catch === "function") result.catch(() => {});
     } catch (_) {}
+}
+
+function openAsrSettings() {
+    appState.activePage = "settings";
+    renderNav();
+    renderContent();
+    requestAnimationFrame(() => {
+        panelShadowRoot?.getElementById("settings-asr-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
 }
 
 function bindPanelDelegatedEvents() {
@@ -3378,6 +3414,10 @@ function bindPanelDelegatedEvents() {
         }
         if (action === "transcription-start") {
             startTranscriptionFromCapsule();
+            return;
+        }
+        if (action === "asr-open-settings") {
+            openAsrSettings();
         }
     });
     panelRoot.addEventListener("mouseover", (event) => {
@@ -3609,7 +3649,7 @@ function collectFeedbackLogs() {
     return debugLogs.filter((item) => {
         const event = String(item?.event || "").toLowerCase();
         const detail = JSON.stringify(item?.detail || {}).toLowerCase();
-        return /error|failed|fail|timeout|exception|abort|invalid|denied/.test(event)
+        return /error|failed|fail|timeout|exception|abort|invalid|denied|cache|subtitle|cc_render|progress/.test(event)
             || /error|failed|fail|timeout|exception|abort|invalid|denied/.test(detail);
     }).map((item) => ({
         source: "asr_ui",
@@ -3618,6 +3658,31 @@ function collectFeedbackLogs() {
         event: item.event || "",
         detail: item.detail || null
     }));
+}
+
+function buildFeedbackDiagnosticContext() {
+    const cache = appState.cache || {};
+    const tabState = appState.tabState || {};
+    return {
+        route_bvid: normalizeBvidCase(getBvidFromUrl(location.href) || ""),
+        route_cid: getCurrentRouteCid(),
+        route_p: getRoutePartId(),
+        route_part_count: getCurrentRoutePartCount(),
+        cache_bvid: normalizeBvidCase(cache.bvid || ""),
+        cache_cid: Number(cache.cid || 0),
+        cache_subtitle_rows: Math.max(
+            Array.isArray(cache.rawSubtitle) ? cache.rawSubtitle.length : 0,
+            Array.isArray(cache.processedSubtitle) ? cache.processedSubtitle.length : 0
+        ),
+        subtitle_phase: String(subtitleUiCoordinator.phase || ""),
+        subtitle_source: String(cache.subtitleSource || tabState.subtitleSource || ""),
+        transcription_running: isTranscriptionRunning(),
+        tab_bvid: normalizeBvidCase(tabState.activeBvid || ""),
+        tab_cid: Number(tabState.activeCid || 0),
+        task_status: tabState.taskStatus || {},
+        task_errors: tabState.taskErrors || {},
+        last_error: String(tabState.lastError || "")
+    };
 }
 
 async function refreshFeedbackState({ markSeen = false, silent = false } = {}) {
@@ -3721,7 +3786,8 @@ async function submitFeedbackFromPanel() {
             content,
             bvid: resolveCurrentBvid() || appState.tabState?.activeBvid || "",
             includeLogs: includeLogsInput?.checked !== false,
-            logs: collectFeedbackLogs()
+            logs: collectFeedbackLogs(),
+            diagnosticContext: buildFeedbackDiagnosticContext()
         });
         if (!res?.ok) throw new Error(res?.error || "提交反馈失败");
         setFeedbackState({
@@ -3898,10 +3964,26 @@ function renderSummary(panel) {
         `;
         return;
     }
-    const summary = appState.cache?.summary || "";
-    const segments = dedupeDisplayedLineOnlyContentSegments(appState.cache?.segments, appState.cache);
     const summaryStatus = getCurrentVideoTaskStatus("summary");
     const segmentsStatus = getCurrentVideoTaskStatus("segments");
+    const summaryDraft = appState.cache?.summaryDraft;
+    const freshDraft = summaryStatus === "processing"
+        && summaryDraft && typeof summaryDraft === "object"
+        && String(summaryDraft.text || "").trim()
+        && Date.now() - Number(summaryDraft.updatedAt || 0) < SUMMARY_DRAFT_TTL_MS;
+    const draftExpiryAt = freshDraft ? Number(summaryDraft.updatedAt || 0) + SUMMARY_DRAFT_TTL_MS : 0;
+    if (draftExpiryAt !== appState.summaryDraftExpiryAt) {
+        if (appState.summaryDraftExpiryTimer) clearTimeout(appState.summaryDraftExpiryTimer);
+        appState.summaryDraftExpiryAt = draftExpiryAt;
+        appState.summaryDraftExpiryTimer = draftExpiryAt ? setTimeout(() => {
+            appState.summaryDraftExpiryTimer = null;
+            appState.summaryDraftExpiryAt = 0;
+            syncCacheFromBackground(resolveCurrentBvid(), { preserveCacheOnMiss: true, force: true, skipCloud: true })
+                .finally(() => renderContent());
+        }, Math.max(0, draftExpiryAt - Date.now()) + 20) : null;
+    }
+    const summary = freshDraft ? String(summaryDraft.text || "") : (appState.cache?.summary || "");
+    const segments = dedupeDisplayedLineOnlyContentSegments(appState.cache?.segments, appState.cache);
     logPartScopeDiagnostic("ui_render_read", {
         feature: "summary_segments",
         summaryStatus,
@@ -3916,6 +3998,7 @@ function renderSummary(panel) {
         : null;
     const isLoading = summaryStatus === "processing" || segmentsStatus === "processing";
     const hasContent = !!String(summary || "").trim() || segments.length > 0;
+    const subtitleState = getCurrentSubtitleDependencyState();
     const apiKey = String(appState.settings?.apiKey || "").trim();
     if (!apiKey && !hasContent) {
         panel.classList.add("summary-no-apikey");
@@ -3950,6 +4033,8 @@ function renderSummary(panel) {
         rawSubtitleLength: Array.isArray(appState.cache?.rawSubtitle) ? appState.cache.rawSubtitle.length : 0,
         processedSubtitleLength: Array.isArray(appState.cache?.processedSubtitle) ? appState.cache.processedSubtitle.length : 0,
         cloudReadStatus: String(appState.cloudReadState?.status || ""),
+        subtitleDependencyStatus: subtitleState.status,
+        subtitleDependencyDetail: subtitleState.detail,
         subtitleSource: String(appState.cache?.subtitleSource || ""),
         summarySource: getTaskCacheSource(appState.cache, "summary"),
         segmentsSource: getTaskCacheSource(appState.cache, "segments"),
@@ -3982,7 +4067,7 @@ function renderSummary(panel) {
         ${modeNoticeHtml}
     `;
 
-    if (!isLoading && (!hasContent || isTranscriptionRunning())) {
+    if (!isLoading && !hasContent) {
         panel.classList.remove("is-segments-expanded");
         const errorView = appState.panelErrors?.summary;
         if (errorView && renderErrorPanel) {
@@ -3992,22 +4077,14 @@ function renderSummary(panel) {
             `;
             return;
         }
-        const hasSubtitle = hasUsableSubtitleCache(appState.cache, resolveCurrentBvid());
-        const isCheckingSubtitleCache = !hasSubtitle && isCloudReadLoadingForCurrentVideo();
-        let btnDisabled = isTranscriptionRunning() ? "disabled" : "";
-        let tipText = hasSubtitle ? "去除噪音，抓住重点。" : "点击后将先检查字幕缓存。";
-        let btnOpacity = isTranscriptionRunning() ? "0.5" : "1";
-        let btnText = isCheckingSubtitleCache ? "检查并生成" : "生成 AI 总结";
-        let extraActionsHtml = "";
-
-        if (isTranscriptionRunning()) {
-            btnDisabled = "disabled";
-            tipText = "正在生成字幕，请稍候...";
-            btnOpacity = "0.5";
-            btnText = "生成 AI 总结";
-        } else if (isCheckingSubtitleCache) {
-            tipText = "正在检查字幕缓存，也可以直接点击生成重试。";
-        } else if (!hasSubtitle) {
+        if (subtitleState.status === "pending") {
+            panel.innerHTML = `
+                ${headerHtml}
+                ${renderSubtitlePendingState(subtitleState.detail)}
+            `;
+            return;
+        }
+        if (subtitleState.status === "missing") {
             panel.innerHTML = `
                 ${headerHtml}
                 ${renderMissingSubtitleState()}
@@ -4019,9 +4096,8 @@ function renderSummary(panel) {
             ${headerHtml}
             <div class="page-body subtitle-empty-container">
                 <div class="action-container">
-                    <p class="action-tip">${tipText}</p>
-                    <button class="action-btn" data-action="run-summary" ${btnDisabled} style="opacity: ${btnOpacity}">${btnText}</button>
-                    ${extraActionsHtml}
+                    <p class="action-tip">去除噪音，抓住重点。</p>
+                    <button class="action-btn" data-action="run-summary">生成 AI 总结</button>
                 </div>
             </div>
         `;
@@ -4466,7 +4542,6 @@ function renderCC(panel) {
         const detectElapsedMs = Date.now() - Number(appState.injectBvidChangedAt || 0);
         const detectTimeoutReached = detectElapsedMs >= SUBTITLE_DETECT_TIMEOUT_MS;
         const isDetectingSubtitle = !running && isSubtitleUiLoading();
-        const capsuleDisabled = (running || isDetectingSubtitle) ? "disabled" : "";
         const asrPanelError = appState.panelErrors?.CC;
         if (asrPanelError && !running && !isDetectingSubtitle && renderErrorPanel) {
             panel.innerHTML = `
@@ -4478,6 +4553,9 @@ function renderCC(panel) {
             bindCCSearch(panel);
             return;
         }
+        const retryableSubtitleLoad = subtitleTimedOut || subtitleLoadFailed;
+        const asrKeyRequirement = getAsrApiKeyRequirement(appState.settings || {});
+        const missingAsrApiKey = asrKeyRequirement.missing && !retryableSubtitleLoad;
         const statusText = isDetectingSubtitle
             ? "正在读取字幕，请稍候..."
             : subtitleTimedOut
@@ -4486,10 +4564,12 @@ function renderCC(panel) {
             ? "字幕加载失败，请重试"
             : ((running && (appState.asrSession?.statusText || transcription.statusText))
                 ? escapeHtml(appState.asrSession?.statusText || transcription.statusText)
-                : "未检测到字幕，可开启在线转录");
-        const retryableSubtitleLoad = subtitleTimedOut || subtitleLoadFailed;
-        const buttonText = running ? "转录中..." : (isDetectingSubtitle ? "检测中..." : (retryableSubtitleLoad ? "重试" : "开始在线转录"));
-        const buttonAction = retryableSubtitleLoad ? "subtitle-load-retry" : "transcription-start";
+                : (missingAsrApiKey
+                    ? `请先填写${escapeHtml(asrKeyRequirement.providerName)}的API Key，再开始转录`
+                    : "未检测到字幕，可开启在线转录"));
+        const buttonText = running ? "转录中..." : (isDetectingSubtitle ? "检测中..." : (retryableSubtitleLoad ? "重试" : (missingAsrApiKey ? "去设置" : "开始在线转录")));
+        const buttonAction = retryableSubtitleLoad ? "subtitle-load-retry" : (missingAsrApiKey ? "asr-open-settings" : "transcription-start");
+        const capsuleDisabled = (running || isDetectingSubtitle) ? "disabled" : "";
         logAsrUiTrace("cc_render", {
             mode: "empty",
             rows: rows.length,
@@ -4528,7 +4608,7 @@ function renderCC(panel) {
         const capsuleHtml = `<div class="subtitle-empty-container">
             <div class="action-container">
                 <p class="action-tip">${statusText}</p>
-                <button ${retryableSubtitleLoad ? "" : 'id="start-groq-transcribe"'} class="action-btn" data-action="${buttonAction}" ${capsuleDisabled}>${buttonText}</button>
+                <button ${retryableSubtitleLoad || missingAsrApiKey ? "" : 'id="start-groq-transcribe"'} class="action-btn" data-action="${buttonAction}" ${capsuleDisabled}>${buttonText}</button>
             </div>
         </div>`;
         panel.innerHTML = `
@@ -4851,6 +4931,7 @@ function renderReal(panel) {
         accepted: isCacheForCurrentRouteVideo(appState.cache, resolveCurrentBvid())
     }, "render:rumors");
     const hasRumorsCache = !!String(rumors?.overview || "").trim() || claims.length > 0;
+    const subtitleState = getCurrentSubtitleDependencyState();
     const rumorsNoTimestamp = isNoTimestampSubtitleCache(appState.cache) || rumors?.no_timestamp || claims.some((item) => item?.no_timestamp);
     
     // Sort claims by timestamp
@@ -4867,6 +4948,8 @@ function renderReal(panel) {
         processedSubtitleLength: Array.isArray(appState.cache?.processedSubtitle) ? appState.cache.processedSubtitle.length : 0,
         subtitleSource: String(appState.cache?.subtitleSource || ""),
         cloudReadStatus: String(appState.cloudReadState?.status || ""),
+        subtitleDependencyStatus: subtitleState.status,
+        subtitleDependencyDetail: subtitleState.detail,
         rumorsSource: getTaskCacheSource(appState.cache, "rumors"),
         sessionFresh: appState.sessionGeneratedTasks.has("rumors")
     });
@@ -4974,6 +5057,26 @@ function renderReal(panel) {
                 </div>
                 ${realNoticeHtml}
                 ${renderErrorPanel(errorView, "run-rumors")}
+            `;
+            return;
+        }
+        if (subtitleState.status === "pending") {
+            panel.innerHTML = `
+                <div class="page-header">
+                    <h3>验真助手 <div class="header-tags"><span class="beta-tag">Beta</span>${rumorsCacheTag}</div></h3>
+                </div>
+                ${realNoticeHtml}
+                ${renderSubtitlePendingState(subtitleState.detail)}
+            `;
+            return;
+        }
+        if (subtitleState.status === "missing") {
+            panel.innerHTML = `
+                <div class="page-header">
+                    <h3>验真助手 <div class="header-tags"><span class="beta-tag">Beta</span>${rumorsCacheTag}</div></h3>
+                </div>
+                ${realNoticeHtml}
+                ${renderMissingSubtitleState()}
             `;
             return;
         }
@@ -5424,7 +5527,7 @@ function renderSettings(panel) {
                     <input id="settings-base-url" type="text" value="${escapeHtml(settings.customBaseUrl || "")}" placeholder="示例：https://api.example.com/v1">
                     <button type="button" class="panel-btn ghost" data-action="settings-authorize-custom-origin">授权当前域名</button>
                 </div>
-                <div class="settings-group-title">ASR（音频识别）模型配置</div>
+                <div class="settings-group-title" id="settings-asr-section">ASR（音频识别）模型配置</div>
                 <label>ASR Provider</label>
                 <div class="settings-provider-row">
                     <select id="settings-asr-provider" class="settings-native-select-hidden">
@@ -6072,7 +6175,8 @@ function renderTaskRetryDebugPanel() {
         merged: "省流联合请求",
         primary: "原 Prompt 重试",
         expanded_tokens: "提高输出上限重试",
-        compact: "保守 Prompt 重试"
+        compact: "保守 Prompt 重试",
+        provider_429_backoff: "Provider 429 退避重试"
     };
     const statusMap = {
         idle: "空闲",
@@ -6107,6 +6211,7 @@ function renderTaskRetryDebugPanel() {
             <div class="debug-card-actions">
                 <button type="button" class="panel-btn ghost" data-action="debug-run-segments-retry-test">测试字段结构错误</button>
                 <button type="button" class="panel-btn ghost" data-action="debug-run-segments-truncation-retry-test">测试截断后提高至 8192</button>
+                <button type="button" class="panel-btn ghost" data-action="debug-run-provider-429-retry-test">测试 429 自动重试</button>
             </div>
             <div class="debug-state-grid">
                 <div><strong>任务状态：</strong>${escapeHtml(statusMap[taskStatus] || taskStatus)}</div>
@@ -6428,6 +6533,14 @@ function bindSegmentPromptDebugControls(panel) {
             tasks: ["summary"],
             runtimeAction: "RUN_SUMMARY_EMPTY_RETRY_TEST",
             expected: "首轮总结判空后自动补发一次总结请求"
+        },
+        {
+            selector: '[data-action="debug-run-provider-429-retry-test"]',
+            id: "provider_429_retry",
+            title: "Provider 429 自动重试",
+            tasks: ["segments"],
+            runtimeAction: "RUN_PROVIDER_429_RETRY_TEST",
+            expected: "依次等待 2 秒、5 秒、10 秒，前三次不向用户显示错误，第 4 次真实请求成功"
         }
     ];
     liveRetryTests.forEach((test) => {
@@ -6599,8 +6712,34 @@ function bindRealtimeLogPanel(panel) {
     });
 }
 
+function getMissingSubtitleTaskMessage(tasks = []) {
+    const list = Array.isArray(tasks) ? tasks : [];
+    if (list.includes("rumors") && !list.includes("summary") && !list.includes("segments")) {
+        return "当前视频暂无字幕，无法开始验真";
+    }
+    if (list.includes("segments") && !list.includes("summary")) {
+        return "当前视频暂无字幕，无法生成视频分段";
+    }
+    return "当前视频暂无字幕，无法生成总结";
+}
+
 async function runTasks(tasks, options = {}) {
     if (hasLocalPendingTasks(tasks)) return;
+    const currentBvid = resolveCurrentBvid();
+    const subtitleState = needsSubtitleForTasks(tasks) ? getCurrentSubtitleDependencyState() : null;
+    if (subtitleState?.status === "pending") {
+        showToast(subtitleState.detail || "正在读取字幕，请稍候...");
+        return;
+    }
+    if (needsSubtitleForTasks(tasks) && isTranscriptionRunning()) {
+        logContent.info("task_start_deferred", {
+            task: tasks.join(","),
+            bvid: currentBvid,
+            code: "ASR_IN_PROGRESS"
+        });
+        showToast("字幕转录中，请等待完成后再生成总结");
+        return;
+    }
     setLocalPendingTasks(tasks, true);
     renderContent();
     // Check for subtitle existence before running summary or segments
@@ -6623,7 +6762,7 @@ async function runTasks(tasks, options = {}) {
                 );
             }
             if (appState.activePage === "summary") renderContent();
-            showToast("当前视频暂无字幕，无法生成总结");
+            showToast(getMissingSubtitleTaskMessage(tasks));
         }
         return;
     }
@@ -7395,7 +7534,9 @@ function applyCacheSubtitleState(cache, targetBvid = "") {
 function startCloudReadForCurrentVideo(options = {}) {
     const target = normalizeBvidCase(options?.bvid || resolveCurrentBvid() || "");
     const cid = getCurrentRouteCid();
-    if (!target || !(cid > 0)) return;
+    const partCount = getCurrentRoutePartCount();
+    const allowPendingSinglePartCid = !(cid > 0) && !getRoutePartId() && partCount === 1;
+    if (!target || (!(cid > 0) && !allowPendingSinglePartCid)) return;
     const silent = options?.silent !== false;
     const nextRequestId = Number(appState.cloudReadState?.requestId || 0) + 1;
     appState.cloudReadState = createCloudReadState(target, "loading", nextRequestId);
@@ -7405,12 +7546,9 @@ function startCloudReadForCurrentVideo(options = {}) {
         bvid: target,
         cid,
         tid: getRoutePartId(),
-        partCount: getCurrentRoutePartCount()
+        partCount
     });
-    const timeout = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error("CLOUD_TIMEOUT")), CLOUD_READ_TIMEOUT_MS);
-    });
-    Promise.race([request, timeout])
+    request
         .then((res) => {
             if (normalizeBvidCase(appState.cloudReadState?.bvid || "") !== target) return;
             if (Number(appState.cloudReadState?.requestId || 0) !== nextRequestId) return;
@@ -7455,6 +7593,33 @@ function renderCloudLoadingState(title, detail = "读取云端数据中...") {
         <div class="page-body subtitle-empty-container">
             <div class="action-container">
                 <p class="action-tip">${detail}</p>
+            </div>
+        </div>
+    `;
+}
+
+function getCurrentSubtitleDependencyState() {
+    const input = {
+        hasSubtitle: hasUsableSubtitleCache(appState.cache, resolveCurrentBvid()),
+        playerLoading: isSubtitleUiLoading(),
+        cloudLoading: isCloudReadLoadingForCurrentVideo(),
+        transcribing: isTranscriptionRunning()
+    };
+    if (typeof getSubtitleDependencyState === "function") {
+        return getSubtitleDependencyState(input);
+    }
+    if (input.hasSubtitle) return { status: "ready", detail: "" };
+    if (input.transcribing) return { status: "pending", detail: "正在生成字幕，请稍候..." };
+    if (input.playerLoading) return { status: "pending", detail: "正在读取字幕，请稍候..." };
+    if (input.cloudLoading) return { status: "pending", detail: "正在读取字幕缓存，请稍候..." };
+    return { status: "missing", detail: "暂无字幕" };
+}
+
+function renderSubtitlePendingState(detail = "正在读取字幕，请稍候...") {
+    return `
+        <div class="page-body subtitle-empty-container">
+            <div class="action-container">
+                <p class="action-tip pulse">${escapeHtml(detail)}</p>
             </div>
         </div>
     `;
@@ -8677,6 +8842,11 @@ function hasNativeCCSubtitleDom() {
 }
 
 async function startTranscriptionFromCapsule() {
+    const asrKeyRequirement = getAsrApiKeyRequirement(appState.settings || {});
+    if (asrKeyRequirement.missing) {
+        showToast(`请先填写${asrKeyRequirement.providerName}的API Key，再开始转录`);
+        return;
+    }
     const fallbackMeta = {
         bvid: normalizeBvidCase(appState.injectBvid || resolveCurrentBvid()),
         cid: Number(resolveCid() || 0),
@@ -8707,6 +8877,22 @@ async function startTranscriptionFromCapsule() {
             code: "ASR_ALREADY_RUNNING"
         });
         showToast("正在转录中，请稍候...");
+        return;
+    }
+    const generatingTasks = ["summary", "segments", "rumors"].filter((task) => {
+        const status = isTabStateForCurrentVideo()
+            ? String(appState.tabState?.taskStatus?.[task] || "")
+            : "";
+        return hasLocalPendingTask(task) || status === "running" || status === "queued";
+    });
+    if (generatingTasks.length) {
+        logContent.info("asr_start_blocked", {
+            task: "asr",
+            bvid,
+            code: "AI_TASK_IN_PROGRESS",
+            detail: { tasks: generatingTasks }
+        });
+        showToast("总结生成中，请完成后再转录字幕");
         return;
     }
     const confirmedCid = await waitForConfirmedRouteCid(bvid);
@@ -9686,7 +9872,11 @@ function isCacheForCurrentRouteVideo(cache, targetBvid = "") {
     const routeCid = getCurrentRouteCid();
     const cacheCid = Number(cache?.cid || 0);
     if (routeBvid && cacheBvid && routeBvid !== cacheBvid) return false;
-    if (!(cacheCid > 0)) return false;
+    if (!(cacheCid > 0)) {
+        return !routeTid
+            && getCurrentRoutePartCount() === 1
+            && cache?.pendingSinglePart === true;
+    }
     if (!(routeCid > 0)) {
         const isConfirmedSinglePartVideo = !routeTid && getCurrentRoutePartCount() === 1;
         return isConfirmedSinglePartVideo;
@@ -9704,11 +9894,22 @@ function selectCacheDirectoryPart(cache, targetBvid = "", targetCid = 0) {
     const bvid = normalizeBvidCase(cache.bvid || targetBvid || "");
     const cid = Number(targetCid || 0);
     if (!bvid) return null;
-    if (!(cid > 0)) return null;
+    const pendingPartKey = `${bvid.toLowerCase()}::single-pending`;
+    const pendingPart = cache.parts && typeof cache.parts === "object" ? cache.parts[pendingPartKey] : null;
+    const allowPendingSinglePart = !getRoutePartId() && getCurrentRoutePartCount() === 1;
+    if (!(cid > 0)) {
+        if (allowPendingSinglePart && pendingPart && typeof pendingPart === "object") {
+            return { ...cache, ...pendingPart, parts: cache.parts, subtitleVariants: cache.subtitleVariants };
+        }
+        return null;
+    }
     const partKey = `${bvid.toLowerCase()}::${cid}`;
     const part = cache.parts && typeof cache.parts === "object" ? cache.parts[partKey] : null;
     if (part && typeof part === "object") {
         return { ...cache, ...part, parts: cache.parts, subtitleVariants: cache.subtitleVariants };
+    }
+    if (allowPendingSinglePart && pendingPart && typeof pendingPart === "object") {
+        return { ...cache, ...pendingPart, parts: cache.parts, subtitleVariants: cache.subtitleVariants };
     }
     return null;
 }
@@ -10481,7 +10682,16 @@ async function forwardSubtitlePayload(payload, source) {
     }
     appState.injectCid = Number.isFinite(cid) && cid > 0 ? cid : appState.injectCid;
     try {
-        const res = await chrome.runtime.sendMessage({ action: "SUBTITLE_CAPTURED", payload: { ...payload, bvid, cid: appState.injectCid || 0 } });
+        const res = await chrome.runtime.sendMessage({
+            action: "SUBTITLE_CAPTURED",
+            payload: {
+                ...payload,
+                bvid,
+                cid: appState.injectCid || 0,
+                tid: String(payload?.tid || payload?.p || getRoutePartId() || ""),
+                partCount: Math.max(0, Number(payload?.partCount || getCurrentRoutePartCount() || 0))
+            }
+        });
         if (!res?.ok) throw new Error(res?.error || "转发字幕失败");
         appState.pendingSubtitle = null;
         appState.subtitleCapturedBvid = bvid;
@@ -10529,7 +10739,28 @@ async function syncActiveCacheByBvid(expectedBvid) {
         if (normalizeBvidCase(appState.tabState?.activeBvid || "") !== target) return;
         const directory = res?.[`cache_${target}`] || null;
         const nextCache = selectCacheDirectoryPart(directory, target, getCurrentRouteCid());
-        appState.cache = nextCache && normalizeBvidCase(nextCache?.bvid || "") === target && isCacheForCurrentRouteVideo(nextCache, target) ? nextCache : null;
+        const acceptedCache = nextCache
+            && normalizeBvidCase(nextCache?.bvid || "") === target
+            && isCacheForCurrentRouteVideo(nextCache, target)
+            ? nextCache
+            : null;
+        const routeCid = getCurrentRouteCid();
+        const routeTid = getRoutePartId();
+        const currentCacheTid = String(appState.cache?.tid || "").trim();
+        const canPreserveCurrentSubtitleCache = !acceptedCache
+            && !(routeCid > 0)
+            && normalizeBvidCase(appState.cache?.bvid || "") === target
+            && hasSubtitleInCache(appState.cache)
+            && (routeTid ? currentCacheTid === routeTid : (!currentCacheTid || currentCacheTid === "1"));
+        appState.cache = acceptedCache || (canPreserveCurrentSubtitleCache ? appState.cache : null);
+        if (canPreserveCurrentSubtitleCache) {
+            logPartScopeDiagnostic("cache_preserved_while_cid_pending", {
+                targetBvid: target.toLowerCase(),
+                cacheCid: Number(appState.cache?.cid || 0),
+                cacheTid: currentCacheTid,
+                routeTid
+            }, `cache-preserved:${target}:${currentCacheTid}`);
+        }
         applyCacheSubtitleState(appState.cache, target);
         if (hasUsableSubtitleCache(appState.cache, target)) {
             appState.subtitleCapturedBvid = target;
@@ -10608,7 +10839,9 @@ async function syncCacheFromBackground(bvid, options = {}) {
     const target = normalizeBvidCase(bvid || getBvidFromUrl(location.href) || "");
     if (!target) return;
     const requestedCid = getCurrentRouteCid();
-    if (!(requestedCid > 0)) {
+    const requestedPartCount = getCurrentRoutePartCount();
+    const allowPendingSinglePartCid = !(requestedCid > 0) && !getRoutePartId() && requestedPartCount === 1;
+    if (!(requestedCid > 0) && !allowPendingSinglePartCid) {
         logPartScopeDiagnostic("cache_request_deferred", {
             requestedBvid: target.toLowerCase(),
             reason: "route_cid_pending"
@@ -10627,7 +10860,7 @@ async function syncCacheFromBackground(bvid, options = {}) {
             bvid: target,
             cid: requestedCid,
             tid: getTidFromUrl(location.href),
-            partCount: getCurrentRoutePartCount(),
+            partCount: requestedPartCount,
             skipCloud: options.skipCloud !== false
         });
         if (!res?.ok) return;
@@ -10659,7 +10892,11 @@ async function syncCacheFromBackground(bvid, options = {}) {
                         ? "bvid_mismatch"
                         : "route_identity_mismatch"
             });
-            if (options.preserveCacheOnMiss !== true) {
+            const hasUsableCurrentCache = isCacheForCurrentRouteVideo(appState.cache, target)
+                && (hasSubtitleInCache(appState.cache)
+                    || !!String(appState.cache?.summary || "").trim()
+                    || (Array.isArray(appState.cache?.segments) && appState.cache.segments.length > 0));
+            if (options.preserveCacheOnMiss !== true && !hasUsableCurrentCache) {
                 appState.cache = null;
             }
             reconcileTranscriptionState(target);
@@ -11046,7 +11283,14 @@ function onBackgroundMessage(message) {
     appState.pendingSubtitle = null;
     renderNav();
     const messageCacheBvid = normalizeBvidCase(cache?.bvid || "");
-    appState.cache = cache && (!routeBvid || messageCacheBvid === routeBvid) && isCacheForCurrentRouteVideo(cache, payloadBvid || routeBvid) ? cache : null;
+    const acceptedCache = cache && (!routeBvid || messageCacheBvid === routeBvid)
+        && isCacheForCurrentRouteVideo(cache, payloadBvid || routeBvid) ? cache : null;
+    const keepCurrentCache = !acceptedCache
+        && isCacheForCurrentRouteVideo(appState.cache, payloadBvid || routeBvid)
+        && (hasSubtitleInCache(appState.cache)
+            || !!String(appState.cache?.summary || "").trim()
+            || (Array.isArray(appState.cache?.segments) && appState.cache.segments.length > 0));
+    appState.cache = acceptedCache || (keepCurrentCache ? appState.cache : null);
     if (appState.cache) {
         applyCacheSubtitleState(appState.cache, payloadBvid || routeBvid);
     }

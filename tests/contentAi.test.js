@@ -16,6 +16,26 @@ describe("contentAi", () => {
     expect(ai.canRunTasksWithCache(["rumors"], "BV1", { bvid: "BV1", processedSubtitle: [{ text: "字幕" }] })).toBe(true);
   });
 
+  it("keeps subtitle-dependent pages pending until subtitle discovery finishes", () => {
+    expect(ai.getSubtitleDependencyState({ playerLoading: true })).toEqual({
+      status: "pending",
+      detail: "正在读取字幕，请稍候..."
+    });
+    expect(ai.getSubtitleDependencyState({ cloudLoading: true })).toEqual({
+      status: "pending",
+      detail: "正在读取字幕缓存，请稍候..."
+    });
+    expect(ai.getSubtitleDependencyState({ transcribing: true })).toEqual({
+      status: "pending",
+      detail: "正在生成字幕，请稍候..."
+    });
+    expect(ai.getSubtitleDependencyState({ hasSubtitle: true, playerLoading: true })).toEqual({
+      status: "ready",
+      detail: ""
+    });
+    expect(ai.getSubtitleDependencyState({})).toEqual({ status: "missing", detail: "暂无字幕" });
+  });
+
   it("creates pending chat messages", () => {
     const messages = ai.createPendingChatMessages("这段讲了什么？", "m1", 123);
 

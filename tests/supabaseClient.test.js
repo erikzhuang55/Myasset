@@ -21,8 +21,8 @@ afterEach(() => {
 });
 
 describe("supabaseClient", () => {
-  it("uses a five second default request timeout", () => {
-    expect(DEFAULT_SUPABASE_REQUEST_TIMEOUT_MS).toBe(5000);
+  it("uses a two second default request timeout", () => {
+    expect(DEFAULT_SUPABASE_REQUEST_TIMEOUT_MS).toBe(2000);
   });
 
   it("detects whether supabase is configured", () => {

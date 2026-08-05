@@ -5,6 +5,19 @@ const DEFAULT_FEATURE_FLAGS = Object.freeze({
   segments_primary_retry: true,
   segments_compact_retry: true,
   segments_expanded_tokens_retry: true,
+  modelscope_model_fallback: true,
+});
+
+const DEFAULT_MODELSCOPE_FALLBACK = Object.freeze({
+  enabled: true,
+  maxAttempts: 1,
+  tasks: Object.freeze({
+    default: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
+    summary: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
+    segments: Object.freeze(["Qwen/Qwen3-Coder-30B-A3B-Instruct", "Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
+    rumors: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
+    chat: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
+  }),
 });
 
 export const DEFAULT_REMOTE_CONFIG = Object.freeze({
@@ -14,6 +27,7 @@ export const DEFAULT_REMOTE_CONFIG = Object.freeze({
   featureFlags: DEFAULT_FEATURE_FLAGS,
   providers: {},
   asr: {},
+  modelFallback: DEFAULT_MODELSCOPE_FALLBACK,
 });
 
 export const REMOTE_CONFIG_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -87,6 +101,22 @@ function normalizeFeatureFlags(value) {
   ]));
 }
 
+function normalizeModelFallback(value = {}) {
+  const incoming = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const incomingTasks = incoming.tasks && typeof incoming.tasks === "object" && !Array.isArray(incoming.tasks)
+    ? incoming.tasks
+    : {};
+  const tasks = Object.fromEntries(Object.entries(DEFAULT_MODELSCOPE_FALLBACK.tasks).map(([task, fallback]) => {
+    const models = cleanModels(incomingTasks[task]);
+    return [task, models.length ? models : [...fallback]];
+  }));
+  return {
+    enabled: incoming.enabled !== false,
+    maxAttempts: 1,
+    tasks,
+  };
+}
+
 export function normalizeRemoteConfigRow(row = {}) {
   const payload = row?.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
     ? row.payload
@@ -98,6 +128,7 @@ export function normalizeRemoteConfigRow(row = {}) {
     featureFlags: normalizeFeatureFlags(payload.feature_flags || payload.featureFlags),
     providers: normalizeProviderMap(payload.providers),
     asr: normalizeProviderMap(payload.asr),
+    modelFallback: normalizeModelFallback(payload.model_fallback || payload.modelFallback),
   };
 }
 

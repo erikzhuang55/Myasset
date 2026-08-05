@@ -93,6 +93,33 @@ describe("providerAdapter", () => {
     expect(JSON.parse(init.body).max_tokens).toBe(8192);
   });
 
+  it("disables thinking only for an explicitly retried DeepSeek V4 request", async () => {
+    const fetchMock = vi.fn(async () => mockJsonResponse({
+      choices: [{ message: { content: "完成" }, finish_reason: "stop" }]
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const baseConfig = {
+      provider: "modelscope",
+      apiKey: "ms-test",
+      model: "deepseek-ai/DeepSeek-V4-Pro"
+    };
+    await callAI("modelscope", baseConfig, [{ role: "user", content: "生成分段" }]);
+    await callAI("modelscope", {
+      ...baseConfig,
+      deepSeekV4ThinkingDisabled: true
+    }, [{ role: "user", content: "生成分段" }]);
+    await callAI("modelscope", {
+      ...baseConfig,
+      model: "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      deepSeekV4ThinkingDisabled: true
+    }, [{ role: "user", content: "生成分段" }]);
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).thinking).toBeUndefined();
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).thinking).toEqual({ type: "disabled" });
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body).thinking).toBeUndefined();
+  });
+
   it("keeps the raw provider response when OpenAI-compatible content is empty", async () => {
     const responseBody = {
       id: "chatcmpl-empty",

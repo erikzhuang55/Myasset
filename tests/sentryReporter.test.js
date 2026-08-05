@@ -300,6 +300,10 @@ describe("sentryReporter", () => {
     expect(shouldReportToSentry(new Error("IO error: FILE_ERROR_NO_SPACE"))).toBe(false);
     expect(shouldReportToSentry(new Error("A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received"))).toBe(false);
     expect(shouldReportToSentry(new Error("Could not establish connection. Receiving end does not exist."))).toBe(false);
+    expect(shouldReportToSentry({ message: "Groq 网络不可达", code: "ASR_GROQ_ACCESS_BLOCKED" })).toBe(false);
+    expect(shouldReportToSentry({ message: "请求频率超限", code: "HTTP_429", status: 429 })).toBe(true);
+    expect(shouldReportToSentry({ message: "Invalid model id: retired-model", code: "INVALID_MODEL_ID", status: 400 })).toBe(true);
+    expect(shouldReportToSentry({ message: "model not found", code: "HTTP_404", status: 404 })).toBe(true);
     expect(shouldReportToSentry(new Error("Cannot read properties of undefined"))).toBe(true);
 
     const result = await reportToSentry(
@@ -312,6 +316,28 @@ describe("sentryReporter", () => {
 
     expect(result).toMatchObject({ sent: false, reason: "ignored" });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("splits final 429 issues by normalized failure reason", () => {
+    const quotaEvent = createSentryEvent({
+      message: "API Error 429: insufficient_balance",
+      code: "HTTP_429",
+      status: 429,
+    }, { task: "summary_segments_merged", provider: "modelscope" });
+    const rateLimitEvent = createSentryEvent({
+      message: "API Error 429: too many requests",
+      code: "HTTP_429",
+      status: 429,
+    }, { task: "summary_segments_merged", provider: "modelscope" });
+
+    expect(quotaEvent.fingerprint).toEqual([
+      "bilitato-429",
+      "summary_segments_merged",
+      "modelscope",
+      "quota_exhausted",
+    ]);
+    expect(quotaEvent.tags.failure_reason).toBe("quota_exhausted");
+    expect(rateLimitEvent.fingerprint.at(-1)).toBe("rate_limited");
   });
 
   it("sends sentry envelope when enabled", async () => {

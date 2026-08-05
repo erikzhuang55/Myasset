@@ -39,13 +39,24 @@ describe("developer tools panel", () => {
     expect(background).toContain("debugForceFirstSegmentsTruncation: true");
   });
 
+  it("offers a Provider 429 backoff simulation without analytics pollution", () => {
+    expect(content).toContain('data-action="debug-run-provider-429-retry-test"');
+    expect(content).toContain('runtimeAction: "RUN_PROVIDER_429_RETRY_TEST"');
+    expect(content).toContain('provider_429_backoff: "Provider 429 退避重试"');
+    expect(background).toContain('msg.action === "RUN_PROVIDER_429_RETRY_TEST"');
+    expect(background).toContain("debugForceProvider429Retries: true");
+    expect(background).toContain("if (isDebugSimulation)");
+    expect(background).toContain("return;\n            }\n            await reportProvider429RetryAttempt");
+    expect(background).toContain("return;\n            }\n            await reportProvider429Recovered");
+  });
+
   it("keeps summary retries on the original request transport", () => {
     expect(background).toContain('mode: "single",\n                requestStream: false');
     expect(background).toContain('mode: "quality",\n                        requestStream: true');
     expect(background).toContain('mode: "efficiency",\n                    requestStream: true');
     expect(background).toContain("const aiRes = requestStream");
-    expect(background).toContain("? await callAIWithTimeoutStream(settings, messages");
-    expect(background).toContain(": await callAIWithTimeout(settings, messages");
+    expect(background).toContain("? await callAIWithTimeoutStream(retrySettings, messages");
+    expect(background).toContain(": await callAIWithTimeout(retrySettings, messages");
   });
 
   it("judges live retry scenarios from their final task status", () => {

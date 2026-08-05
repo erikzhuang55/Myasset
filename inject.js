@@ -728,7 +728,8 @@
 
     function getRouteVideoKey() {
         const meta = resolveCurrentVideoMeta();
-        return meta.bvid ? `${meta.bvid}::${meta.cid || getRouteTid()}` : "";
+        const routeP = Math.max(1, Number(getRouteTid() || meta.p || 1));
+        return meta.bvid ? `${meta.bvid}::p${routeP}` : "";
     }
 
     function emitPlayInfo() {
