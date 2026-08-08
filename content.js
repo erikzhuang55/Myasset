@@ -798,17 +798,37 @@ function commitSubtitleRows(rows, options = {}) {
     const unchanged = previousMeta.rowCount === nextMeta.rowCount
         && getSubtitleRowsStateDigest(existingRows) === getSubtitleRowsStateDigest(list)
         && subtitleUiCoordinator.rowsRouteKey === routeKey;
+    const alreadyReadyForRoute = subtitleUiCoordinator.phase === "ready"
+        && subtitleUiCoordinator.routeKey === routeKey;
     subtitleUiCoordinator.rows = list;
+    subtitleUiCoordinator.routeKey = routeKey;
     subtitleUiCoordinator.rowsRouteKey = routeKey;
     subtitleUiCoordinator.rowsSource = source;
     subtitleUiCoordinator.rowsCid = incomingCid || currentCid || 0;
+    stopSubtitleControlProbe();
+    subtitleUiCoordinator.pendingRequestUrls.clear();
+    if (subtitleUiCoordinator.timeoutTimer) {
+        clearTimeout(subtitleUiCoordinator.timeoutTimer);
+        subtitleUiCoordinator.timeoutTimer = null;
+    }
     subtitleUiCoordinator.phase = "ready";
     subtitleUiCoordinator.displaySource = source;
+    logSubtitleDiagnostic("ui_phase_changed", {
+        phase: "ready",
+        source,
+        routeKey,
+        generation: subtitleUiCoordinator.generation,
+        rowCount: list.length,
+        reason: "rows_committed"
+    });
     if (!existingRows.length || subtitleUiCoordinator.initialAlignmentPending) {
         subtitleUiCoordinator.initialAlignmentPending = true;
     }
-    if (unchanged) return false;
-    markSubtitleStateChanged(source, { rowCount: list.length });
+    if (unchanged && alreadyReadyForRoute) return false;
+    markSubtitleStateChanged(source, {
+        rowCount: list.length,
+        readyTransition: !alreadyReadyForRoute
+    });
     return true;
 }
 
@@ -1983,9 +2003,6 @@ async function onInjectMessage(event) {
             subtitleUrl: String(event.data?.subtitleUrl || ""),
             ...getSubtitleDiagnosticRowsMeta(event.data?.data)
         });
-        if (Array.isArray(event.data?.data) && event.data.data.length) {
-            markSubtitleUiReady("inject", event.data?.bvid, event.data?.p || event.data?.tid);
-        }
     }
     if (msgType === "BILI_INJECT_READY" || msgType === "BILI_SUBTITLE_HANDSHAKE") {
         appState.injectReady = true;

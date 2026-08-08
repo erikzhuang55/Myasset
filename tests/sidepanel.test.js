@@ -399,6 +399,14 @@ describe("native side panel", () => {
     expect(content).toContain('reason: payloadP && currentUrlP && payloadP !== currentUrlP ? "payload_p_mismatch" : "route_state_not_aligned"');
   });
 
+  it("marks injected subtitles ready only after route-scoped rows are committed", () => {
+    expect(content).not.toContain('markSubtitleUiReady("inject"');
+    expect(content).toMatch(/subtitleUiCoordinator\.rows = list;[\s\S]*?subtitleUiCoordinator\.routeKey = routeKey;[\s\S]*?subtitleUiCoordinator\.rowsRouteKey = routeKey;[\s\S]*?subtitleUiCoordinator\.rowsCid = incomingCid \|\| currentCid \|\| 0;[\s\S]*?subtitleUiCoordinator\.phase = "ready";/);
+    expect(content).toContain('reason: "rows_committed"');
+    expect(content).toContain("if (unchanged && alreadyReadyForRoute) return false;");
+    expect(content).toContain("readyTransition: !alreadyReadyForRoute");
+  });
+
   it("records detailed resource timing for subtitle XHR requests", () => {
     expect(inject).toContain("logSubtitleResourceTiming(url, this, requestStartedAt, requestMeta)");
     expect(inject).toContain('logSubtitleDiagnostic("source_resource_timing"');
