@@ -10,37 +10,55 @@ params as (
   select
     greatest(7, least(coalesce(p_days, 30), 90)) as days,
     coalesce(
-      max((created_at at time zone 'Asia/Shanghai')::date),
+      ((select max(created_at) from public.usage_events) at time zone 'Asia/Shanghai')::date,
       (now() at time zone 'Asia/Shanghai')::date
     ) as anchor_date
-  from public.usage_events
 ),
-events as (
+recent as materialized (
   select
-    e.*,
+    e.id,
+    e.user_hash,
+    e.event_name,
+    e.feature_name,
+    e.status,
+    e.error_code,
+    e.extension_version,
+    e.created_at,
     (e.created_at at time zone 'Asia/Shanghai')::date as local_date
   from public.usage_events e
+  cross join params p
+  where e.created_at >= (
+      (p.anchor_date - (greatest(p.days, 30) - 1))::timestamp
+      at time zone 'Asia/Shanghai'
+    )
+    and e.created_at < (
+      (p.anchor_date + 1)::timestamp
+      at time zone 'Asia/Shanghai'
+    )
 ),
 windowed as (
-  select e.*
-  from events e
+  select r.*
+  from recent r
   cross join params p
-  where e.local_date between p.anchor_date - (p.days - 1) and p.anchor_date
+  where r.local_date between p.anchor_date - (p.days - 1) and p.anchor_date
 ),
 kpis as (
   select
     p.anchor_date,
     p.days,
-    count(distinct e.user_hash) filter (where e.local_date = p.anchor_date) as dau,
-    count(distinct e.user_hash) filter (
-      where e.local_date between p.anchor_date - 6 and p.anchor_date
+    count(distinct r.user_hash) filter (
+      where r.local_date = p.anchor_date
+    ) as dau,
+    count(distinct r.user_hash) filter (
+      where r.local_date between p.anchor_date - 6 and p.anchor_date
     ) as wau,
-    count(distinct e.user_hash) filter (
-      where e.local_date between p.anchor_date - 29 and p.anchor_date
+    count(distinct r.user_hash) filter (
+      where r.local_date between p.anchor_date - 29 and p.anchor_date
     ) as mau,
-    (select count(distinct user_hash) from events) as observable_users
+    (select count(distinct user_hash) from public.usage_events) as observable_users
   from params p
-  left join events e on e.local_date between p.anchor_date - 29 and p.anchor_date
+  left join recent r
+    on r.local_date between p.anchor_date - 29 and p.anchor_date
   group by p.anchor_date, p.days
 ),
 feature_catalog(feature_key, label, sort_order) as (
@@ -271,7 +289,5 @@ select jsonb_build_object(
 );
 $$;
 
-revoke all on function public.get_usage_dashboard_v1(integer) from public;
-revoke all on function public.get_usage_dashboard_v1(integer) from anon;
-revoke all on function public.get_usage_dashboard_v1(integer) from authenticated;
-grant execute on function public.get_usage_dashboard_v1(integer) to service_role;
+
+;

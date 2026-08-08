@@ -1,5 +1,9 @@
 export const MODELSCOPE_QUOTA_LEDGER_STORAGE_KEY = "modelScopeQuotaLedger";
 
+export function isStrictModelScopeProvider(settings = {}) {
+  return String(settings?.provider || "").trim().toLowerCase() === "modelscope";
+}
+
 function cleanText(value, maxLength = 200) {
   return String(value || "").trim().slice(0, maxLength);
 }
@@ -136,8 +140,20 @@ export function classifyModelScopeFallbackError(error, ledger = {}, { currentMod
   const status = Number(error?.status || 0);
   const message = `${error?.message || ""}\n${error?.responseText || ""}`;
   if (code === "ABORTED" || status === 401 || status === 403 || code === "HTTP_401" || code === "HTTP_403") return null;
-  if (["AI_RESPONSE_TIMEOUT", "AI_STREAM_TIMEOUT", "HTTP_5XX"].includes(code) || status >= 500) {
-    return { eligible: true, reason: status >= 500 || code === "HTTP_5XX" ? "provider_5xx" : "timeout" };
+  if (["AI_RESPONSE_TIMEOUT", "AI_STREAM_TIMEOUT", "HTTP_5XX"].includes(code) || /^HTTP_5\d\d$/.test(code) || status >= 500) {
+    return { eligible: true, reason: status >= 500 || code === "HTTP_5XX" || /^HTTP_5\d\d$/.test(code) ? "provider_5xx" : "timeout" };
+  }
+  if ([
+    "SUMMARY_EMPTY_RESPONSE",
+    "SEGMENTS_JSON_PARSE_FAILED",
+    "SEGMENTS_INVALID_SCHEMA",
+    "SEGMENTS_EMPTY_LIST",
+    "SEGMENTS_MISSING_PROTOCOL"
+  ].includes(code)) {
+    return {
+      eligible: true,
+      reason: code === "SUMMARY_EMPTY_RESPONSE" ? "summary_empty" : "structured_output_invalid",
+    };
   }
   if (code === "MODEL_NOT_FOUND" || code === "INVALID_MODEL_ID" || code === "HTTP_402_MODEL_UNAVAILABLE") {
     return { eligible: true, reason: "model_unavailable", markUnavailable: true };
@@ -156,11 +172,21 @@ export function classifyModelScopeFallbackError(error, ledger = {}, { currentMod
   const normalizedLedger = normalizeModelScopeQuotaLedger(ledger);
   const userRemaining = normalizedLedger.user.remaining;
   const modelRemaining = findModelEntry(normalizedLedger, currentModel)?.remaining ?? null;
-  const modelQuotaMessage = /model.{0,60}(?:quota|limit|额度|配额).{0,30}(?:exceed|exhaust|used up|用尽|耗尽|不足)|(?:quota|limit|额度|配额).{0,60}model/i.test(message);
+  const modelQuotaMessage = /rate\s+limit\s+you\s+for\s+model|model.{0,60}(?:quota|limit|额度|配额).{0,30}(?:exceed|exhaust|used up|用尽|耗尽|不足)|(?:quota|limit|额度|配额).{0,60}model/i.test(message);
   if ((status === 429 || code.startsWith("HTTP_429"))
     && userRemaining !== 0
     && (modelQuotaMessage || modelRemaining === 0)) {
-    return { eligible: true, reason: "model_quota_exhausted", markQuotaExhausted: true };
+    return { eligible: true, reason: "model_quota_exhausted", markQuotaExhausted: true, immediate: true };
+  }
+  if ((status === 429 || code.startsWith("HTTP_429")) && userRemaining === 0) return null;
+  if (status === 429 || code.startsWith("HTTP_429")) {
+    if (code === "HTTP_429_QUEUE_EXCEEDED" || /queue.{0,30}(?:overload|full|limit|busy)|(?:overload|full).{0,30}queue/i.test(message)) {
+      return { eligible: true, reason: "queue_overloaded" };
+    }
+    if (code === "HTTP_429_RATE_LIMIT" || /rate\s*limit|too\s+many\s+requests|请求过于频繁/i.test(message)) {
+      return { eligible: true, reason: "rate_limited" };
+    }
+    return { eligible: true, reason: "unknown_429" };
   }
   return null;
 }
@@ -168,5 +194,6 @@ export function classifyModelScopeFallbackError(error, ledger = {}, { currentMod
 export function shouldUseImmediateModelScopeFallback(error) {
   const classification = classifyModelScopeFallbackError(error);
   return classification?.reason === "quota_exhausted"
+    || classification?.reason === "model_quota_exhausted"
     || classification?.reason === "model_unavailable";
 }

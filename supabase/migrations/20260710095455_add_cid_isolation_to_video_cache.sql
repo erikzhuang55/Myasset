@@ -30,4 +30,4 @@ create index if not exists video_cache_bvid_cid_lookup
 comment on column public.video_cache.cid is
     'Bilibili content ID for multipart isolation. NULL indicates a legacy BVID-only cache row and must not be used for multipart videos.';
 
-commit;
+commit;;

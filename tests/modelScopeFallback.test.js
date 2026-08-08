@@ -7,6 +7,7 @@ import {
   selectModelScopeFallbackModel,
   updateModelScopeQuotaLedger,
   shouldUseImmediateModelScopeFallback,
+  isStrictModelScopeProvider,
 } from "../utils/modelScopeFallback.js";
 
 const NOW = Date.UTC(2026, 7, 6, 8, 0, 0);
@@ -19,6 +20,13 @@ const CONFIG = {
 };
 
 describe("ModelScope model fallback", () => {
+  it("only enables model switching for the explicit ModelScope provider", () => {
+    expect(isStrictModelScopeProvider({ provider: "modelscope" })).toBe(true);
+    expect(isStrictModelScopeProvider({ provider: " ModelScope " })).toBe(true);
+    expect(isStrictModelScopeProvider({ provider: "gemini", model: "Qwen/Qwen3-30B-A3B" })).toBe(false);
+    expect(isStrictModelScopeProvider({ providerModels: { modelscope: "Qwen/Qwen3-30B-A3B" } })).toBe(false);
+  });
+
   it("resets the quota ledger on the next Shanghai calendar day", () => {
     const previous = {
       date: "2026-08-05",
@@ -91,10 +99,14 @@ describe("ModelScope model fallback", () => {
   it("only retries failures that a different model can plausibly recover", () => {
     let ledger = normalizeModelScopeQuotaLedger({}, Date.now());
     expect(classifyModelScopeFallbackError({ code: "HTTP_5XX", status: 503 }, ledger)).toMatchObject({ reason: "provider_5xx" });
+    expect(classifyModelScopeFallbackError({ code: "HTTP_503" }, ledger)).toMatchObject({ reason: "provider_5xx" });
+    expect(classifyModelScopeFallbackError({ code: "AI_STREAM_TIMEOUT" }, ledger)).toMatchObject({ reason: "timeout" });
     expect(classifyModelScopeFallbackError({ code: "HTTP_400", status: 400, message: "model is not available" }, ledger)).toMatchObject({ reason: "model_unavailable" });
     expect(classifyModelScopeFallbackError({ code: "HTTP_401", status: 401 }, ledger)).toBeNull();
     expect(classifyModelScopeFallbackError({ code: "PROVIDER_NETWORK_ERROR" }, ledger)).toBeNull();
-    expect(classifyModelScopeFallbackError({ code: "SUMMARY_EMPTY_RESPONSE" }, ledger)).toBeNull();
+    expect(classifyModelScopeFallbackError({ code: "SUMMARY_EMPTY_RESPONSE" }, ledger)).toMatchObject({ reason: "summary_empty" });
+    expect(classifyModelScopeFallbackError({ code: "SEGMENTS_JSON_PARSE_FAILED" }, ledger)).toMatchObject({ reason: "structured_output_invalid" });
+    expect(classifyModelScopeFallbackError({ code: "SEGMENTS_INVALID_SCHEMA" }, ledger)).toMatchObject({ reason: "structured_output_invalid" });
     ledger = updateModelScopeQuotaLedger(ledger, "model-a", {
       modelRemaining: 0,
       userRemaining: 50,
@@ -110,6 +122,13 @@ describe("ModelScope model fallback", () => {
       ledger,
       { currentModel: "model-a" },
     )).toBeNull();
+  });
+
+  it("switches after one short wait for queue, rate-limit, and unknown 429 failures", () => {
+    expect(classifyModelScopeFallbackError({ code: "HTTP_429_QUEUE_EXCEEDED", status: 429 })).toMatchObject({ reason: "queue_overloaded" });
+    expect(classifyModelScopeFallbackError({ code: "HTTP_429_RATE_LIMIT", status: 429 })).toMatchObject({ reason: "rate_limited" });
+    expect(classifyModelScopeFallbackError({ code: "HTTP_429", status: 429 })).toMatchObject({ reason: "unknown_429" });
+    expect(shouldUseImmediateModelScopeFallback({ code: "HTTP_429", status: 429 })).toBe(false);
   });
 
   it("immediately falls back for quota exhaustion and unavailable models", () => {
@@ -128,6 +147,11 @@ describe("ModelScope model fallback", () => {
       status: 429,
       message: 'API Error 429: {"error":{"message":"insufficient balance"}}',
     };
+    const modelQuotaError = {
+      code: "HTTP_429",
+      status: 429,
+      message: "We have to rate limit you for model deepseek-ai/DeepSeek-V4-Pro",
+    };
 
     expect(classifyModelScopeFallbackError(quotaError)).toMatchObject({
       reason: "quota_exhausted",
@@ -138,6 +162,11 @@ describe("ModelScope model fallback", () => {
     });
     expect(shouldUseImmediateModelScopeFallback(quotaError)).toBe(true);
     expect(shouldUseImmediateModelScopeFallback(balanceError)).toBe(true);
+    expect(classifyModelScopeFallbackError(modelQuotaError)).toMatchObject({
+      reason: "model_quota_exhausted",
+      immediate: true,
+    });
+    expect(shouldUseImmediateModelScopeFallback(modelQuotaError)).toBe(true);
     expect(shouldUseImmediateModelScopeFallback(unavailableError)).toBe(true);
   });
 });

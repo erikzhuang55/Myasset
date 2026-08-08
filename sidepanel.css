@@ -1454,6 +1454,13 @@ button {
     justify-content: space-between;
 }
 
+.settings-title-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+
 .settings-provider-row select {
     min-width: 0;
     flex: 1;
@@ -1480,6 +1487,16 @@ button {
     border-radius: 7px;
     font-size: 11px;
     white-space: nowrap;
+}
+
+.settings-guide-btn.has-unread-announcement {
+    position: relative;
+}
+
+.settings-guide-btn .announcement-unread-dot {
+    position: absolute;
+    top: 2px;
+    right: 2px;
 }
 
 .settings-reset-btn {

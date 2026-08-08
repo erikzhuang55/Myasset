@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 const content = readFileSync(new URL("../content.js", import.meta.url), "utf8");
 const background = readFileSync(new URL("../background.js", import.meta.url), "utf8");
+const contentCss = readFileSync(new URL("../content.css", import.meta.url), "utf8");
 
 describe("developer tools panel", () => {
   it("keeps the debug-only navigation entry in its existing position", () => {
@@ -39,6 +40,24 @@ describe("developer tools panel", () => {
     expect(background).toContain("debugForceFirstSegmentsTruncation: true");
   });
 
+  it("offers a real ModelScope response header test with safe header output", () => {
+    expect(content).toContain('data-action="debug-test-modelscope-response-headers"');
+    expect(content).toContain('action: "TEST_MODELSCOPE_RESPONSE_HEADERS"');
+    expect(content).toContain("原始响应头");
+    expect(content).toContain("原始响应头 JSON");
+    expect(content).toContain('data-action="debug-copy-modelscope-response-headers"');
+    expect(background).toContain('msg.action === "TEST_MODELSCOPE_RESPONSE_HEADERS"');
+    expect(background).toContain("serializeSafeResponseHeaders");
+    expect(background).toContain("rawHeaders: responseHeadersToJson");
+    expect(background).toContain("set-cookie|set-cookie2|authorization|proxy-authorization");
+  });
+
+  it("can clear local announcement read state for repeated UI testing", () => {
+    expect(content).toContain('data-action="debug-clear-announcement-read-state"');
+    expect(content).toContain('key.startsWith("topAnnouncementDismissed:")');
+    expect(content).toContain("appState.dismissedAnnouncementKeys.clear()");
+  });
+
   it("offers a Provider 429 backoff simulation without analytics pollution", () => {
     expect(content).toContain('data-action="debug-run-provider-429-retry-test"');
     expect(content).toContain('runtimeAction: "RUN_PROVIDER_429_RETRY_TEST"');
@@ -46,8 +65,26 @@ describe("developer tools panel", () => {
     expect(background).toContain('msg.action === "RUN_PROVIDER_429_RETRY_TEST"');
     expect(background).toContain("debugForceProvider429Retries: true");
     expect(background).toContain("if (isDebugSimulation)");
-    expect(background).toContain("return;\n            }\n            await reportProvider429RetryAttempt");
+    expect(background).toContain("await reportProvider429RetryAttempt(settings, options, event)");
     expect(background).toContain("return;\n            }\n            await reportProvider429Recovered");
+  });
+
+  it("wraps retry test actions instead of overflowing the debug card", () => {
+    expect(contentCss).toMatch(/\.debug-card-actions\s*\{[\s\S]*?flex-wrap:\s*wrap/);
+    expect(contentCss).toMatch(/\.debug-card-actions \.panel-btn\s*\{[\s\S]*?flex:\s*1 1 calc\(50% - 4px\)/);
+    expect(contentCss).toMatch(/\.debug-card-actions \.panel-btn\s*\{[\s\S]*?white-space:\s*normal/);
+  });
+
+  it("previews the model quota fallback toast without a network request", () => {
+    expect(content).toContain('data-action="debug-preview-model-fallback-toast"');
+    expect(content).toContain("当前模型当日额度已经耗尽，已自动切换到其他可用模型");
+    expect(background).toContain("当前模型当日额度已经耗尽，已自动切换到其他可用模型");
+  });
+
+  it("previews the Gemini Retry-After toast without a network request", () => {
+    expect(content).toContain('data-action="debug-preview-gemini-retry-after-toast"');
+    expect(content).toContain("当前模型触发限流，将在 12 秒后自动重试");
+    expect(background).toContain("当前模型触发限流，将在 ${waitSeconds} 秒后自动重试");
   });
 
   it("keeps summary retries on the original request transport", () => {
@@ -55,8 +92,9 @@ describe("developer tools panel", () => {
     expect(background).toContain('mode: "quality",\n                        requestStream: true');
     expect(background).toContain('mode: "efficiency",\n                    requestStream: true');
     expect(background).toContain("const aiRes = requestStream");
-    expect(background).toContain("? await callAIWithTimeoutStream(retrySettings, messages");
-    expect(background).toContain(": await callAIWithTimeout(retrySettings, messages");
+    expect(background).toContain("? await callAIWithTimeoutStream(requestSettings, messages");
+    expect(background).toContain(": await callAIWithTimeout(requestSettings, messages");
+    expect(background).toContain("isModelScopeStoppedEmptySummary(settings, initialAIResponse)");
   });
 
   it("judges live retry scenarios from their final task status", () => {

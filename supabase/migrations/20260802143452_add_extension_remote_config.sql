@@ -52,7 +52,6 @@ values (
     "feature_flags": {
       "summary_empty_retry": true,
       "segments_local_json_repair": true,
-      "segments_ai_json_repair": true,
       "segments_primary_retry": true,
       "segments_compact_retry": true,
       "segments_expanded_tokens_retry": true
@@ -166,3 +165,5 @@ begin
   end if;
 end;
 $$;
+
+;

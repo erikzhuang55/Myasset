@@ -56,9 +56,12 @@ begin
     || E'    and nullif(metadata->>''task_id'', '''') is not null\n'
     || E'),\n'
     || E'recovered_tasks as (\n'
-    || E'  select distinct task_id\n'
-    || E'  from recovery_events\n'
-    || E'  where status = ''success''\n'
+    || E'  select distinct f.task_id\n'
+    || E'  from task_attempt_failures f\n'
+    || E'  join windowed terminal\n'
+    || E'    on nullif(terminal.metadata->>''task_id'', '''') = f.task_id\n'
+    || E'   and terminal.created_at >= f.initial_failed_at\n'
+    || E'   and terminal.event_name in (''task_success'', ''task_partial'')\n'
     || E'),\n'
     || E'retry_overview as (\n'
     || E'  select\n'
@@ -152,3 +155,5 @@ revoke all on function public.get_usage_dashboard_v1(integer) from public;
 revoke all on function public.get_usage_dashboard_v1(integer) from anon;
 revoke all on function public.get_usage_dashboard_v1(integer) from authenticated;
 grant execute on function public.get_usage_dashboard_v1(integer) to service_role;
+
+;

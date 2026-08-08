@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   PROVIDER_429_RETRY_DELAYS_MS,
+  classifyProvider429Error,
   isProvider429Error,
+  resolveProviderRetryAfterMs,
   runWithProvider429Backoff
 } from "../utils/provider429Retry.js";
 
@@ -18,6 +20,37 @@ describe("provider 429 retry", () => {
     expect(isProvider429Error({ code: "HTTP_429_RATE_LIMIT" })).toBe(true);
     expect(isProvider429Error(new Error("API Error 429: insufficient balance"))).toBe(true);
     expect(isProvider429Error({ status: 500, code: "HTTP_500" })).toBe(false);
+  });
+
+  it("separates account quota, model quota, credit, queue, and temporary rate limits", () => {
+    expect(classifyProvider429Error(create429Error("You exceeded your current quota"))).toBe("quota_exhausted");
+    expect(classifyProvider429Error(create429Error("We have to rate limit you for model deepseek-ai/DeepSeek-V4-Pro"))).toBe("model_quota_exhausted");
+    expect(classifyProvider429Error(create429Error("Credit balance exhausted"))).toBe("credit_balance_exhausted");
+    expect(classifyProvider429Error(create429Error("Provider queue is full"))).toBe("queue_overloaded");
+    expect(classifyProvider429Error(create429Error("Too many requests"))).toBe("rate_limited");
+  });
+
+  it("reads Gemini retry-after from headers or error text", () => {
+    expect(resolveProviderRetryAfterMs({ retryAfterSec: 2.5 })).toBe(2500);
+    expect(resolveProviderRetryAfterMs({ responseHeaders: new Headers({ "retry-after": "4" }) })).toBe(4000);
+    expect(resolveProviderRetryAfterMs(create429Error("Please retry in 3.725s"))).toBe(3725);
+  });
+
+  it("supports a provider supplied retry delay", async () => {
+    const waits = [];
+    let attempts = 0;
+    const result = await runWithProvider429Backoff(async () => {
+      attempts += 1;
+      if (attempts === 1) throw create429Error("Please retry in 3.725s");
+      return "ok";
+    }, {
+      delaysMs: [0],
+      getNextDelayMs: (error) => resolveProviderRetryAfterMs(error),
+      wait: async (delayMs) => waits.push(delayMs)
+    });
+    expect(result).toBe("ok");
+    expect(attempts).toBe(2);
+    expect(waits).toEqual([3725]);
   });
 
   it("waits 2s, 5s, and 10s before succeeding without exposing intermediate failures", async () => {

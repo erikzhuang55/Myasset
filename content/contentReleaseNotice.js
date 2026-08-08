@@ -4,6 +4,64 @@
   const STORAGE_KEY = "bilitato_last_seen_version";
 
   const RELEASE_NOTES = {
+    "1.6.3": {
+      title: "Bilitato 已更新至 v1.6.3",
+      displayVersion: "v1.6.3",
+      subtitle: "本次重点优化分 P 字幕切换、ModelScope 自动降级和服务通知体验。",
+      groups: [
+        {
+          tag: "新增",
+          items: [
+            {
+              title: "新增公告中心",
+              desc: "插件标题栏会提示重要服务变更，也可以在设置中查看历史公告；已读公告可关闭，不会反复打扰。",
+              highlight: true,
+            },
+          ],
+        },
+        {
+          tag: "优化",
+          items: [
+            {
+              title: "ModelScope 降级更及时",
+              desc: "模型当日额度耗尽或暂时不可用时，会自动切换到其他可用模型，并提示当前处理状态。",
+              highlight: true,
+            },
+            {
+              title: "Gemini 限流提示更清楚",
+              desc: "服务返回明确等待时间时，插件会显示倒计时提示，并在等待结束后自动重试一次。",
+            },
+            {
+              title: "转录配置提醒更直接",
+              desc: "开始转录前会检查当前语音识别服务的 API Key；未填写时可直接前往设置。",
+            },
+          ],
+        },
+        {
+          tag: "修复",
+          items: [
+            {
+              title: "修复分 P 字幕切换闪烁",
+              desc: "已确认属于当前分 P 的字幕，不再被迟到的重复路由通知清空，同时继续严格校验 BVID、P 和 CID。",
+              highlight: true,
+            },
+            {
+              title: "修复分 P 缓存身份波动",
+              desc: "统一首页分 P 标识的空值与 P1 表示，减少字幕先出现、短暂丢失后又恢复的问题。",
+            },
+            {
+              title: "修复其他 Provider 错用 Qwen 降级",
+              desc: "自动切换备用模型严格限制在 ModelScope，Gemini、自定义 Provider 等继续使用各自原有请求与重试方式。",
+            },
+            {
+              title: "修复空总结直接失败",
+              desc: "ModelScope 返回结束但没有总结正文时，会优先尝试可用备用模型，提高任务最终完成率。",
+            },
+          ],
+        },
+      ],
+      privacy: "Bilitato 不会上传您的 API Key、Prompt 或与 AI 的聊天内容。公告仅同步公开服务通知，自动降级不会修改您保存的默认模型。",
+    },
     "1.6.2": {
       title: "Bilitato 已更新至 v1.6.2",
       displayVersion: "v1.6.2",
@@ -1124,7 +1182,9 @@
 
   function buildReleasePageVersions(version) {
     const majorHistory = [];
-    if (version === "1.6.2") {
+    if (version === "1.6.3") {
+      majorHistory.push("1.6.3", "1.6.2", "1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");
+    } else if (version === "1.6.2") {
       majorHistory.push("1.6.2", "1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");
     } else if (version === "1.6.1") {
       majorHistory.push("1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");

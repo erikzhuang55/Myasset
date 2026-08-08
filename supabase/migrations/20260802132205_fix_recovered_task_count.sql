@@ -20,3 +20,5 @@ revoke all on function public.get_usage_dashboard_v1(integer) from public;
 revoke all on function public.get_usage_dashboard_v1(integer) from anon;
 revoke all on function public.get_usage_dashboard_v1(integer) from authenticated;
 grant execute on function public.get_usage_dashboard_v1(integer) to service_role;
+
+;

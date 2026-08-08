@@ -334,9 +334,9 @@ describe("sentryReporter", () => {
       "bilitato-429",
       "summary_segments_merged",
       "modelscope",
-      "quota_exhausted",
+      "credit_balance_exhausted",
     ]);
-    expect(quotaEvent.tags.failure_reason).toBe("quota_exhausted");
+    expect(quotaEvent.tags.failure_reason).toBe("credit_balance_exhausted");
     expect(rateLimitEvent.fingerprint.at(-1)).toBe("rate_limited");
   });
 

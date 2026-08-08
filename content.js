@@ -374,6 +374,17 @@ const CLOUD_READ_TIMEOUT_MS = 2000;
 const SUMMARY_DRAFT_TTL_MS = 10 * 60 * 1000;
 const FEEDBACK_SUBMITTED_STORAGE_KEY = "feedbackSubmitted";
 const FEEDBACK_PENDING_REPLY_TEXT = "感谢你的反馈！我会尽量在24小时内回复。";
+const BUILTIN_ANNOUNCEMENTS = Object.freeze([Object.freeze({
+    key: "modelscope_magicube_2026_08",
+    title: "ModelScope 免费额度机制更新",
+    summary: "ModelScope 免费额度机制更新，点击查看",
+    content: "modelscope目前更新了调用机制，取消了每天自动刷新的调用额度，而是改为魔粒兑换免费额度，每日登录赠送200魔粒（约等于200次调用），如您频繁出现额度不足的提示，请登录 ModelScope 个人中心即可刷新每日免费调用额度，祝调用愉快！",
+    linkUrl: "https://modelscope.cn/my/overview",
+    linkLabel: "前往 ModelScope",
+    showBanner: true,
+    publishedAt: "2026-08-08T00:00:00+08:00",
+    updatedAt: "2026-08-08T00:00:00+08:00"
+})]);
 
 function getAsrApiKeyRequirement(settings = {}) {
     const requested = String(settings.asrProvider || "groq").toLowerCase();
@@ -529,6 +540,13 @@ const appState = {
     cloudCachePrefs: { all: false, current: false },
     versionState: null,
     versionCheckTimer: null,
+    announcements: BUILTIN_ANNOUNCEMENTS.map((item) => ({ ...item })),
+    announcementsLoaded: false,
+    announcementsLoadingPromise: null,
+    announcementErrorText: "",
+    dismissedAnnouncementKeys: new Set(),
+    announcementPage: 0,
+    modelScopeHeaderTest: null,
     lastSettingsUsageEventSignature: "",
     playInfo: null,
     playInfoUpdatedAt: 0,
@@ -622,8 +640,14 @@ const subtitleUiCoordinator = {
 };
 const playInfoWaiters = new Set();
 
+function normalizeComparablePartId(value) {
+    const raw = String(value ?? "").trim();
+    const numeric = Number(raw || 1);
+    return Number.isInteger(numeric) && numeric > 0 ? String(numeric) : raw;
+}
+
 function getCurrentSubtitleRouteKey() {
-    return `${String(getBvidFromUrl(location.href) || "").toLowerCase()}|${String(getRoutePartId() || "")}`;
+    return `${String(getBvidFromUrl(location.href) || "").toLowerCase()}|${normalizeComparablePartId(getRoutePartId())}`;
 }
 
 function getCurrentSubtitleStateRows() {
@@ -789,7 +813,7 @@ function commitSubtitleRows(rows, options = {}) {
 }
 
 function isDuplicateSubtitleRouteSwitch(bvid, p) {
-    const key = `${String(bvid || "").toLowerCase()}|${String(p || "")}`;
+    const key = `${String(bvid || "").toLowerCase()}|${normalizeComparablePartId(p)}`;
     const now = Date.now();
     if (subtitleUiCoordinator.lastRouteSwitchKey === key && now - subtitleUiCoordinator.lastRouteSwitchAt < 1500) {
         logSubtitleDiagnostic("route_switch_ignored", { routeKey: key, reason: "duplicate_route_event" });
@@ -800,8 +824,28 @@ function isDuplicateSubtitleRouteSwitch(bvid, p) {
     return false;
 }
 
+function shouldPreserveReadySubtitleForRoute(bvid, p, cid = 0) {
+    const routeKey = `${String(bvid || "").toLowerCase()}|${normalizeComparablePartId(p)}`;
+    const targetCid = Number(cid || 0);
+    const rowsCid = Number(subtitleUiCoordinator.rowsCid || 0);
+    const matchesRoute = subtitleUiCoordinator.phase === "ready"
+        && subtitleUiCoordinator.routeKey === routeKey
+        && subtitleUiCoordinator.rowsRouteKey === routeKey
+        && Array.isArray(subtitleUiCoordinator.rows)
+        && subtitleUiCoordinator.rows.length > 0;
+    if (!matchesRoute) return false;
+    if (targetCid > 0 && rowsCid !== targetCid) return false;
+    logSubtitleDiagnostic("route_reset_preserved", {
+        routeKey,
+        cid: targetCid,
+        rowCount: subtitleUiCoordinator.rows.length,
+        reason: "ready_subtitle_matches_route"
+    });
+    return true;
+}
+
 function beginSubtitleUiCycle(bvid = "", p = "") {
-    const routeKey = `${String(bvid || getBvidFromUrl(location.href) || "").toLowerCase()}|${String(p || getRoutePartId() || "")}`;
+    const routeKey = `${String(bvid || getBvidFromUrl(location.href) || "").toLowerCase()}|${normalizeComparablePartId(p || getRoutePartId())}`;
     if (["probing", "loading", "requesting"].includes(subtitleUiCoordinator.phase) && subtitleUiCoordinator.routeKey === routeKey) {
         return;
     }
@@ -1013,7 +1057,7 @@ function completeSubtitleUiRequest(detail = {}) {
 }
 
 function markSubtitleUiReady(source = "unknown", bvid = "", p = "") {
-    const routeKey = `${String(bvid || getBvidFromUrl(location.href) || "").toLowerCase()}|${String(p || getRoutePartId() || "")}`;
+    const routeKey = `${String(bvid || getBvidFromUrl(location.href) || "").toLowerCase()}|${normalizeComparablePartId(p || getRoutePartId())}`;
     if (subtitleUiCoordinator.routeKey && subtitleUiCoordinator.routeKey !== routeKey) return;
     const alreadyReadyForRoute = subtitleUiCoordinator.phase === "ready" && subtitleUiCoordinator.routeKey === routeKey;
     subtitleUiCoordinator.routeKey = routeKey;
@@ -1097,6 +1141,290 @@ function renderVersionUpdateBadge() {
     const state = appState.versionState || {};
     if (!state.hasUpdate) return "";
     return `<button type="button" class="version-update-badge" data-action="open-extension-management" data-button-tooltip="跳转插件页后请在左上角找到“更新”按钮以更新插件">有可用版本更新</button>`;
+}
+
+function normalizeAnnouncementRecord(value = {}) {
+    const key = String(value.key || value.announcement_key || "").trim().toLowerCase();
+    const linkUrl = String(value.linkUrl || value.link_url || "").trim();
+    return {
+        key: /^[a-z0-9][a-z0-9_-]{0,79}$/.test(key) ? key : "",
+        title: String(value.title || "").trim().slice(0, 120),
+        summary: String(value.summary || "").trim().slice(0, 240),
+        content: String(value.content || "").trim().slice(0, 5000),
+        linkUrl: /^https:\/\//i.test(linkUrl) ? linkUrl.slice(0, 500) : "",
+        linkLabel: String(value.linkLabel || value.link_label || "").trim().slice(0, 60),
+        showBanner: value.showBanner !== false && value.show_banner !== false,
+        publishedAt: String(value.publishedAt || value.published_at || ""),
+        updatedAt: String(value.updatedAt || value.updated_at || "")
+    };
+}
+
+function mergeAnnouncements(remoteRows = []) {
+    const byKey = new Map(BUILTIN_ANNOUNCEMENTS.map((item) => [item.key, normalizeAnnouncementRecord(item)]));
+    (Array.isArray(remoteRows) ? remoteRows : []).forEach((item) => {
+        const normalized = normalizeAnnouncementRecord(item);
+        if (normalized.key && normalized.title && normalized.content) byKey.set(normalized.key, normalized);
+    });
+    return [...byKey.values()].sort((left, right) => {
+        const rightTime = Date.parse(right.publishedAt || right.updatedAt || "") || 0;
+        const leftTime = Date.parse(left.publishedAt || left.updatedAt || "") || 0;
+        return rightTime - leftTime;
+    });
+}
+
+function getTopBannerAnnouncement() {
+    const latest = Array.isArray(appState.announcements) ? appState.announcements[0] : null;
+    return latest?.showBanner !== false ? latest : null;
+}
+
+function getAnnouncementDismissedStorageKey(key) {
+    return `topAnnouncementDismissed:${String(key || "").trim().toLowerCase()}`;
+}
+
+function getUnreadAnnouncements() {
+    const announcements = Array.isArray(appState.announcements) ? appState.announcements : [];
+    return announcements.filter((item) => item?.key && !appState.dismissedAnnouncementKeys.has(item.key));
+}
+
+function hasUnreadAnnouncements() {
+    return getUnreadAnnouncements().length > 0;
+}
+
+function renderAnnouncementUnreadDot() {
+    return hasUnreadAnnouncements() ? '<span class="settings-feature-dot announcement-unread-dot" aria-label="有新公告"></span>' : "";
+}
+
+function syncAnnouncementIndicators() {
+    const unread = hasUnreadAnnouncements();
+    panelShadowRoot?.querySelectorAll('[data-action="settings-open-announcements"]').forEach((button) => {
+        button.classList.toggle("has-unread-announcement", unread);
+        button.querySelector(".announcement-unread-dot")?.remove();
+        if (unread) button.insertAdjacentHTML("beforeend", renderAnnouncementUnreadDot());
+    });
+    const header = panelShadowRoot?.querySelector(".plugin-top-logo");
+    if (!header) return;
+    header.classList.toggle("has-announcement-hint", unread);
+    let hint = header.querySelector(".collapsed-announcement-hint");
+    if (unread && !hint) {
+        hint = document.createElement("span");
+        hint.className = "collapsed-announcement-hint";
+        hint.textContent = "有最新公告，请及时查看";
+        header.appendChild(hint);
+    } else if (!unread) {
+        hint?.remove();
+    }
+    renderNav();
+}
+
+async function hydrateAnnouncementReadState() {
+    const announcements = Array.isArray(appState.announcements) ? appState.announcements : [];
+    const storageKeys = announcements.map((item) => getAnnouncementDismissedStorageKey(item.key));
+    if (!storageKeys.length) return;
+    try {
+        const stored = await chrome.storage.local.get(storageKeys);
+        announcements.forEach((item) => {
+            if (stored?.[getAnnouncementDismissedStorageKey(item.key)] === true) {
+                appState.dismissedAnnouncementKeys.add(item.key);
+            }
+        });
+    } catch (_) {}
+}
+
+async function markAnnouncementsRead(keys = []) {
+    const normalizedKeys = [...new Set((Array.isArray(keys) ? keys : [keys])
+        .map((key) => String(key || "").trim().toLowerCase())
+        .filter(Boolean))];
+    if (!normalizedKeys.length) return;
+    const updates = {};
+    normalizedKeys.forEach((key) => {
+        appState.dismissedAnnouncementKeys.add(key);
+        updates[getAnnouncementDismissedStorageKey(key)] = true;
+    });
+    renderTopAnnouncement();
+    syncAnnouncementIndicators();
+    try {
+        await chrome.storage.local.set(updates);
+    } catch (_) {}
+}
+
+async function clearAnnouncementReadState() {
+    try {
+        const stored = await chrome.storage.local.get(null);
+        const keys = Object.keys(stored || {}).filter((key) => key.startsWith("topAnnouncementDismissed:"));
+        if (keys.length) await chrome.storage.local.remove(keys);
+        appState.dismissedAnnouncementKeys.clear();
+        await renderTopAnnouncement();
+        syncAnnouncementIndicators();
+        showToast(keys.length ? `已清除 ${keys.length} 条公告已读状态` : "当前没有公告已读状态");
+    } catch (error) {
+        showToast(error?.message || "清除公告已读状态失败");
+    }
+}
+
+function renderTopAnnouncementBanner(announcement) {
+    return `
+        <div class="plugin-top-announcement" role="status">
+            <button type="button" class="plugin-top-announcement-open" data-action="open-top-announcement" data-announcement-key="${escapeHtmlAttr(announcement.key)}" aria-label="查看${escapeHtmlAttr(announcement.title)}公告">
+                <span class="plugin-top-announcement-badge">公告</span>
+                <span class="plugin-top-announcement-text">${escapeHtml(announcement.summary || announcement.title)}</span>
+            </button>
+            <button type="button" class="plugin-top-announcement-close" data-action="dismiss-top-announcement" data-announcement-key="${escapeHtmlAttr(announcement.key)}" aria-label="关闭公告">×</button>
+        </div>
+    `;
+}
+
+async function renderTopAnnouncement() {
+    const slot = panelShadowRoot?.getElementById("plugin-top-announcement-slot");
+    if (!slot || slot.dataset.loading === "1") return;
+    const announcement = getTopBannerAnnouncement();
+    if (!announcement || appState.dismissedAnnouncementKeys.has(announcement.key)) {
+        slot.innerHTML = "";
+        return;
+    }
+    slot.dataset.loading = "1";
+    let shouldRenderAgain = false;
+    try {
+        const storageKey = getAnnouncementDismissedStorageKey(announcement.key);
+        const stored = await chrome.storage.local.get([storageKey]);
+        if (stored?.[storageKey] === true) appState.dismissedAnnouncementKeys.add(announcement.key);
+        const currentAnnouncement = getTopBannerAnnouncement();
+        if (!currentAnnouncement) {
+            slot.innerHTML = "";
+            return;
+        }
+        if (currentAnnouncement.key !== announcement.key) {
+            shouldRenderAgain = true;
+            return;
+        }
+        slot.innerHTML = appState.dismissedAnnouncementKeys.has(announcement.key)
+            ? ""
+            : renderTopAnnouncementBanner(currentAnnouncement);
+    } catch (_) {
+        const currentAnnouncement = getTopBannerAnnouncement();
+        slot.innerHTML = currentAnnouncement ? renderTopAnnouncementBanner(currentAnnouncement) : "";
+    } finally {
+        slot.dataset.loading = "0";
+        if (shouldRenderAgain) queueMicrotask(() => renderTopAnnouncement());
+    }
+}
+
+async function loadAnnouncements({ force = false } = {}) {
+    if (appState.announcementsLoadingPromise) return appState.announcementsLoadingPromise;
+    if (appState.announcementsLoaded && !force) return appState.announcements;
+    appState.announcementsLoadingPromise = chrome.runtime.sendMessage({ action: "GET_ANNOUNCEMENTS", force })
+        .then(async (result) => {
+            const state = result?.announcements || {};
+            appState.announcements = mergeAnnouncements(state.rows);
+            appState.announcementErrorText = String(state.errorText || "");
+            appState.announcementsLoaded = true;
+            await hydrateAnnouncementReadState();
+            renderTopAnnouncement();
+            syncAnnouncementIndicators();
+            return appState.announcements;
+        })
+        .catch(() => {
+            appState.announcements = mergeAnnouncements([]);
+            appState.announcementErrorText = "公告更新暂时不可用，已显示内置记录";
+            appState.announcementsLoaded = true;
+            syncAnnouncementIndicators();
+            return appState.announcements;
+        })
+        .finally(() => {
+            appState.announcementsLoadingPromise = null;
+        });
+    return appState.announcementsLoadingPromise;
+}
+
+async function dismissTopAnnouncement(key) {
+    const announcementKey = String(key || getTopBannerAnnouncement()?.key || "").trim().toLowerCase();
+    if (!announcementKey) return;
+    await markAnnouncementsRead([announcementKey]);
+}
+
+function closeTopAnnouncementModal() {
+    panelShadowRoot?.querySelector(".plugin-announcement-overlay")?.remove();
+}
+
+function formatAnnouncementDate(value) {
+    const date = new Date(String(value || ""));
+    if (!Number.isFinite(date.getTime())) return "";
+    return date.toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+}
+
+function renderAnnouncementHistoryItem(announcement, selectedKey = "") {
+    const selectedClass = announcement.key === selectedKey ? " is-selected" : "";
+    const dateText = formatAnnouncementDate(announcement.publishedAt || announcement.updatedAt);
+    const linkHtml = announcement.linkUrl
+        ? `<a class="plugin-announcement-item-link" href="${escapeHtmlAttr(announcement.linkUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(announcement.linkLabel || "查看详情")}</a>`
+        : "";
+    return `
+        <article class="plugin-announcement-item${selectedClass}">
+            <div class="plugin-announcement-item-meta"><span>公告</span>${dateText ? `<time>${escapeHtml(dateText)}</time>` : ""}</div>
+            <h3>${escapeHtml(announcement.title)}</h3>
+            <p>${escapeHtml(announcement.content)}</p>
+            ${linkHtml}
+        </article>
+    `;
+}
+
+function showAnnouncementCenter({ selectedKey = "", page = appState.announcementPage } = {}) {
+    closeTopAnnouncementModal();
+    const panel = panelShadowRoot?.querySelector(".ai-summary-plugin-box");
+    if (!panel) return;
+    const announcements = Array.isArray(appState.announcements) ? appState.announcements : [];
+    const selectedAnnouncement = selectedKey ? announcements.find((item) => item.key === selectedKey) : null;
+    const pageSize = 3;
+    const pageCount = Math.max(1, Math.ceil(announcements.length / pageSize));
+    const currentPage = Math.max(0, Math.min(Number(page || 0), pageCount - 1));
+    appState.announcementPage = currentPage;
+    const visibleAnnouncements = selectedAnnouncement
+        ? [selectedAnnouncement]
+        : announcements.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+    const rowsHtml = visibleAnnouncements.length
+        ? visibleAnnouncements.map((item) => renderAnnouncementHistoryItem(item, selectedKey)).join("")
+        : `<div class="plugin-announcement-empty">暂无公告</div>`;
+    const paginationHtml = !selectedAnnouncement && announcements.length > pageSize
+        ? `<div class="plugin-announcement-pagination"><button type="button" class="panel-btn ghost" data-action="announcement-page" data-page="${currentPage - 1}" ${currentPage <= 0 ? "disabled" : ""}>上一页</button><span>${currentPage + 1} / ${pageCount}</span><button type="button" class="panel-btn ghost" data-action="announcement-page" data-page="${currentPage + 1}" ${currentPage >= pageCount - 1 ? "disabled" : ""}>下一页</button></div>`
+        : "";
+    const errorHtml = appState.announcementErrorText
+        ? `<div class="plugin-announcement-status">${escapeHtml(appState.announcementErrorText)}</div>`
+        : "";
+    const overlay = document.createElement("div");
+    overlay.className = "release-notice-overlay plugin-announcement-overlay";
+    overlay.dataset.theme = resolveThemeMode();
+    overlay.innerHTML = `
+        <section class="release-notice-card plugin-announcement-card" role="dialog" aria-modal="true" aria-labelledby="plugin-announcement-title">
+            <button type="button" class="release-notice-close" data-action="close-top-announcement" aria-label="关闭公告">×</button>
+            <div class="release-notice-fixed-head">
+                <div class="release-notice-top">
+                    <span class="release-notice-badge">公告</span>
+                </div>
+                <h2 class="plugin-announcement-title" id="plugin-announcement-title">${selectedAnnouncement ? "公告详情" : "公告中心"}</h2>
+                ${selectedAnnouncement ? "" : '<p class="plugin-announcement-subtitle">查看 Bilitato 的功能通知与服务变更</p>'}
+            </div>
+            ${errorHtml}
+            <div class="plugin-announcement-history">${rowsHtml}</div>
+            ${paginationHtml}
+        </section>
+    `;
+    overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) closeTopAnnouncementModal();
+    });
+    panel.appendChild(overlay);
+    if (selectedKey) overlay.querySelector(".plugin-announcement-item.is-selected")?.scrollIntoView({ block: "nearest" });
+}
+
+async function openAnnouncementCenter({ selectedKey = "", forceRefresh = false } = {}) {
+    if (!selectedKey) appState.announcementPage = 0;
+    if (selectedKey) {
+        await markAnnouncementsRead([selectedKey]);
+    } else if (appState.announcementsLoaded) {
+        await markAnnouncementsRead(appState.announcements.map((item) => item.key));
+    }
+    showAnnouncementCenter({ selectedKey });
+    await loadAnnouncements({ force: forceRefresh });
+    if (!selectedKey) await markAnnouncementsRead(appState.announcements.map((item) => item.key));
+    showAnnouncementCenter({ selectedKey });
 }
 
 function showDebugVersionUpdateBadge() {
@@ -1732,10 +2060,11 @@ async function onInjectMessage(event) {
         const routeBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
         const routeP = String(getRoutePartId() || event.data?.p || event.data?.tid || "");
         if (isDuplicateSubtitleRouteSwitch(routeBvid, routeP)) return;
-        resetAllState();
-        const routeCid = Number(event.data?.cid || 0);
+        const routeCid = Number(event.data?.cid || getCurrentRouteCid() || 0);
+        const preserveReadySubtitle = shouldPreserveReadySubtitleForRoute(routeBvid, routeP, routeCid);
+        resetAllState({ preserveReadySubtitle });
         const routePartCount = Number(event.data?.partCount || 0);
-        beginSubtitleUiCycle(routeBvid, routeP);
+        if (!preserveReadySubtitle) beginSubtitleUiCycle(routeBvid, routeP);
         appState.routeWatchBvid = routeBvid;
         appState.routeWatchKey = getCurrentRouteVideoKey();
         appState.injectBvid = routeBvid;
@@ -1756,7 +2085,7 @@ async function onInjectMessage(event) {
             tid: getRoutePartId() || null,
             partCount: appState.injectPartCount
         }).catch(() => {});
-        clearCCListImmediately();
+        if (!preserveReadySubtitle) clearCCListImmediately();
         renderContent();
         waitForAlignedPlayInfo(routeBvid).catch(() => {});
         return;
@@ -2122,6 +2451,7 @@ async function waitPanelMount() {
                 </div>
                 <div class="progress-container"><div id="step-progress-bar" class="progress-bar"></div></div>
             </div>
+            <div class="plugin-top-announcement-slot" id="plugin-top-announcement-slot"></div>
             <div class="plugin-main-container">
                 <nav class="plugin-side-nav">
                     <div class="nav-group" id="nav-top"></div>
@@ -2274,7 +2604,7 @@ function markPluginDisplayFeatureSeen() {
     if (!shouldShowPluginDisplayFeatureDot()) return;
     const nextSettings = { ...(appState.settings || {}), pluginDisplayFeatureSeen: true };
     appState.settings = nextSettings;
-    panelShadowRoot?.querySelectorAll(".settings-feature-dot").forEach((node) => node.remove());
+    panelShadowRoot?.querySelectorAll(".plugin-display-feature-dot").forEach((node) => node.remove());
     renderNav();
     chrome.runtime.sendMessage({ action: "SAVE_SETTINGS", settings: nextSettings }).then((res) => {
         if (res?.settings) appState.settings = res.settings;
@@ -2325,6 +2655,10 @@ function clearCollapseFeedback(box) {
 
 function showCollapseLocationHint(box) {
     if (!box || appState.collapseHintShown) return;
+    if (hasUnreadAnnouncements()) {
+        syncAnnouncementIndicators();
+        return;
+    }
     appState.collapseHintShown = true;
     const header = box.querySelector(".plugin-top-logo");
     if (!header) return;
@@ -2765,6 +3099,9 @@ window.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener?.("change"
 function renderApp() {
     bindPanelDelegatedEvents();
     applyThemeMode();
+    renderTopAnnouncement();
+    syncAnnouncementIndicators();
+    loadAnnouncements().catch(() => {});
     renderNav();
     renderContent();
     renderTopRemaining();
@@ -2993,6 +3330,22 @@ function bindPanelDelegatedEvents() {
         const actionNode = event.target.closest("[data-action]");
         if (!actionNode) return;
         const action = actionNode.dataset.action;
+        if (action === "open-top-announcement") {
+            openAnnouncementCenter({ selectedKey: String(actionNode.dataset.announcementKey || "") });
+            return;
+        }
+        if (action === "dismiss-top-announcement") {
+            dismissTopAnnouncement(actionNode.dataset.announcementKey);
+            return;
+        }
+        if (action === "close-top-announcement") {
+            closeTopAnnouncementModal();
+            return;
+        }
+        if (action === "announcement-page") {
+            showAnnouncementCenter({ page: Number(actionNode.dataset.page || 0) });
+            return;
+        }
         if (action === "subtitle-load-retry") {
             retrySubtitleLoad();
             return;
@@ -3259,6 +3612,10 @@ function bindPanelDelegatedEvents() {
             showSetupGuide();
             return;
         }
+        if (action === "settings-open-announcements") {
+            openAnnouncementCenter({ forceRefresh: true });
+            return;
+        }
         if (action === "goto-setup-guide") {
             appState.activePage = "settings";
             renderNav();
@@ -3323,6 +3680,14 @@ function bindPanelDelegatedEvents() {
             showToast("已清空错误测试状态");
             return;
         }
+        if (action === "debug-preview-model-fallback-toast") {
+            showToast("当前模型当日额度已经耗尽，已自动切换到其他可用模型", { durationMs: 4200 });
+            return;
+        }
+        if (action === "debug-preview-gemini-retry-after-toast") {
+            showToast("当前模型触发限流，将在 12 秒后自动重试", { durationMs: 5000 });
+            return;
+        }
         if (action === "debug-show-release-notice") {
             recordDebugScenarioResult({
                 id: "release_notice",
@@ -3347,6 +3712,17 @@ function bindPanelDelegatedEvents() {
                 actual: "已显示更新入口"
             });
             showDebugVersionUpdateBadge();
+            return;
+        }
+        if (action === "debug-clear-announcement-read-state") {
+            clearAnnouncementReadState();
+            return;
+        }
+        if (action === "debug-copy-modelscope-response-headers") {
+            const rawHeaders = appState.modelScopeHeaderTest?.result?.rawHeaders || {};
+            navigator.clipboard.writeText(JSON.stringify(rawHeaders, null, 2))
+                .then(() => showToast("响应头 JSON 已复制"))
+                .catch(() => showToast("复制响应头失败"));
             return;
         }
         if (action === "debug-simulate-first-install") {
@@ -3540,7 +3916,7 @@ function renderNav() {
         node.dataset.buttonTooltip = item.label || item.id;
         node.setAttribute("aria-label", item.label || item.id);
         const existingDot = node.querySelector(".nav-red-dot");
-        if (item.id === "settings" && (hasFeedbackUnread() || shouldShowPluginDisplayFeatureDot())) {
+        if (item.id === "settings" && (hasFeedbackUnread() || shouldShowPluginDisplayFeatureDot() || hasUnreadAnnouncements())) {
             if (!existingDot) {
                 const dot = document.createElement("span");
                 dot.className = "nav-red-dot";
@@ -5484,7 +5860,10 @@ function renderSettings(panel) {
             <div class="settings-grid">
                 <div class="settings-group-title-row">
                     <div class="settings-group-title">主模型配置</div>
-                    <button type="button" class="panel-btn ghost settings-guide-btn" data-action="settings-open-guide">查看引导</button>
+                    <div class="settings-title-actions">
+                        <button type="button" class="panel-btn ghost settings-guide-btn" data-action="settings-open-guide">查看引导</button>
+                        <button type="button" class="panel-btn ghost settings-guide-btn${hasUnreadAnnouncements() ? " has-unread-announcement" : ""}" data-action="settings-open-announcements">查看公告${renderAnnouncementUnreadDot()}</button>
+                    </div>
                 </div>
                 <label>Provider</label>
                 <div class="settings-provider-row">
@@ -5622,7 +6001,7 @@ function renderSettings(panel) {
                 </div>
                 <button type="button" class="panel-btn ghost" data-action="settings-reset-prompts">恢复默认</button>
                 <div class="settings-group-title">调用与显示模式</div>
-                <label class="settings-feature-label">插件显示${shouldShowPluginDisplayFeatureDot() ? '<span class="settings-feature-dot" aria-label="新增功能"></span>' : ""}</label>
+                <label class="settings-feature-label">插件显示${shouldShowPluginDisplayFeatureDot() ? '<span class="settings-feature-dot plugin-display-feature-dot" aria-label="新增功能"></span>' : ""}</label>
                 ${renderCustomSelect("settings-plugin-display-mode", [
                     { value: "expanded", label: "默认展开" },
                     { value: "collapsed", label: "默认缩起" }
@@ -6056,6 +6435,9 @@ function renderLifecycleDemoControls() {
                 <button type="button" class="debug-scenario-row" data-action="debug-simulate-first-install">
                     <span><strong>首次安装体验</strong><small>打开首次安装引导</small></span><b>运行</b>
                 </button>
+                <button type="button" class="debug-scenario-row" data-action="debug-clear-announcement-read-state">
+                    <span><strong>清除公告已读状态</strong><small>重新显示公告红点、Banner 和缩起提示</small></span><b>清除</b>
+                </button>
             </div>
         </section>
     `;
@@ -6212,6 +6594,8 @@ function renderTaskRetryDebugPanel() {
                 <button type="button" class="panel-btn ghost" data-action="debug-run-segments-retry-test">测试字段结构错误</button>
                 <button type="button" class="panel-btn ghost" data-action="debug-run-segments-truncation-retry-test">测试截断后提高至 8192</button>
                 <button type="button" class="panel-btn ghost" data-action="debug-run-provider-429-retry-test">测试 429 自动重试</button>
+                <button type="button" class="panel-btn ghost" data-action="debug-preview-model-fallback-toast">预览模型降级气泡</button>
+                <button type="button" class="panel-btn ghost" data-action="debug-preview-gemini-retry-after-toast">预览 Gemini 等待气泡</button>
             </div>
             <div class="debug-state-grid">
                 <div><strong>任务状态：</strong>${escapeHtml(statusMap[taskStatus] || taskStatus)}</div>
@@ -6273,6 +6657,41 @@ function renderSummaryRetryDebugPanel() {
             <details class="debug-details">
                 <summary>最近阶段事件</summary>
                 ${eventListHtml}
+            </details>
+        </section>
+    `;
+}
+
+function renderModelScopeHeaderTestPanel() {
+    const test = appState.modelScopeHeaderTest;
+    const headers = Array.isArray(test?.result?.headers) ? test.result.headers : [];
+    const rateLimit = test?.result?.rateLimit || {};
+    const rawHeaders = test?.result?.rawHeaders || {};
+    const rawHeadersJson = JSON.stringify(rawHeaders, null, 2);
+    const statusText = test?.status === "running"
+        ? "请求中..."
+        : test?.status === "success"
+            ? `HTTP ${Number(test.result?.status || 200)} · ${Number(test.result?.durationMs || 0)} ms`
+            : test?.status === "error"
+                ? String(test.error || "测试失败")
+                : "尚未测试";
+    return `
+        <section class="debug-tool-card">
+            <div class="debug-tool-card-head">
+                <div><strong>ModelScope 响应头</strong><span>发送最小真实请求，检查官网是否返回额度字段</span></div>
+                <span class="debug-risk-badge network">真实请求 · 可能计费</span>
+            </div>
+            <button type="button" class="panel-btn ghost" data-action="debug-test-modelscope-response-headers" ${test?.status === "running" ? "disabled" : ""}>测试当前响应头</button>
+            <div class="debug-state-grid" style="margin-top:8px;">
+                <div><strong>状态：</strong>${escapeHtml(statusText)}</div>
+                <div><strong>模型：</strong>${escapeHtml(String(test?.result?.model || appState.settings?.model || "-"))}</div>
+                <div><strong>模型额度：</strong>${escapeHtml(formatMetricQuotaValue(rateLimit.modelRemaining, rateLimit.modelLimit))}</div>
+                <div><strong>账号额度：</strong>${escapeHtml(formatMetricQuotaValue(rateLimit.userRemaining, rateLimit.userLimit))}</div>
+            </div>
+            <details class="debug-details" ${test?.status === "success" ? "open" : ""}>
+                <summary>原始响应头 JSON（${headers.length}）</summary>
+                <div class="debug-card-actions" style="margin-top:8px;"><button type="button" class="panel-btn ghost" data-action="debug-copy-modelscope-response-headers" ${test?.status === "success" ? "" : "disabled"}>复制 JSON</button></div>
+                <pre class="debug-state-json">${escapeHtml(rawHeadersJson)}</pre>
             </details>
         </section>
     `;
@@ -6429,6 +6848,7 @@ function renderDebugOverviewPanel() {
 
 function renderDebugScenariosPanel() {
     return `
+        ${renderModelScopeHeaderTestPanel()}
         ${renderTaskRetryDebugPanel()}
         ${renderSummaryRetryDebugPanel()}
         ${renderErrorDemoControls()}
@@ -6509,6 +6929,24 @@ function renderDebugStatePanel() {
 }
 
 function bindSegmentPromptDebugControls(panel) {
+    const modelScopeHeaderButton = panel?.querySelector('[data-action="debug-test-modelscope-response-headers"]');
+    if (modelScopeHeaderButton) {
+        modelScopeHeaderButton.addEventListener("click", async () => {
+            if (!window.confirm("该测试会使用当前 ModelScope 配置发送一次最小真实请求，可能消耗一次额度。确定继续吗？")) return;
+            appState.modelScopeHeaderTest = { status: "running", result: null, error: "" };
+            renderContent();
+            try {
+                const response = await chrome.runtime.sendMessage({ action: "TEST_MODELSCOPE_RESPONSE_HEADERS" });
+                if (!response?.ok) throw new Error(response?.error || "响应头测试失败");
+                appState.modelScopeHeaderTest = { status: "success", result: response.result || {}, error: "" };
+                showToast("ModelScope 响应头读取完成");
+            } catch (error) {
+                appState.modelScopeHeaderTest = { status: "error", result: null, error: error?.message || "响应头测试失败" };
+                showToast(error?.message || "响应头测试失败");
+            }
+            renderContent();
+        });
+    }
     const liveRetryTests = [
         {
             selector: '[data-action="debug-run-segments-retry-test"]',
@@ -7146,10 +7584,10 @@ function pruneChatPendingByHistory(history) {
     appState.chatPending = appState.chatPending.filter((item) => !ids.has(String(item?.id || "")));
 }
 
-function resetPageStateByBvidSwitch() {
-    logSubtitleDiagnostic("clear_requested", { source: "resetPageStateByBvidSwitch" });
+function resetPageStateByBvidSwitch({ preserveReadySubtitle = false } = {}) {
+    logSubtitleDiagnostic("clear_requested", { source: "resetPageStateByBvidSwitch", preserveReadySubtitle });
     resetPanelCollapseForCurrentPart();
-    beginSubtitleUiCycle();
+    if (!preserveReadySubtitle) beginSubtitleUiCycle();
     appState.cache = null;
     appState.chatPending = [];
     appState.chatStreamingId = "";
@@ -7172,7 +7610,9 @@ function resetPageStateByBvidSwitch() {
     closeCopyMenu();
     closeSubtitleLanguageMenu();
     appState.chatAutoScrollPausedUntil = 0;
-    appState.subtitleCapturedBvid = "";
+    appState.subtitleCapturedBvid = preserveReadySubtitle
+        ? normalizeBvidCase(resolveCurrentBvid() || getBvidFromUrl(location.href) || "")
+        : "";
     appState.subtitleOptions = [];
     appState.subtitleOptionsBvid = "";
     appState.activeSubtitleId = "";
@@ -7192,7 +7632,7 @@ function resetPageStateByBvidSwitch() {
         appState.navActionActiveTimer = null;
     }
     appState.navActionActive = "";
-    appState.lastSubtitleForwardAt = 0;
+    if (!preserveReadySubtitle) appState.lastSubtitleForwardAt = 0;
     appState.subtitleTimeline = [];
     resetTranscriptionState();
     clearAsrSession();
@@ -7201,8 +7641,10 @@ function resetPageStateByBvidSwitch() {
     appState.transcriptionCapsuleVisible = false;
     appState.transcriptionCapsuleMeta = null;
     appState.asrRequestDispatched = false;
-    appState.subtitleDomDetected = false;
-    appState.subtitleObserveUntil = 0;
+    if (!preserveReadySubtitle) {
+        appState.subtitleDomDetected = false;
+        appState.subtitleObserveUntil = 0;
+    }
     appState.subtitleCheckTargetBvid = "";
     appState.expandedSummaryHeight = 0;
     appState.lastCacheSyncTime = 0;
@@ -7243,12 +7685,13 @@ function resetPageStateByBvidSwitch() {
         clearInterval(appState.transcribeCountdownTimer);
         appState.transcribeCountdownTimer = null;
     }
-    stopSubtitleObserver();
+    if (!preserveReadySubtitle) stopSubtitleObserver();
 }
 
-function resetAllState() {
-    logSubtitleDiagnostic("clear_requested", { source: "resetAllState" });
-    resetPageStateByBvidSwitch();
+function resetAllState(options = {}) {
+    const preserveReadySubtitle = options?.preserveReadySubtitle === true;
+    logSubtitleDiagnostic("clear_requested", { source: "resetAllState", preserveReadySubtitle });
+    resetPageStateByBvidSwitch({ preserveReadySubtitle });
     clearStreamCache();
     appState.renderedSubtitleIndex = -1;
     scheduleSubtitleRender("reset_all_state");
@@ -8793,7 +9236,7 @@ function startSubtitleCheckTimer() {
     }
     const bvid = normalizeBvidCase(getBvidFromUrl(location.href) || appState.injectBvid || "");
     const p = String(getRoutePartId() || "");
-    const routeKey = `${bvid.toLowerCase()}|${p}`;
+    const routeKey = `${bvid.toLowerCase()}|${normalizeComparablePartId(p)}`;
     if (subtitleUiCoordinator.phase === "idle" || subtitleUiCoordinator.routeKey !== routeKey) {
         beginSubtitleUiCycle(bvid, p);
     }
@@ -9773,7 +10216,7 @@ function hasUsableSubtitleCache(cache, targetBvid = "") {
 
 function getCurrentRouteVideoKey() {
     const bvid = normalizeBvidCase(getBvidFromUrl(location.href) || resolveCurrentBvid() || "");
-    const tid = getRoutePartId();
+    const tid = normalizeComparablePartId(getRoutePartId());
     return bvid ? `${bvid}|${tid}` : "";
 }
 
@@ -9787,15 +10230,15 @@ function getRoutePartId() {
 
 function getCurrentRouteCid() {
     const routeBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
-    const routeTid = getRoutePartId();
+    const routeTid = normalizeComparablePartId(getRoutePartId());
     const injectBvid = normalizeBvidCase(appState.injectBvid || "");
     const tabStateBvid = normalizeBvidCase(appState.tabState?.activeBvid || "");
-    const tabStateTid = String(appState.tabState?.activeTid || "").trim();
+    const tabStateTid = normalizeComparablePartId(appState.tabState?.activeTid);
     const playInfoBvid = normalizeBvidCase(appState.playInfo?._bvid || "");
     const candidates = [];
     if (!routeBvid || !injectBvid || routeBvid === injectBvid) candidates.push(appState.injectCid);
     if ((!routeBvid || (tabStateBvid && routeBvid === tabStateBvid))
-        && (routeTid ? (tabStateTid && routeTid === tabStateTid) : !tabStateTid)) {
+        && routeTid === tabStateTid) {
         candidates.push(appState.tabState?.activeCid);
     }
     if ((!routeBvid || (playInfoBvid && routeBvid === playInfoBvid))) candidates.push(appState.playInfo?._cid);
@@ -9885,8 +10328,7 @@ function isCacheForCurrentRouteVideo(cache, targetBvid = "") {
     if (!routeTid) return true;
 
     const cacheTid = String(cache?.tid || "").trim();
-    if (cacheTid) return cacheTid === routeTid;
-    return false;
+    return normalizeComparablePartId(cacheTid) === normalizeComparablePartId(routeTid);
 }
 
 function selectCacheDirectoryPart(cache, targetBvid = "", targetCid = 0) {
@@ -10467,7 +10909,9 @@ function startRouteWatcher() {
         appState.routeWatchBvid = current;
         appState.routeWatchKey = currentKey;
         pushSubtitleTimeline("route_switch", { from: prev, to: current, fromKey: prevKey, toKey: currentKey });
-        resetAllState();
+        const routeCid = getCurrentRouteCid();
+        const preserveReadySubtitle = shouldPreserveReadySubtitleForRoute(current, routeP, routeCid);
+        resetAllState({ preserveReadySubtitle });
         clearStreamCache();
         appState.pendingSubtitle = null;
         appState.activePage = resolveDefaultOpenPage(appState.settings?.defaultOpenPage);
@@ -10501,7 +10945,7 @@ function startRouteWatcher() {
         }).catch(() => {});
         startSubtitleCheckTimer();
         beginSubtitleObservation(current);
-        clearCCListImmediately();
+        if (!preserveReadySubtitle) clearCCListImmediately();
         renderContent();
         syncCacheFromBackground(current);
         refreshFeedbackAfterVideoSwitch();
@@ -11025,6 +11469,10 @@ function onSidePanelMessage(message, sender, sendResponse) {
             showSetupGuide();
             return {};
         }
+        if (command === "open-announcements") {
+            await openAnnouncementCenter({ forceRefresh: true });
+            return {};
+        }
         if (command === "switch-to-embedded") {
             setEmbeddedPanelVisible(true);
             const root = document.getElementById("__bili_ai_plugin_root__");
@@ -11063,7 +11511,7 @@ function onBackgroundMessage(message) {
     }
     if (action === "SHOW_TOAST") {
         const text = String(message?.text || message?.message || "").trim();
-        if (text) showToast(text);
+        if (text) showToast(text, { durationMs: Number(message?.durationMs || 0) });
         return false;
     }
     if (action === "TRANSCRIBE_STATUS") {

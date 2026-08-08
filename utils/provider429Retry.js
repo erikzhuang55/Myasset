@@ -13,6 +13,12 @@ export function isProvider429Error(error) {
 export function classifyProvider429Error(error) {
   if (!isProvider429Error(error)) return "not_429";
   const text = `${error?.message || ""}\n${error?.responseText || ""}`;
+  if (/credit(?:s)?\s+(?:balance\s+)?(?:exhausted|depleted)|insufficient[_\s-]*balance|no\s+(?:more\s+)?credits?/i.test(text)) {
+    return "credit_balance_exhausted";
+  }
+  if (/rate\s+limit\s+you\s+for\s+model|model.{0,80}(?:quota|limit|额度|配额).{0,40}(?:exceed|exhaust|used\s+up|耗尽|用尽|不足)|(?:quota|limit|额度|配额).{0,80}model/i.test(text)) {
+    return "model_quota_exhausted";
+  }
   if (/insufficient[_\s-]*(?:balance|quota)|exceeded\s+(?:your\s+)?current\s+quota|current\s+quota.{0,30}(?:exceed|exhaust)|billing\s+details/i.test(text)) {
     return "quota_exhausted";
   }
@@ -23,6 +29,23 @@ export function classifyProvider429Error(error) {
     return "rate_limited";
   }
   return "unknown_429";
+}
+
+export function resolveProviderRetryAfterMs(error, now = Date.now()) {
+  const directSeconds = Number(error?.retryAfterSec || 0);
+  if (directSeconds > 0) return Math.ceil(directSeconds * 1000);
+  const rawHeader = error?.responseHeaders?.get?.("retry-after")
+    || error?.responseHeaders?.get?.("Retry-After")
+    || "";
+  const headerSeconds = Number(rawHeader);
+  if (Number.isFinite(headerSeconds) && headerSeconds > 0) return Math.ceil(headerSeconds * 1000);
+  const headerDate = Date.parse(String(rawHeader || ""));
+  if (Number.isFinite(headerDate)) return Math.max(0, headerDate - Number(now || Date.now()));
+  const text = `${error?.message || ""}\n${error?.responseText || ""}`;
+  const match = text.match(/(?:please\s+)?retry\s+(?:after|in)\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec|seconds?)/i);
+  if (!match) return 0;
+  const value = Number(match[1] || 0);
+  return Math.ceil(value * (/^m/i.test(match[2] || "") ? 1 : 1000));
 }
 
 async function callHookSafely(hook, payload) {
@@ -68,7 +91,11 @@ export async function runWithProvider429Backoff(runAttempt, options = {}) {
       if (typeof options.shouldRetry === "function" && options.shouldRetry(error) === false) throw error;
       if (!firstError) firstError = error;
       const exhausted = attempt >= maxAttempts;
-      const nextDelayMs = exhausted ? 0 : delaysMs[attempt - 1];
+      const defaultDelayMs = exhausted ? 0 : delaysMs[attempt - 1];
+      const resolvedDelayMs = typeof options.getNextDelayMs === "function"
+        ? Number(options.getNextDelayMs(error, { attempt, maxAttempts, defaultDelayMs }) || 0)
+        : defaultDelayMs;
+      const nextDelayMs = exhausted ? 0 : Math.max(0, resolvedDelayMs);
       await callHookSafely(options.onRateLimit, {
         attempt,
         maxAttempts,

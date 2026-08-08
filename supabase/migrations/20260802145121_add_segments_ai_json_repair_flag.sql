@@ -5,4 +5,4 @@ set payload = jsonb_set(
   'true'::jsonb,
   true
 )
-where config_key = 'production';
+where config_key = 'production';;

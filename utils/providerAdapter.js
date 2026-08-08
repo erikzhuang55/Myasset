@@ -89,6 +89,49 @@ export const PROVIDERS = {
     }
 };
 
+function getKnownProviderModels(provider = {}) {
+    return new Set([
+        String(provider?.model || "").trim(),
+        ...(Array.isArray(provider?.models) ? provider.models : []).map((model) => String(model || "").trim())
+    ].filter(Boolean));
+}
+
+export function resolveProviderScopedModel(providerKey, settings = {}, providerCatalog = PROVIDERS) {
+    const currentProvider = String(providerKey || settings?.provider || "").trim().toLowerCase();
+    const providerModels = settings?.providerModels && typeof settings.providerModels === "object"
+        ? Object.fromEntries(Object.entries(settings.providerModels).map(([key, value]) => [
+            String(key || "").trim().toLowerCase(),
+            String(value || "").trim()
+        ]).filter(([key]) => key))
+        : {};
+    const scopedModel = String(providerModels[currentProvider] || "").trim();
+    const globalModel = String(settings?.model || "").trim();
+    let model = scopedModel || globalModel;
+
+    if (currentProvider !== "custom") {
+        const currentModels = getKnownProviderModels(providerCatalog?.[currentProvider]);
+        const knownForCurrentProvider = currentModels.has(model);
+        const knownForOtherProvider = !knownForCurrentProvider && !!model && Object.entries(providerCatalog || {}).some(([key, provider]) => (
+            String(key || "").trim().toLowerCase() !== currentProvider
+            && String(key || "").trim().toLowerCase() !== "custom"
+            && getKnownProviderModels(provider).has(model)
+        ));
+        const savedForOtherProvider = !knownForCurrentProvider && !!model && Object.entries(providerModels).some(([key, value]) => (
+            key !== currentProvider && key !== "custom" && value === model
+        ));
+        if (!model || knownForOtherProvider || savedForOtherProvider) {
+            model = String(providerCatalog?.[currentProvider]?.model || "").trim();
+        }
+    }
+
+    if (currentProvider && model) providerModels[currentProvider] = model;
+    return {
+        model,
+        providerModels,
+        repaired: model !== (scopedModel || globalModel)
+    };
+}
+
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [700, 1600];
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
 
@@ -370,7 +413,10 @@ function resolveProviderRequest(providerKey, config, messages, streaming) {
     const baseUrl = isCustom
         ? String(config.customBaseUrl || "").trim()
         : (provider.baseUrl || "").trim();
-    const model = (config.model && config.model.trim() !== "") ? config.model : provider.model;
+    const { model } = resolveProviderScopedModel(providerKey || config.provider, config, {
+        ...PROVIDERS,
+        ...providerCatalog
+    });
     const apiKey = config.apiKey || "";
     if (!baseUrl) throw new Error("自定义 Provider 需要填写 Base URL");
     if (!model) throw new Error("请填写模型名称");

@@ -248,3 +248,5 @@ revoke all on function public.get_usage_dashboard_filters_v1(integer, text, text
 revoke all on function public.get_usage_dashboard_filters_v1(integer, text, text, text) from anon;
 revoke all on function public.get_usage_dashboard_filters_v1(integer, text, text, text) from authenticated;
 grant execute on function public.get_usage_dashboard_filters_v1(integer, text, text, text) to service_role;
+
+;

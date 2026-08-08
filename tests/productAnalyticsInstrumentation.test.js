@@ -12,7 +12,11 @@ describe("product analytics instrumentation", () => {
     expect(background).toContain('eventName: "task_attempt_failed"');
     expect(background).toContain('eventName: "task_recovery_finished"');
     expect(background).toContain('"summary_empty_retry"');
-    expect(background).toContain('strategy: "local_json_extract"');
+    expect(background).not.toContain('strategy: "local_json_extract"');
+    expect(background).not.toContain('"segments_local_json_repair"');
+    expect(background).toContain("function parseSegmentsJSON");
+    expect(background).toContain("if (!isStrictModelScopeProvider(settings)) return robustJSONParse(responseText)");
+    expect(background).toContain('"分段 JSON/字段异常，直接切换 ModelScope 备用模型"');
     expect(background).toContain('strategy = "ai_json_repair"');
     expect(background).toContain("markSegmentsAIRepairAttempted(taskContext)");
     expect(background).toContain('strategy: strategy === "primary" ? "primary_retry"');
@@ -77,6 +81,10 @@ describe("product analytics instrumentation", () => {
     expect(background).toContain("reasoning_chars:");
     expect(background).toContain("raw_response:");
     expect(background).toContain('source: "summary_retry_empty"');
+    expect(background).toContain("function isModelScopeStoppedEmptySummary");
+    expect(background).toContain('diagnostics.finish_reason.trim().toLowerCase() === "stop"');
+    expect(background).toContain('diagnostics.content_state.trim().toLowerCase() === "empty"');
+    expect(background).toContain('"总结正文为空，直接切换 ModelScope 备用模型"');
   });
 
   it("turns off DeepSeek V4 thinking only for a length-truncated reasoning retry", () => {

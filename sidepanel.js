@@ -44,7 +44,8 @@ const state = {
     activePartKey: "",
     switchingToEmbedded: false,
     summaryDraftExpiryTimer: null,
-    summaryDraftExpiryAt: 0
+    summaryDraftExpiryAt: 0,
+    announcementsUnread: false
 };
 
 const app = document.getElementById("app");
@@ -177,6 +178,29 @@ function getAsrApiKeyRequirement(settings = {}) {
 function renderVersionUpdateBadge() {
     if (!state.versionState?.hasUpdate) return "";
     return `<button type="button" class="version-update-badge" data-action="open-extension-management" data-tooltip="跳转插件页后请在左上角找到“更新”按钮以更新插件" data-tooltip-placement="bottom">有可用版本更新</button>`;
+}
+
+function getAnnouncementDismissedStorageKey(key) {
+    return `topAnnouncementDismissed:${String(key || "").trim().toLowerCase()}`;
+}
+
+function renderAnnouncementUnreadDot() {
+    return state.announcementsUnread ? '<span class="settings-feature-dot announcement-unread-dot" aria-label="有新公告"></span>' : "";
+}
+
+async function refreshAnnouncementUnreadState({ force = false } = {}) {
+    try {
+        const response = await chrome.runtime.sendMessage({ action: "GET_ANNOUNCEMENTS", force });
+        const rows = Array.isArray(response?.announcements?.rows) ? response.announcements.rows : [];
+        const keys = [...new Set(rows.map((item) => String(item?.announcement_key || item?.key || "").trim().toLowerCase()).filter(Boolean))];
+        const storageKeys = keys.map(getAnnouncementDismissedStorageKey);
+        const stored = storageKeys.length ? await chrome.storage.local.get(storageKeys) : {};
+        const unread = keys.some((key) => stored?.[getAnnouncementDismissedStorageKey(key)] !== true);
+        if (unread !== state.announcementsUnread) {
+            state.announcementsUnread = unread;
+            render();
+        }
+    } catch (_) {}
 }
 
 function normalizeAsrBaseUrlInput(value, fallback) {
@@ -357,6 +381,7 @@ async function refreshState({ quiet = false, hydrate = false, refreshFeedback = 
             render();
         }
         checkLatestVersionAvailability().catch(() => {});
+        if (hydrate) refreshAnnouncementUnreadState().catch(() => {});
     } catch (error) {
         if (!quiet) state.error = error?.message || "读取失败";
         render();
@@ -419,7 +444,9 @@ function showToast(text) {
 function navButton(id, file, label) {
     const active = state.activePage === id;
     const src = `${UI_BASE}/${active ? "active" : "default"}/${file}`;
-    const showSettingsDot = Number(state.feedback?.unreadCount || 0) > 0 || state.settings?.pluginDisplayFeatureSeen === false;
+    const showSettingsDot = Number(state.feedback?.unreadCount || 0) > 0
+        || state.settings?.pluginDisplayFeatureSeen === false
+        || state.announcementsUnread;
     const dot = id === "settings" && showSettingsDot ? `<span class="nav-red-dot"></span>` : "";
     return `<button class="side-nav-item ${active ? "active" : ""}" data-nav="${id}" data-id="${id}" data-tooltip="${escapeHtml(label)}" data-tooltip-placement="right" aria-label="${escapeHtml(label)}"><img class="loaded" src="${src}" alt="">${dot}</button>`;
 }
@@ -526,8 +553,8 @@ function enhanceSettingsSelects() {
 function markPluginDisplayFeatureSeen() {
     if (state.settings?.pluginDisplayFeatureSeen !== false) return;
     state.settings = { ...state.settings, pluginDisplayFeatureSeen: true };
-    document.querySelector(".settings-feature-dot")?.remove();
-    if (Number(state.feedback?.unreadCount || 0) <= 0) {
+    document.querySelector(".plugin-display-feature-dot")?.remove();
+    if (Number(state.feedback?.unreadCount || 0) <= 0 && !state.announcementsUnread) {
         document.querySelector('.side-nav-item[data-id="settings"] .nav-red-dot')?.remove();
     }
     scheduleSettingsSave();
@@ -1067,7 +1094,7 @@ function renderSettings() {
         ${statusHtml()}
         <div class="settings-scroll-body"><div class="settings-grid">
             <div class="settings-group">
-                <div class="settings-group-title-row"><div class="settings-group-title">主模型配置</div><button type="button" class="panel-btn ghost settings-guide-btn" data-action="open-setup-guide">查看引导</button></div>
+                <div class="settings-group-title-row"><div class="settings-group-title">主模型配置</div><div class="settings-title-actions"><button type="button" class="panel-btn ghost settings-guide-btn" data-action="open-setup-guide">查看引导</button><button type="button" class="panel-btn ghost settings-guide-btn${state.announcementsUnread ? " has-unread-announcement" : ""}" data-action="open-announcements">查看公告${renderAnnouncementUnreadDot()}</button></div></div>
                 <div class="field"><label>Provider ${providerNote ? `<span id="setting-provider-tag" class="provider-tag">${escapeHtml(providerNote)}</span>` : `<span id="setting-provider-tag" class="provider-tag settings-hidden"></span>`}</label><div class="settings-provider-row"><select id="setting-provider">${providerOptions}</select><button id="setting-provider-register" type="button" class="panel-btn ghost" data-action="open-register" data-url="${escapeHtml(provider?.regUrl || "")}" ${provider?.regUrl ? "" : "disabled"}>注册</button></div></div>
                 <div class="field"><label>API Key</label>${secretField("setting-api-key", settings.apiKey, "示例：sk-xxxxx")}</div>
                 <div class="field"><label class="settings-label-with-info">Model${modelLabelInfo}</label>${providerModels.length ? `<select id="setting-model-select">${modelOptions}<option value="custom" ${modelIsPreset ? "" : "selected"}>自定义</option></select>` : ""}<input id="setting-model" class="${providerModels.length && modelIsPreset ? "settings-hidden" : ""}" value="${escapeHtml(currentModel)}" placeholder="请输入模型名"></div>
@@ -1098,7 +1125,7 @@ function renderSettings() {
             </div>
             <div class="settings-group">
                 <div class="settings-group-title">调用与显示</div>
-                <div class="field"><label class="settings-feature-label">插件显示${settings.pluginDisplayFeatureSeen === false ? '<span class="settings-feature-dot" aria-label="新增功能"></span>' : ""}</label><select id="setting-plugin-display-mode"><option value="expanded" ${settings.pluginDisplayMode !== "collapsed" ? "selected" : ""}>默认展开</option><option value="collapsed" ${settings.pluginDisplayMode === "collapsed" ? "selected" : ""}>默认缩起</option></select></div>
+                <div class="field"><label class="settings-feature-label">插件显示${settings.pluginDisplayFeatureSeen === false ? '<span class="settings-feature-dot plugin-display-feature-dot" aria-label="新增功能"></span>' : ""}</label><select id="setting-plugin-display-mode"><option value="expanded" ${settings.pluginDisplayMode !== "collapsed" ? "selected" : ""}>默认展开</option><option value="collapsed" ${settings.pluginDisplayMode === "collapsed" ? "selected" : ""}>默认缩起</option></select></div>
                 <div class="field"><label>深/浅模式</label><select id="setting-theme-mode"><option value="system" ${settings.themeMode !== "light" && settings.themeMode !== "dark" ? "selected" : ""}>跟随系统</option><option value="light" ${settings.themeMode === "light" ? "selected" : ""}>浅色模式</option><option value="dark" ${settings.themeMode === "dark" ? "selected" : ""}>深色模式</option></select></div>
                 <div class="field"><label>默认页面</label><select id="setting-default-page">${["CC", "summary", "chat", "real"].map((key) => `<option value="${key}" ${settings.defaultOpenPage === key ? "selected" : ""}>${{CC:"字幕",summary:"总结",chat:"聊天",real:"验真"}[key]}</option>`).join("")}</select></div>
                 <div class="field"><label>调用模式</label><select id="setting-pref-mode"><option value="quality" ${settings.prefMode !== "efficiency" ? "selected" : ""}>高速模式</option><option value="efficiency" ${settings.prefMode === "efficiency" ? "selected" : ""}>省流模式</option></select></div>
@@ -1758,6 +1785,12 @@ async function handleAction(actionNode) {
         window.close();
         return;
     }
+    if (action === "open-announcements") {
+        await contentAction("open-announcements");
+        state.announcementsUnread = false;
+        window.close();
+        return;
+    }
     if (action === "goto-setup-guide") {
         state.activePage = "settings";
         render();
@@ -2061,6 +2094,9 @@ app.addEventListener("keydown", (event) => {
 });
 
 chrome.storage.onChanged.addListener((changes) => {
+    if (Object.keys(changes || {}).some((key) => key.startsWith("topAnnouncementDismissed:"))) {
+        refreshAnnouncementUnreadState().catch(() => {});
+    }
     if (Object.keys(changes || {}).some((key) => key === "settings" || key === "cloudReadDisabledBvids" || key.startsWith("cache_") || key.startsWith("tabState_"))) {
         refreshState({ quiet: true });
     }

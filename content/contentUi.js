@@ -17,7 +17,7 @@
         }, 1000);
     }
 
-    function showToast(text) {
+    function showToast(text, options = {}) {
         let toast = document.querySelector(".plugin-toast");
         if (!toast) {
             toast = document.createElement("div");
@@ -26,7 +26,12 @@
         }
         toast.textContent = text;
         toast.classList.add("show");
-        setTimeout(() => toast.classList.remove("show"), 1400);
+        if (toast._hideTimer) clearTimeout(toast._hideTimer);
+        const requestedDuration = Number(options?.durationMs || 0);
+        const durationMs = requestedDuration > 0
+            ? requestedDuration
+            : Math.max(1400, Math.min(5000, String(text || "").length * 90));
+        toast._hideTimer = setTimeout(() => toast.classList.remove("show"), durationMs);
     }
 
     globalThis.BilitatoContentUi = {

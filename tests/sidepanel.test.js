@@ -15,7 +15,8 @@ const sidepanelCss = readFileSync(new URL("../sidepanel.css", import.meta.url), 
 const offscreen = readFileSync(new URL("../offscreen.js", import.meta.url), "utf8");
 const inject = readFileSync(new URL("../inject.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const videoCacheCidMigration = readFileSync(new URL("../supabase/migrations/20260710095455_add_cid_isolation_to_video_cache.sql", import.meta.url), "utf8");
-const controlledVideoCacheMigration = readFileSync(new URL("../supabase/migrations/20260806030000_add_controlled_video_cache_upsert.sql", import.meta.url), "utf8");
+const controlledVideoCacheMigration = readFileSync(new URL("../supabase/migrations/20260805185947_add_controlled_video_cache_upsert.sql", import.meta.url), "utf8");
+const announcementsMigration = readFileSync(new URL("../supabase/migrations/20260807203733_add_extension_announcements.sql", import.meta.url), "utf8");
 
 describe("native side panel", () => {
   it("declares the Chrome side panel entry and permissions", () => {
@@ -70,7 +71,7 @@ describe("native side panel", () => {
   });
 
   it("checks database driven update availability without frequent polling", () => {
-    expect(manifest.version).toBe("1.6.2");
+    expect(manifest.version).toBe("1.6.3");
     expect(background).toContain('msg.action === "CHECK_LATEST_VERSION"');
     expect(background).toContain('msg.action === "OPEN_EXTENSION_MANAGEMENT"');
     expect(background).toContain("VERSION_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000");
@@ -91,7 +92,13 @@ describe("native side panel", () => {
     expect(sidepanel).not.toContain("有可用版本更新 v${latest}");
   });
 
-  it("ships the 1.6.2 release notice pages", () => {
+  it("ships the 1.6.3 release notice pages", () => {
+    expect(releaseNotice).toContain('"1.6.3"');
+    expect(releaseNotice).toContain("Bilitato 已更新至 v1.6.3");
+    expect(releaseNotice).toContain("修复分 P 字幕切换闪烁");
+    expect(releaseNotice).toContain("修复其他 Provider 错用 Qwen 降级");
+    expect(releaseNotice).toContain("新增公告中心");
+    expect(releaseNotice).toContain('majorHistory.push("1.6.3", "1.6.2", "1.6.1"');
     expect(releaseNotice).toContain('"1.6.2"');
     expect(releaseNotice).toContain("Bilitato 已更新至 v1.6.2");
     expect(releaseNotice).toContain("兜底机制大修复");
@@ -373,7 +380,7 @@ describe("native side panel", () => {
   });
 
   it("delegates full resets to the shared page reset", () => {
-    expect(content).toMatch(/function resetAllState\(\) \{[\s\S]*?resetPageStateByBvidSwitch\(\);[\s\S]*?clearStreamCache\(\);/);
+    expect(content).toMatch(/function resetAllState\(options = \{\}\) \{[\s\S]*?resetPageStateByBvidSwitch\(\{ preserveReadySubtitle \}\);[\s\S]*?clearStreamCache\(\);/);
   });
 
   it("allows the cached Chinese CC variant to replace the injected display", () => {
@@ -655,11 +662,45 @@ describe("native side panel", () => {
     expect(contentCss).toContain(".ai-summary-plugin-box.is-collapsed .native-side-panel-btn");
     expect(content).toContain("shouldShowPluginDisplayFeatureDot()");
     expect(content).toContain("markPluginDisplayFeatureSeen()");
-    expect(content).toContain('class="settings-feature-dot"');
+    expect(content).toContain('class="settings-feature-dot plugin-display-feature-dot"');
     expect(sidepanel).toContain("state.settings?.pluginDisplayFeatureSeen === false");
     expect(sidepanel).toContain('select.id === "setting-plugin-display-mode"');
     expect(sidepanel).toContain("function markPluginDisplayFeatureSeen()");
     expect(sidepanelCss).toContain(".settings-feature-dot");
+  });
+
+  it("supports remote announcement history with a dismissible title banner", () => {
+    expect(content).toContain('id="plugin-top-announcement-slot"');
+    expect(content).toContain('data-action="open-top-announcement"');
+    expect(content).toContain('data-action="dismiss-top-announcement"');
+    expect(content).toContain('data-action="close-top-announcement"');
+    expect(content).toContain('data-action="announcement-page"');
+    expect(content).toContain('const pageSize = 3');
+    expect(content).toContain('selectedAnnouncement\n        ? [selectedAnnouncement]');
+    expect(content).toContain('await markAnnouncementsRead([selectedKey])');
+    expect(content).toContain('有最新公告，请及时查看');
+    expect(content).toContain('announcement-unread-dot');
+    expect(content).toContain('hasFeedbackUnread() || shouldShowPluginDisplayFeatureDot() || hasUnreadAnnouncements()');
+    expect(content).toContain('topAnnouncementDismissed:${String(key || "").trim().toLowerCase()}');
+    expect(content).toContain('action: "GET_ANNOUNCEMENTS"');
+    expect(content).toContain('data-action="settings-open-announcements"');
+    expect(sidepanel).toContain('data-action="open-announcements"');
+    expect(sidepanel).toContain('announcementsUnread: false');
+    expect(sidepanel).toContain('refreshAnnouncementUnreadState');
+    expect(sidepanel).toContain('|| state.announcementsUnread');
+    expect(background).toContain('SUPABASE_ANNOUNCEMENTS_TABLE = "extension_announcements"');
+    expect(background).toContain('ANNOUNCEMENT_CACHE_TTL_MS = 6 * 60 * 60 * 1000');
+    expect(background).toContain('msg.action === "GET_ANNOUNCEMENTS"');
+    expect(content).toContain('https://modelscope.cn/my/overview');
+    expect(content).toContain('每日登录赠送200魔粒');
+    expect(contentCss).toContain('.ai-summary-plugin-box.is-collapsed .plugin-top-announcement-slot');
+    expect(contentCss).toContain('.plugin-announcement-overlay[data-theme="dark"] .plugin-announcement-item');
+    expect(announcementsMigration).toContain('create table if not exists public.extension_announcements');
+    expect(announcementsMigration).toContain('alter table public.extension_announcements enable row level security');
+    expect(announcementsMigration).toContain('to anon, authenticated');
+    expect(announcementsMigration).toContain('using (is_published = true)');
+    expect(announcementsMigration).toContain("'test_release_notice_2026_08'");
+    expect(announcementsMigration).toContain("'test_service_notice_2026_08'");
   });
 
   it("supports a configurable Groq Base URL for regular and chunked transcription", () => {

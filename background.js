@@ -1,6 +1,6 @@
 import SubtitleProcessor from "./utils/subtitleProcessor.js";
 import { robustJSONParse } from "./utils/jsonParse.js";
-import { callAI, callAIStream, PROVIDERS } from "./utils/providerAdapter.js";
+import { callAI, callAIStream, PROVIDERS, resolveProviderScopedModel } from "./utils/providerAdapter.js";
 import {
     DEFAULT_REMOTE_CONFIG,
     isRemoteConfigCacheFresh,
@@ -15,7 +15,8 @@ import {
     normalizeModelScopeQuotaLedger,
     selectModelScopeFallbackModel,
     updateModelScopeQuotaLedger,
-    shouldUseImmediateModelScopeFallback
+    shouldUseImmediateModelScopeFallback,
+    isStrictModelScopeProvider
 } from "./utils/modelScopeFallback.js";
 import {
     MAX_SEGMENTS_REPAIR_INPUT_CHARS,
@@ -57,7 +58,11 @@ import { createAppError, createHttpError, serializeAppError } from "./utils/appE
 import { isSupabaseEnabled, supabaseRpc, supabaseSelect, supabaseWrite } from "./utils/supabaseClient.js";
 import { reportUsageEvent } from "./utils/usageEvents.js";
 import { createProviderRequestTiming } from "./utils/providerRequestTiming.js";
-import { runWithProvider429Backoff } from "./utils/provider429Retry.js";
+import {
+    classifyProvider429Error,
+    resolveProviderRetryAfterMs,
+    runWithProvider429Backoff
+} from "./utils/provider429Retry.js";
 import "./logger.js";
 
 let IS_DEBUG_MODE = false;
@@ -870,6 +875,86 @@ async function writeCachedFeedbackState(state) {
     } catch (_) {}
 }
 
+function normalizeAnnouncementRow(row = {}) {
+    const key = String(row.announcement_key || row.key || "").trim().toLowerCase();
+    const linkUrl = String(row.link_url || row.linkUrl || "").trim();
+    return {
+        key: /^[a-z0-9][a-z0-9_-]{0,79}$/.test(key) ? key : "",
+        title: String(row.title || "").trim().slice(0, 120),
+        summary: String(row.summary || "").trim().slice(0, 240),
+        content: String(row.content || "").trim().slice(0, 5000),
+        linkUrl: /^https:\/\//i.test(linkUrl) ? linkUrl.slice(0, 500) : "",
+        linkLabel: String(row.link_label || row.linkLabel || "").trim().slice(0, 60),
+        showBanner: row.show_banner !== false && row.showBanner !== false,
+        publishedAt: String(row.published_at || row.publishedAt || ""),
+        updatedAt: String(row.updated_at || row.updatedAt || "")
+    };
+}
+
+async function readCachedAnnouncementState() {
+    try {
+        const stored = await chrome.storage.local.get([ANNOUNCEMENT_CACHE_STORAGE_KEY]);
+        const cache = stored?.[ANNOUNCEMENT_CACHE_STORAGE_KEY];
+        if (!cache) return null;
+        return {
+            rows: Array.isArray(cache.rows) ? cache.rows.map(normalizeAnnouncementRow).filter((row) => row.key && row.title && row.content) : [],
+            fetchedAt: Number(cache.fetchedAt || 0),
+            enabled: true,
+            errorText: ""
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
+async function writeCachedAnnouncementState(state) {
+    try {
+        await chrome.storage.local.set({
+            [ANNOUNCEMENT_CACHE_STORAGE_KEY]: {
+                rows: Array.isArray(state?.rows) ? state.rows : [],
+                fetchedAt: Number(state?.fetchedAt || Date.now())
+            }
+        });
+    } catch (_) {}
+}
+
+async function fetchAnnouncementState(settings, { force = false } = {}) {
+    const cached = await readCachedAnnouncementState();
+    const cacheFresh = cached && Date.now() - Number(cached.fetchedAt || 0) < ANNOUNCEMENT_CACHE_TTL_MS;
+    if (!force && cacheFresh) return cached;
+    if (!isSupabaseEnabled(settings)) {
+        return cached || { rows: [], fetchedAt: 0, enabled: false, errorText: "公告服务暂时不可用" };
+    }
+    try {
+        const rows = await supabaseSelect(settings, SUPABASE_ANNOUNCEMENTS_TABLE, {
+            select: "announcement_key,title,summary,content,link_url,link_label,show_banner,published_at,updated_at",
+            is_published: "eq.true",
+            published_at: `lte.${new Date().toISOString()}`,
+            order: "published_at.desc"
+        }, {
+            requestName: "supabase_select:extension_announcements",
+            errorMessage: "读取公告失败"
+        });
+        const state = {
+            rows: rows.map(normalizeAnnouncementRow).filter((row) => row.key && row.title && row.content),
+            fetchedAt: Date.now(),
+            enabled: true,
+            errorText: ""
+        };
+        await writeCachedAnnouncementState(state);
+        return state;
+    } catch (error) {
+        logBackground.warn("announcement_select_unavailable", {
+            task: "announcement",
+            code: error?.code || "",
+            detail: { error_message: error?.message || "读取公告失败" }
+        });
+        return cached
+            ? { ...cached, errorText: "公告更新暂时不可用，已显示本地记录" }
+            : { rows: [], fetchedAt: 0, enabled: false, errorText: "公告服务暂时不可用" };
+    }
+}
+
 async function fetchFeedbackState(settings, { markSeen = false, force = false } = {}) {
     if (!isSupabaseEnabled(settings)) {
         return { rows: [], unreadCount: 0, clientId: "", enabled: false };
@@ -1023,6 +1108,9 @@ const SUPABASE_DEFAULT_VIDEO_CACHE_TABLE = "video_cache";
 const SUPABASE_DEFAULT_FEEDBACK_TABLE = "feedback";
 const FEEDBACK_CACHE_STORAGE_KEY = "feedbackStateCache";
 const FEEDBACK_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const SUPABASE_ANNOUNCEMENTS_TABLE = "extension_announcements";
+const ANNOUNCEMENT_CACHE_STORAGE_KEY = "announcementStateCache";
+const ANNOUNCEMENT_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const SUPABASE_DEFAULT_USAGE_DAILY_RPC = "increment_feature_usage_daily";
 const SUPABASE_DEFAULT_VERSION_TABLE = "extension_versions";
 const SUPABASE_REMOTE_CONFIG_TABLE = "extension_remote_config";
@@ -1428,6 +1516,58 @@ function registerModelScopeRateLimitObserver() {
 
 registerModelScopeRateLimitObserver();
 
+function serializeSafeResponseHeaders(headers) {
+    const blocked = /^(?:set-cookie|set-cookie2|authorization|proxy-authorization)$/i;
+    const rows = [];
+    if (headers && typeof headers.forEach === "function") {
+        headers.forEach((value, name) => {
+            if (blocked.test(String(name || ""))) return;
+            rows.push({
+                name: String(name || "").toLowerCase(),
+                value: String(value || "").slice(0, 500)
+            });
+        });
+    }
+    return rows.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function responseHeadersToJson(headers) {
+    return Object.fromEntries(serializeSafeResponseHeaders(headers).map((item) => [item.name, item.value]));
+}
+
+async function testModelScopeResponseHeaders() {
+    const settings = await getResolvedSettings();
+    if (String(settings?.provider || "").toLowerCase() !== "modelscope") {
+        throw createAppError("CONFIG_REQUIRED", "请先在设置中选择 ModelScope，再运行响应头测试");
+    }
+    if (!String(settings?.apiKey || "").trim()) {
+        throw createAppError("MISSING_API_KEY", "请先填写 ModelScope API Token");
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort("timeout"), 30000);
+    const startedAt = Date.now();
+    try {
+        const result = await callAI("modelscope", {
+            ...settings,
+            maxOutputTokens: 16
+        }, [{ role: "user", content: "Reply with OK only." }], controller.signal);
+        const rateLimit = resolveRateLimitInfo(settings, result?.headers, { allowObservedFallback: false });
+        if (hasModelScopeRateLimitInfo(rateLimit)) await rememberModelScopeRateLimit(settings, rateLimit);
+        return {
+            provider: "modelscope",
+            model: String(settings?.model || ""),
+            status: 200,
+            durationMs: Date.now() - startedAt,
+            headers: serializeSafeResponseHeaders(result?.headers),
+            rawHeaders: responseHeadersToJson(result?.headers),
+            rateLimit,
+            usage: result?.usage || null
+        };
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
 async function getModelScopeQuotaLedger() {
     if (modelScopeQuotaLedgerMemory) {
         modelScopeQuotaLedgerMemory = normalizeModelScopeQuotaLedger(modelScopeQuotaLedgerMemory);
@@ -1560,7 +1700,7 @@ async function reportModelScopeFallbackFinished(settings, options, triggerError,
 
 async function tryModelScopeFallback(settings, options, triggerError, runFallback) {
     if (options?.disableModelFallback
-        || String(settings?.provider || "").toLowerCase() !== "modelscope"
+        || !isStrictModelScopeProvider(settings)
         || !isRemoteFeatureEnabled(remoteConfigMemory, "modelscope_model_fallback", true)
         || remoteConfigMemory?.modelFallback?.enabled === false) {
         return null;
@@ -1604,8 +1744,24 @@ async function tryModelScopeFallback(settings, options, triggerError, runFallbac
         });
         return null;
     }
-    const fallbackSettings = { ...settings, model: fallbackModel };
+    const fallbackSettings = {
+        ...settings,
+        model: fallbackModel,
+        providerModels: {
+            ...(settings?.providerModels || {}),
+            modelscope: fallbackModel
+        }
+    };
     await reportModelScopeFallbackInitial(settings, options, triggerError, fallbackModel, classification.reason);
+    if (["quota_exhausted", "model_quota_exhausted"].includes(classification.reason)) {
+        try {
+            await chrome.tabs.sendMessage(options?.tabId, {
+                action: "SHOW_TOAST",
+                text: "当前模型当日额度已经耗尽，已自动切换到其他可用模型",
+                durationMs: 4200
+            });
+        } catch (_) {}
+    }
     logAI.warn("model_fallback_started", {
         task: component,
         provider: "modelscope",
@@ -2251,6 +2407,13 @@ async function handleMessage(msg, sender) {
             debugForceFirstSegmentsFailure: true
         }, requestedBvid);
         return {};
+    }
+    if (msg.action === "GET_ANNOUNCEMENTS") {
+        const settings = await getResolvedSettings();
+        return { announcements: await fetchAnnouncementState(settings, { force: !!msg.force }) };
+    }
+    if (msg.action === "TEST_MODELSCOPE_RESPONSE_HEADERS") {
+        return { result: await testModelScopeResponseHeaders() };
     }
     if (msg.action === "RUN_SEGMENTS_TRUNCATION_RETRY_TEST") {
         if (!tabId) throw new Error("tabId 缺失");
@@ -5288,6 +5451,14 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
         let summaryText = sanitizeSummaryOutput(aiRes.text);
         if (consumeDebugForceFirstSummaryEmpty(taskContext)) {
             summaryText = "";
+            aiRes = {
+                ...aiRes,
+                responseMeta: {
+                    ...(aiRes.responseMeta || {}),
+                    finishReason: "stop",
+                    contentState: "empty"
+                }
+            };
             await recordSummaryRetryDebugState(taskContext.tabId, {
                 status: "retrying",
                 stage: "empty_detected",
@@ -5325,7 +5496,7 @@ async function requestTaskResult(bvid, task, settings, taskContext = {}) {
         }, "主响应已返回，开始解析分段");
         const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
             ? null
-            : robustJSONParse(aiRes.text);
+            : parseSegmentsJSON(aiRes.text, settings);
         let finalParsed = parsed;
         let compactRetryNormalized = null;
         if (finalParsed) {
@@ -5621,6 +5792,13 @@ function getSummaryEmptyResponseDiagnostics(aiRes = {}) {
     };
 }
 
+function isModelScopeStoppedEmptySummary(settings = {}, aiRes = {}) {
+    if (!isStrictModelScopeProvider(settings)) return false;
+    const diagnostics = getSummaryEmptyResponseDiagnostics(aiRes);
+    return diagnostics.finish_reason.trim().toLowerCase() === "stop"
+        && diagnostics.content_state.trim().toLowerCase() === "empty";
+}
+
 function logSummaryEmptyResponse({ settings, bvid, mode, source, aiRes } = {}) {
     logAI.warn("summary_empty_response", {
         bvid,
@@ -5692,6 +5870,84 @@ async function retryEmptySummaryOnce({ settings, prompt, tabId, bvid, mode, requ
         logSummaryEmptyResponse({ settings, bvid, mode, source: "initial", aiRes: initialAIResponse });
     }
     if (!isRemoteFeatureEnabled(settings?.remoteConfig, "summary_empty_retry", true)) throw triggerError;
+    const runSummaryRequest = async (requestSettings, requestOptions = {}) => {
+        let streamedSummaryText = "";
+        const messages = [{ role: "user", content: prompt }];
+        const aiRes = requestStream
+            ? await callAIWithTimeoutStream(requestSettings, messages, TASK_TIMEOUT_MS, (delta) => {
+                streamedSummaryText += String(delta || "");
+            }, null, { tabId, taskContext, component: "summary", bvid, ...requestOptions })
+            : await callAIWithTimeout(requestSettings, messages, TASK_TIMEOUT_MS, {
+                bypassQueue: true,
+                tabId,
+                taskContext,
+                component: "summary",
+                bvid,
+                ...requestOptions
+            });
+        return {
+            aiRes,
+            summaryText: sanitizeSummaryOutput(aiRes.text || streamedSummaryText)
+        };
+    };
+    if (!thinkingDisabledForRetry && isModelScopeStoppedEmptySummary(settings, initialAIResponse)) {
+        await recordSummaryRetryDebugState(tabId, {
+            status: "retrying",
+            stage: "model_fallback",
+            attempt: 1,
+            total: 1,
+            code: triggerError.code || "SUMMARY_EMPTY_RESPONSE",
+            mode,
+            message: "总结正文为空，正在切换 ModelScope 备用模型"
+        }, "总结正文为空，直接切换 ModelScope 备用模型").catch(() => {});
+        try {
+            const fallbackResult = await tryModelScopeFallback(
+                settings,
+                { tabId, taskContext, component: "summary", bvid },
+                triggerError,
+                async (fallbackSettings) => {
+                    const retried = await runSummaryRequest(fallbackSettings, {
+                        disableModelFallback: true,
+                        disableProvider429Retry: true
+                    });
+                    if (!retried.summaryText) {
+                        throw createSummaryEmptyError({
+                            settings: fallbackSettings,
+                            bvid,
+                            mode,
+                            source: "summary_model_fallback_empty",
+                            aiRes: retried.aiRes
+                        });
+                    }
+                    return { ...retried.aiRes, text: retried.summaryText };
+                }
+            );
+            if (fallbackResult) {
+                const summaryText = sanitizeSummaryOutput(fallbackResult.text);
+                await recordSummaryRetryDebugState(tabId, {
+                    status: "recovered",
+                    stage: "recovered",
+                    attempt: 1,
+                    total: 1,
+                    code: "",
+                    mode,
+                    message: "备用模型已生成总结"
+                }, "ModelScope 备用模型已修复总结空响应").catch(() => {});
+                return { aiRes: fallbackResult, summaryText };
+            }
+        } catch (error) {
+            await recordSummaryRetryDebugState(tabId, {
+                status: "retry_failed",
+                stage: "retry_failed",
+                attempt: 1,
+                total: 1,
+                code: String(error?.code || "SUMMARY_EMPTY_RESPONSE"),
+                mode,
+                message: error?.message || "备用模型仍未返回总结"
+            }, `ModelScope 备用模型重试失败：${String(error?.code || "SUMMARY_EMPTY_RESPONSE")}`).catch(() => {});
+            throw error;
+        }
+    }
     await reportTaskInitialFailure({
         settings,
         taskContext,
@@ -5725,14 +5981,8 @@ async function retryEmptySummaryOnce({ settings, prompt, tabId, bvid, mode, requ
     }, thinkingDisabledForRetry ? "DeepSeek V4 输出截断，关闭思考进行第 1/1 次重试" : "开始第 1/1 次总结空响应自动重试").catch(() => {});
     const recoveryStartedAt = Date.now();
     try {
-        let streamedSummaryText = "";
-        const messages = [{ role: "user", content: prompt }];
-        const aiRes = requestStream
-            ? await callAIWithTimeoutStream(retrySettings, messages, TASK_TIMEOUT_MS, (delta) => {
-                streamedSummaryText += String(delta || "");
-            }, null, { tabId, taskContext, component: "summary", bvid })
-            : await callAIWithTimeout(retrySettings, messages, TASK_TIMEOUT_MS, { bypassQueue: true, tabId, taskContext, component: "summary", bvid });
-        const summaryText = sanitizeSummaryOutput(aiRes.text || streamedSummaryText);
+        const retried = await runSummaryRequest(retrySettings);
+        const { aiRes, summaryText } = retried;
         if (!summaryText) {
             logSummaryEmptyResponse({ settings, bvid, mode, source: "retry", aiRes });
             throw createSummaryEmptyError({
@@ -5821,6 +6071,21 @@ const AUTO_RETRY_SEGMENT_ERROR_CODES = new Set([
 
 function shouldAutoRetrySegmentsError(error) {
     return AUTO_RETRY_SEGMENT_ERROR_CODES.has(String(error?.code || ""));
+}
+
+function parseSegmentsJSON(responseText, settings = {}) {
+    if (!isStrictModelScopeProvider(settings)) return robustJSONParse(responseText);
+    const content = String(responseText || "")
+        .trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/i, "")
+        .trim();
+    if (!content) return null;
+    try {
+        return JSON.parse(content);
+    } catch (_) {
+        return null;
+    }
 }
 
 function canRepairSegmentsResponseWithAI(error) {
@@ -6104,7 +6369,7 @@ function buildPrimarySegmentsPrompt({ settings, cache, subtitleText, mode, guide
     };
 }
 
-async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, taskContext, mode, originalError }) {
+async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, taskContext, mode, originalError, disableModelFallback = false }) {
     const compactSubtitle = buildCompactSegmentsSubtitlePayload(cache, MAX_SEGMENTS_SUBTITLE_CHARS);
     if (!compactSubtitle) throw originalError || createSegmentsParseError("");
     const promptTaskContext = { ...taskContext, noSubtitleTimestamps: isNoTimestampSubtitleCache(cache) };
@@ -6121,10 +6386,17 @@ async function retrySegmentsWithCompactPrompt({ tabId, bvid, cache, settings, ta
             prompt_chars: compactPrompt.length
         }
     });
-    const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: compactPrompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId, taskContext, component: "segments", bvid });
+    const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: compactPrompt }], TASK_TIMEOUT_MS, {
+        bypassQueue: true,
+        tabId,
+        taskContext,
+        component: "segments",
+        bvid,
+        disableModelFallback
+    });
     const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
         ? null
-        : robustJSONParse(aiRes.text);
+            : parseSegmentsJSON(aiRes.text, settings);
     if (!parsed) {
         const parseError = attachSentryContext(
             createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
@@ -6227,7 +6499,7 @@ async function retrySegmentsWithAIRepair({ tabId, bvid, cache, settings, mode, o
     );
     const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
         ? null
-        : robustJSONParse(aiRes.text);
+        : parseSegmentsJSON(aiRes.text, settings);
     if (!parsed) {
         throw attachSentryContext(
             createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
@@ -6324,7 +6596,7 @@ async function retrySegmentsWithPrimaryPrompt({
     const aiRes = await callAIWithTimeout(settings, [{ role: "user", content: segmentPromptPlan.prompt }], TASK_TIMEOUT_MS, { bypassQueue: true, tabId, taskContext, component: "segments", bvid });
     const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
         ? null
-        : robustJSONParse(aiRes.text);
+        : parseSegmentsJSON(aiRes.text, settings);
     if (!parsed) {
         const parseError = attachSentryContext(
             createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
@@ -6411,6 +6683,49 @@ async function retrySegmentsWithAutoFallbacks({
         error: latestError,
         durationMs: initialDurationMs
     });
+    const structuredOutputError = [
+        "SEGMENTS_JSON_PARSE_FAILED",
+        "SEGMENTS_INVALID_SCHEMA",
+        "SEGMENTS_EMPTY_LIST",
+        "SEGMENTS_MISSING_PROTOCOL"
+    ].includes(String(latestError?.code || ""));
+    if (structuredOutputError && isStrictModelScopeProvider(settings)) {
+        await recordSegmentsDebugState(tabId, {
+            status: "retrying",
+            stage: "model_fallback",
+            strategy: "model_fallback",
+            attempt: 1,
+            total: 1,
+            code: String(latestError?.code || ""),
+            mode,
+            message: "分段格式异常，正在切换备用模型重试"
+        }, "分段 JSON/字段异常，直接切换 ModelScope 备用模型");
+        const fallbackResult = await tryModelScopeFallback(
+            settings,
+            { tabId, taskContext, component: "segments", bvid },
+            latestError,
+            (fallbackSettings) => retrySegmentsWithCompactPrompt({
+                tabId,
+                bvid,
+                cache,
+                settings: fallbackSettings,
+                taskContext,
+                mode,
+                originalError: latestError,
+                disableModelFallback: true
+            })
+        );
+        if (Array.isArray(fallbackResult) && fallbackResult.length) {
+            await recordSegmentsDebugState(tabId, {
+                status: "recovered",
+                stage: "recovered",
+                strategy: "model_fallback",
+                message: "备用模型已生成有效分段"
+            }, "ModelScope 备用模型重试成功");
+            return fallbackResult;
+        }
+        throw latestError;
+    }
     let primaryUsed = false;
     let expandedTokensUsed = false;
     let compactUsed = false;
@@ -6608,7 +6923,19 @@ function resolveUsageStatusByError(error) {
 }
 
 function resolveUsageErrorCode(error, fallback = "UNKNOWN") {
-    return String(error?.code || fallback || "UNKNOWN").trim() || "UNKNOWN";
+    const originalCode = String(error?.code || fallback || "UNKNOWN").trim() || "UNKNOWN";
+    const normalizedCode = originalCode.toUpperCase();
+    if (normalizedCode.startsWith("HTTP_429_")) return originalCode;
+    if (normalizedCode !== "HTTP_429" && Number(error?.status || 0) !== 429) return originalCode;
+    const reason = classifyProvider429Error(error);
+    return ({
+        credit_balance_exhausted: "HTTP_429_CREDIT_EXHAUSTED",
+        model_quota_exhausted: "HTTP_429_MODEL_QUOTA_EXHAUSTED",
+        quota_exhausted: "HTTP_429_INSUFFICIENT_QUOTA",
+        queue_overloaded: "HTTP_429_QUEUE_EXCEEDED",
+        rate_limited: "HTTP_429_RATE_LIMIT",
+        unknown_429: "HTTP_429_UNKNOWN"
+    })[reason] || originalCode;
 }
 
 function isNonSoftwareTaskBlocker(error) {
@@ -6626,7 +6953,7 @@ function isNonSoftwareTaskBlocker(error) {
         "ASR_RATE_LIMIT",
         "CUSTOM_PROVIDER_AUTH_REQUIRED",
         "CUSTOM_PROVIDER_BASE_URL_REQUIRED"
-    ].includes(code) || [401, 402, 403, 429].includes(status);
+    ].includes(code) || code.startsWith("HTTP_429_") || [401, 402, 403, 429].includes(status);
 }
 
 function resolveTaskOutcomeCategory(error, status = "") {
@@ -6942,7 +7269,7 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                 }, "quality 主响应已返回，开始解析分段");
                 const parsed = isLikelyTruncatedSegmentOutput(aiRes.text, aiRes.metrics, aiRes.responseMeta)
                     ? null
-                    : robustJSONParse(aiRes.text);
+                    : parseSegmentsJSON(aiRes.text, settings);
                 if (!parsed) {
                     throw attachSentryContext(
                         createSegmentsParseError(aiRes.text, aiRes.metrics, aiRes.responseMeta),
@@ -7226,7 +7553,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
             }, "efficiency 联合响应已返回，开始解析分段");
             const parsed = isLikelyTruncatedSegmentOutput(segmentsSection.content, aiRes.metrics, aiRes.responseMeta)
                 ? null
-                : robustJSONParse(segmentsSection.content);
+                : parseSegmentsJSON(segmentsSection.content, settings);
             if (!parsed) {
                 segmentsFailureError = attachSentryContext(
                     createSegmentsParseError(segmentsSection.content, aiRes.metrics, aiRes.responseMeta),
@@ -7282,47 +7609,6 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                 }
             }
         }
-        if (!segmentsResolved
-            && String(segmentsFailureError?.code || "") !== "SEGMENTS_OUTPUT_TRUNCATED"
-            && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_local_json_repair", true)) {
-            const jsonMatch = fullText.match(/\[\s*\{[\s\S]*?\}\s*\]/);
-            if (jsonMatch) {
-                const localRepairStartedAt = Date.now();
-                const localRepairTrigger = segmentsFailureError || createSegmentsMissingProtocolError(fullText, aiRes.metrics, aiRes.responseMeta);
-                await reportTaskInitialFailure({
-                    settings,
-                    taskContext,
-                    component: "segments",
-                    bvid,
-                    error: localRepairTrigger,
-                    durationMs: aiRes.metrics?.latencyMs || 0
-                });
-                const parsed = robustJSONParse(jsonMatch[0]);
-                const normalized = normalizeSegments(parsed, cache, { bvid, task: "segments", mode: "efficiency", fallback: "loose_json_array" });
-                if (normalized.length) {
-                    results.segments = { ok: true, data: normalized, error: null };
-                    segmentsResolved = true;
-                    segmentsFailureError = null;
-                    logSegmentQualitySummary(bvid, normalized, cache, {
-                        task: "segments",
-                        mode: "efficiency",
-                        fallback: "loose_json_array",
-                        subtitlePayload: getSubtitlePayloadMeta(cache, subtitleText, subtitlePayloadOptions)
-                    });
-                }
-                await reportTaskRecoveryFinished({
-                    settings,
-                    taskContext,
-                    component: "segments",
-                    bvid,
-                    strategy: "local_json_extract",
-                    triggerError: localRepairTrigger,
-                    resultError: normalized.length ? null : createSegmentsNormalizeError(parsed),
-                    success: normalized.length > 0,
-                    durationMs: Date.now() - localRepairStartedAt
-                });
-            }
-        }
         if (!segmentsResolved && !segmentsFailureError) {
             segmentsFailureError = attachSentryContext(
                 createSegmentsMissingProtocolError(fullText, aiRes.metrics, aiRes.responseMeta),
@@ -7351,6 +7637,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
         }
         if (!segmentsResolved
             && !hasAttemptedSegmentsAIRepair(taskContext)
+            && !isStrictModelScopeProvider(settings)
             && canRepairSegmentsResponseWithAI(segmentsFailureError)
             && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_ai_json_repair", true)) {
             await reportTaskInitialFailure({
@@ -7431,6 +7718,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
         }
         if (!segmentsResolved
             && String(segmentsFailureError?.code || "") !== "SEGMENTS_OUTPUT_TRUNCATED"
+            && !isStrictModelScopeProvider(settings)
             && isRemoteFeatureEnabled(settings?.remoteConfig, "segments_primary_retry", true)) {
             await reportTaskInitialFailure({
                 settings,
@@ -7462,7 +7750,7 @@ async function runSummarySegmentsInEfficiency(tabId, bvid, force, settings, task
                 fallbackRecoveryMetrics = fallbackRes.metrics || {};
                 const parsed = isLikelyTruncatedSegmentOutput(fallbackRes.text, fallbackRes.metrics, fallbackRes.responseMeta)
                     ? null
-                    : robustJSONParse(fallbackRes.text);
+                    : parseSegmentsJSON(fallbackRes.text, settings);
                 if (!parsed) {
                     const fallbackParseError = attachSentryContext(
                         createSegmentsParseError(fallbackRes.text, fallbackRes.metrics, fallbackRes.responseMeta),
@@ -8512,6 +8800,9 @@ async function waitForProvider429RetryDelay(delayMs, tabId) {
 
 async function runAIRequestWith429Backoff(settings, options, runAttempt) {
     const isDebugSimulation = options?.taskContext?.debugForceProvider429Retries === true;
+    const provider = String(settings?.provider || "").toLowerCase();
+    const isGeminiRetryAfterFlow = provider === "gemini" && !isDebugSimulation;
+    const isModelScopeRetryFlow = isStrictModelScopeProvider(settings) && !isDebugSimulation;
     if (options?.disableProvider429Retry) {
         return runAttempt({ attempt: 1, maxAttempts: 1 });
     }
@@ -8524,15 +8815,24 @@ async function runAIRequestWith429Backoff(settings, options, runAttempt) {
         }
         return runAttempt(attemptContext);
     }, {
-        shouldRetry: (error) => !(String(settings?.provider || "").toLowerCase() === "modelscope"
-            && shouldUseImmediateModelScopeFallback(error)),
+        delaysMs: isGeminiRetryAfterFlow ? [0] : (isModelScopeRetryFlow ? [2000] : undefined),
+        shouldRetry: (error) => {
+            if (provider === "modelscope" && shouldUseImmediateModelScopeFallback(error)) return false;
+            if (isGeminiRetryAfterFlow) return resolveProviderRetryAfterMs(error) > 0;
+            return true;
+        },
+        getNextDelayMs: isGeminiRetryAfterFlow
+            ? (error) => resolveProviderRetryAfterMs(error)
+            : undefined,
         wait: (delayMs) => waitForProvider429RetryDelay(delayMs, options?.tabId),
         onRateLimit: async (event) => {
             if (event?.error && typeof event.error === "object") {
                 event.error.requestAttempt = Number(event.attempt || 0);
                 event.error.requestMaxAttempts = Number(event.maxAttempts || 0);
-                event.error.retryDelaysMs = [2000, 5000, 10000];
-                event.error.retryStrategy = "provider_429_backoff";
+                event.error.retryDelaysMs = isGeminiRetryAfterFlow
+                    ? [Number(event?.nextDelayMs || 0)]
+                    : (isModelScopeRetryFlow ? [2000] : [2000, 5000, 10000]);
+                event.error.retryStrategy = isGeminiRetryAfterFlow ? "gemini_retry_after" : "provider_429_backoff";
             }
             logAI.warn("provider_429_retry", {
                 task: String(options?.component || "ai"),
@@ -8562,6 +8862,16 @@ async function runAIRequestWith429Backoff(settings, options, runAttempt) {
                     ? "模拟 429 自动重试已耗尽"
                     : `模拟第 ${Number(event?.attempt || 0)} 次 429，等待 ${Number(event?.nextDelayMs || 0) / 1000} 秒`);
                 return;
+            }
+            if (isGeminiRetryAfterFlow && !event?.exhausted && Number(event?.nextDelayMs || 0) > 0) {
+                const waitSeconds = Math.max(1, Math.ceil(Number(event.nextDelayMs) / 1000));
+                try {
+                    await chrome.tabs.sendMessage(options?.tabId, {
+                        action: "SHOW_TOAST",
+                        text: `当前模型触发限流，将在 ${waitSeconds} 秒后自动重试`,
+                        durationMs: Math.min(5000, Math.max(1800, Number(event.nextDelayMs)))
+                    });
+                } catch (_) {}
             }
             await reportProvider429RetryAttempt(settings, options, event);
         },
@@ -9679,7 +9989,7 @@ function isEqualJSON(a, b) {
     }
 }
 
-function normalizeSettings(settings) {
+function normalizeSettings(settings, providerCatalog = PROVIDERS) {
     const base = settings && typeof settings === "object" ? { ...settings } : {};
     delete base.remoteConfig;
     delete base.providerCatalog;
@@ -9702,12 +10012,18 @@ function normalizeSettings(settings) {
         String(value || "").trim()
     ]).filter(([key]) => key));
     const rawModel = String(base.model || DEFAULT_SETTINGS.model || "").trim();
-    const model = provider === "modelscope" && LEGACY_MODELSCOPE_MODELS.has(rawModel)
+    const legacyNormalizedModel = provider === "modelscope" && LEGACY_MODELSCOPE_MODELS.has(rawModel)
         ? DEFAULT_SETTINGS.model
         : rawModel;
     if (LEGACY_MODELSCOPE_MODELS.has(String(providerModels.modelscope || "").trim())) {
         providerModels.modelscope = DEFAULT_SETTINGS.model;
     }
+    const resolvedProviderModel = resolveProviderScopedModel(provider, {
+        ...base,
+        model: legacyNormalizedModel,
+        providerModels
+    }, providerCatalog);
+    const model = resolvedProviderModel.model;
     const requestedAsrProvider = String(base.asrProvider || DEFAULT_SETTINGS.asrProvider || "groq").toLowerCase();
     const asrProvider = ["groq", "siliconflow", "mimo"].includes(requestedAsrProvider) ? requestedAsrProvider : "groq";
     const apiKey = String(providerApiKeys[provider] || base.apiKey || "").trim();
@@ -9756,7 +10072,7 @@ function normalizeSettings(settings) {
         debugMode: !!base.debugMode,
         apiKey,
         providerApiKeys,
-        providerModels,
+        providerModels: resolvedProviderModel.providerModels,
         model,
         sentryEnabled,
         sentryDsn,
@@ -10509,7 +10825,19 @@ function withPromptSettings(settings, promptSettings) {
 async function getResolvedSettings() {
     const remoteConfig = await ensureRemoteConfigLoaded();
     const { settings } = await chrome.storage.local.get(["settings"]);
-    const normalizedSettings = normalizeSettings(settings);
+    const provider = String(settings?.provider || DEFAULT_SETTINGS.provider || "modelscope").trim() || "modelscope";
+    const providerCatalog = buildEffectiveProviderCatalog(PROVIDERS, remoteConfig, provider);
+    const normalizedSettings = normalizeSettings(settings, providerCatalog);
+    const storedProviderModel = String(settings?.providerModels?.[provider] || "").trim();
+    if (String(settings?.model || "").trim() !== normalizedSettings.model
+        || storedProviderModel !== String(normalizedSettings.providerModels?.[provider] || "").trim()) {
+        await chrome.storage.local.set({ settings: normalizedSettings });
+        logBackground.info("storage_update", {
+            source: "provider_model_repair",
+            provider,
+            model: normalizedSettings.model
+        });
+    }
     const { promptSettings } = await chrome.storage.sync.get(["promptSettings"]);
     let normalizedPromptSettings = normalizePromptSettings(promptSettings || DEFAULT_PROMPT_SETTINGS);
     if (!promptSettings && settings?.prompts && typeof settings.prompts === "object") {
@@ -10523,7 +10851,7 @@ async function getResolvedSettings() {
     return withPromptSettings({
         ...normalizedSettings,
         remoteConfig,
-        providerCatalog: buildEffectiveProviderCatalog(PROVIDERS, remoteConfig, normalizedSettings.provider)
+        providerCatalog
     }, normalizedPromptSettings);
 }
 

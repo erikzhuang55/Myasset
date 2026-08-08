@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { callAI, callAIStream } from "../utils/providerAdapter.js";
+import { callAI, callAIStream, resolveProviderScopedModel } from "../utils/providerAdapter.js";
 
 function mockJsonResponse(body, ok = true, status = 200) {
   return {
@@ -14,6 +14,70 @@ function mockJsonResponse(body, ok = true, status = 200) {
 describe("providerAdapter", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("prefers the model saved for the active provider", () => {
+    const result = resolveProviderScopedModel("gemini", {
+      provider: "gemini",
+      model: "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      providerModels: {
+        modelscope: "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        gemini: "gemini-2.5-flash"
+      }
+    });
+
+    expect(result.model).toBe("gemini-2.5-flash");
+    expect(result.providerModels.gemini).toBe("gemini-2.5-flash");
+  });
+
+  it("repairs a known ModelScope model left under Gemini", () => {
+    const result = resolveProviderScopedModel("gemini", {
+      provider: "gemini",
+      model: "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      providerModels: {
+        modelscope: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+      }
+    });
+
+    expect(result.model).toBe("gemini-2.0-flash");
+    expect(result.providerModels.gemini).toBe("gemini-2.0-flash");
+    expect(result.repaired).toBe(true);
+  });
+
+  it("repairs a foreign model again at the request boundary", async () => {
+    const fetchMock = vi.fn(async () => mockJsonResponse({
+      candidates: [{ content: { parts: [{ text: "已修复" }] }, finishReason: "STOP" }]
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await callAI("gemini", {
+      provider: "gemini",
+      apiKey: "gemini-key",
+      model: "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      providerModels: { modelscope: "Qwen/Qwen3-30B-A3B-Instruct-2507" }
+    }, [{ role: "user", content: "test" }]);
+
+    expect(fetchMock.mock.calls[0][0]).toContain("/models/gemini-2.0-flash:generateContent");
+  });
+
+  it("preserves an unknown custom model for a built-in provider", () => {
+    const result = resolveProviderScopedModel("gemini", {
+      provider: "gemini",
+      model: "gemini-experimental-user-model"
+    });
+
+    expect(result.model).toBe("gemini-experimental-user-model");
+    expect(result.repaired).toBe(false);
+  });
+
+  it("never rewrites a custom provider model", () => {
+    const result = resolveProviderScopedModel("custom", {
+      provider: "custom",
+      model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    });
+
+    expect(result.model).toBe("Qwen/Qwen3-30B-A3B-Instruct-2507");
+    expect(result.repaired).toBe(false);
   });
 
   it("builds OpenAI-compatible chat completion requests", async () => {
