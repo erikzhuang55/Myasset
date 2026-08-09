@@ -1,6 +1,6 @@
 {
   "name": "bilitato",
-  "version": "1.6.3",
+  "version": "1.6.4",
   "private": true,
   "type": "module",
   "scripts": {
@@ -20,6 +20,7 @@
     "esbuild": "0.28.1",
     "fflate": "^0.8.2",
     "husky": "^9.1.7",
+    "supabase": "^2.113.0",
     "vitest": "^3.2.4"
   },
   "dependencies": {

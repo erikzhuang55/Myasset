@@ -10,13 +10,13 @@ const DEFAULT_FEATURE_FLAGS = Object.freeze({
 
 const DEFAULT_MODELSCOPE_FALLBACK = Object.freeze({
   enabled: true,
-  maxAttempts: 1,
+  maxAttempts: 4,
   tasks: Object.freeze({
-    default: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
-    summary: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
-    segments: Object.freeze(["Qwen/Qwen3-Coder-30B-A3B-Instruct", "Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
-    rumors: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
-    chat: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B"]),
+    default: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B-Instruct-2507", "deepseek-ai/DeepSeek-V4-Flash-0731", "deepseek-ai/DeepSeek-V4-Pro"]),
+    summary: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B-Instruct-2507", "deepseek-ai/DeepSeek-V4-Flash-0731", "deepseek-ai/DeepSeek-V4-Pro"]),
+    segments: Object.freeze(["Qwen/Qwen3-Coder-30B-A3B-Instruct", "Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B-Instruct-2507", "deepseek-ai/DeepSeek-V4-Flash-0731"]),
+    rumors: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B-Instruct-2507", "deepseek-ai/DeepSeek-V4-Flash-0731"]),
+    chat: Object.freeze(["Qwen/Qwen3-30B-A3B-Instruct-2507", "Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B-Instruct-2507", "deepseek-ai/DeepSeek-V4-Flash-0731"]),
   }),
 });
 
@@ -112,7 +112,9 @@ function normalizeModelFallback(value = {}) {
   }));
   return {
     enabled: incoming.enabled !== false,
-    maxAttempts: 1,
+    maxAttempts: Math.min(6, Math.max(1, Math.floor(Number(
+      incoming.max_attempts ?? incoming.maxAttempts ?? DEFAULT_MODELSCOPE_FALLBACK.maxAttempts,
+    )) || DEFAULT_MODELSCOPE_FALLBACK.maxAttempts)),
     tasks,
   };
 }

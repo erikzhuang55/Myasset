@@ -111,11 +111,14 @@ export function selectModelScopeFallbackModel({
   availableModels = [],
   fallbackConfig = {},
   ledger: rawLedger = {},
+  excludedModels = [],
   now = Date.now(),
 } = {}) {
   const ledger = normalizeModelScopeQuotaLedger(rawLedger, now);
-  if (ledger.user.remaining === 0) return null;
   const currentKey = cleanText(currentModel).toLowerCase();
+  const excludedKeys = new Set((Array.isArray(excludedModels) ? excludedModels : [])
+    .map((model) => cleanText(model).toLowerCase())
+    .filter(Boolean));
   const available = [...new Set((Array.isArray(availableModels) ? availableModels : [])
     .map((model) => cleanText(model))
     .filter(Boolean))];
@@ -127,7 +130,7 @@ export function selectModelScopeFallbackModel({
   for (const requestedModel of queue) {
     const requestedKey = cleanText(requestedModel).toLowerCase();
     const model = availableByKey.get(requestedKey);
-    if (!model || requestedKey === currentKey) continue;
+    if (!model || requestedKey === currentKey || excludedKeys.has(requestedKey)) continue;
     const entry = findModelEntry(ledger, model);
     if (entry?.remaining === 0 || entry?.unavailable === true) continue;
     return model;
@@ -170,15 +173,12 @@ export function classifyModelScopeFallbackError(error, ledger = {}, { currentMod
     return { eligible: true, reason: "quota_exhausted", markQuotaExhausted: true, immediate: true };
   }
   const normalizedLedger = normalizeModelScopeQuotaLedger(ledger);
-  const userRemaining = normalizedLedger.user.remaining;
   const modelRemaining = findModelEntry(normalizedLedger, currentModel)?.remaining ?? null;
   const modelQuotaMessage = /rate\s+limit\s+you\s+for\s+model|model.{0,60}(?:quota|limit|额度|配额).{0,30}(?:exceed|exhaust|used up|用尽|耗尽|不足)|(?:quota|limit|额度|配额).{0,60}model/i.test(message);
   if ((status === 429 || code.startsWith("HTTP_429"))
-    && userRemaining !== 0
     && (modelQuotaMessage || modelRemaining === 0)) {
     return { eligible: true, reason: "model_quota_exhausted", markQuotaExhausted: true, immediate: true };
   }
-  if ((status === 429 || code.startsWith("HTTP_429")) && userRemaining === 0) return null;
   if (status === 429 || code.startsWith("HTTP_429")) {
     if (code === "HTTP_429_QUEUE_EXCEEDED" || /queue.{0,30}(?:overload|full|limit|busy)|(?:overload|full).{0,30}queue/i.test(message)) {
       return { eligible: true, reason: "queue_overloaded" };

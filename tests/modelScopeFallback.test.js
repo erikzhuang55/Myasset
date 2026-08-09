@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   classifyModelScopeFallbackError,
   getShanghaiDateKey,
@@ -10,6 +11,8 @@ import {
   isStrictModelScopeProvider,
 } from "../utils/modelScopeFallback.js";
 
+const backgroundSource = readFileSync(new URL("../background.js", import.meta.url), "utf8");
+
 const NOW = Date.UTC(2026, 7, 6, 8, 0, 0);
 const MODELS = ["model-a", "model-b", "model-c"];
 const CONFIG = {
@@ -20,6 +23,13 @@ const CONFIG = {
 };
 
 describe("ModelScope model fallback", () => {
+  it("continues through deterministic quota failures without retrying an attempted model", () => {
+    expect(backgroundSource).toContain("while (fallbackModelsTried.length < maxAttempts)");
+    expect(backgroundSource).toContain("excludedModels: [...attemptedModels]");
+    expect(backgroundSource).toContain('["quota_exhausted", "model_quota_exhausted", "model_unavailable"]');
+    expect(backgroundSource).toContain("if (canTryNextModel && attempt < maxAttempts) continue");
+  });
+
   it("only enables model switching for the explicit ModelScope provider", () => {
     expect(isStrictModelScopeProvider({ provider: "modelscope" })).toBe(true);
     expect(isStrictModelScopeProvider({ provider: " ModelScope " })).toBe(true);
@@ -69,6 +79,18 @@ describe("ModelScope model fallback", () => {
     })).toBe("model-c");
   });
 
+  it("skips models already attempted in the current fallback chain", () => {
+    expect(selectModelScopeFallbackModel({
+      currentModel: "model-a",
+      task: "summary",
+      availableModels: MODELS,
+      fallbackConfig: CONFIG,
+      ledger: normalizeModelScopeQuotaLedger({}, NOW),
+      excludedModels: ["model-b"],
+      now: NOW,
+    })).toBe("model-c");
+  });
+
   it("allows one attempt for a model whose remaining quota is unknown", () => {
     expect(selectModelScopeFallbackModel({
       currentModel: "model-a",
@@ -80,7 +102,7 @@ describe("ModelScope model fallback", () => {
     })).toBe("model-b");
   });
 
-  it("does not fallback when the user's total daily quota is exhausted", () => {
+  it("still probes another model when aggregate quota information is not actionable", () => {
     const ledger = normalizeModelScopeQuotaLedger({
       date: "2026-08-06",
       models: {},
@@ -93,7 +115,7 @@ describe("ModelScope model fallback", () => {
       fallbackConfig: CONFIG,
       ledger,
       now: NOW,
-    })).toBeNull();
+    })).toBe("model-b");
   });
 
   it("only retries failures that a different model can plausibly recover", () => {
@@ -121,7 +143,7 @@ describe("ModelScope model fallback", () => {
       { code: "HTTP_429", status: 429 },
       ledger,
       { currentModel: "model-a" },
-    )).toBeNull();
+    )).toMatchObject({ reason: "model_quota_exhausted" });
   });
 
   it("switches after one short wait for queue, rate-limit, and unknown 429 failures", () => {

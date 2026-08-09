@@ -11,6 +11,7 @@
     let capturedBvid = "";
     let capturedRouteKey = "";
     let latestPlayinfo = null; // 存储 XHR 拦截到的最新 dash 数据
+    let latestSubtitleIdentity = null;
     let playinfoRefreshActive = false;
     let latestAudioProbe = null;
     let routeMonitorTimer = null;
@@ -85,6 +86,7 @@
     window.fetch = async function (...args) {
         const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
         const requestMeta = resolveCurrentVideoMeta();
+        rememberSubtitleMetadataIdentity(url, requestMeta);
         const response = await originalFetch.apply(this, args);
         if (isSubtitleRequest(url)) {
             logSubtitleDiagnostic("source_request", { source: "inject.fetch", subtitleUrl: url, requestMeta });
@@ -106,6 +108,7 @@
         }
         this.__biliUrl = url;
         this.__biliRequestMeta = resolveCurrentVideoMeta();
+        rememberSubtitleMetadataIdentity(rawUrl, this.__biliRequestMeta);
         return originalOpen.apply(this, arguments);
     };
 
@@ -578,6 +581,10 @@
         capturedRouteKey = getRouteVideoKey();
         subtitleStringCache = [];
         latestPlayinfo = null; // 切换视频时清空，防止旧视频数据残留
+        const nextP = Math.max(1, Number(getRouteTid() || 1));
+        const keepCurrentSubtitleIdentity = String(latestSubtitleIdentity?.bvid || "").toLowerCase() === String(nextBvid || "").toLowerCase()
+            && Number(latestSubtitleIdentity?.p || 1) === nextP;
+        if (!keepCurrentSubtitleIdentity) latestSubtitleIdentity = null;
         latestAudioProbe = null;
         silentDeadlineTs = Date.now() + 2000;
         manualOverrideRouteKey = "";
@@ -702,14 +709,28 @@
         const video = document.querySelector("video");
         const duration = Number(currentPage?.duration) || Number(video?.duration) || 0;
         const playInfoMatchesRoute = String(latestPlayinfo?._bvid || "").toLowerCase() === String(bvid || "").toLowerCase();
-        const cid = Number(currentPage?.cid)
+        const currentAid = stateMatchesRoute
+            ? Number(videoData?.aid || state?.aid || 0)
+            : 0;
+        const referenceCid = Number(currentPage?.cid)
             || (playInfoMatchesRoute ? Number(latestPlayinfo?._cid) : 0)
             || (stateMatchesRoute ? Number(state.cid) : 0)
             || 0;
+        const subtitleIdentityMatchesRoute = String(latestSubtitleIdentity?.bvid || "").toLowerCase() === String(bvid || "").toLowerCase()
+            && Number(latestSubtitleIdentity?.p || 1) === p
+            && Number(latestSubtitleIdentity?.aid || 0) > 0
+            && (currentAid > 0
+                ? Number(latestSubtitleIdentity.aid) === currentAid
+                : latestSubtitleIdentity?.verified === true)
+            && (!(referenceCid > 0) || Number(latestSubtitleIdentity.cid) === referenceCid);
+        const cid = (subtitleIdentityMatchesRoute ? Number(latestSubtitleIdentity?.cid) : 0)
+            || referenceCid;
         return {
             bvid: String(bvid || "").trim(),
             p,
             cid: Number.isFinite(cid) ? cid : 0,
+            aid: Number.isFinite(currentAid) ? currentAid : 0,
+            referenceCid: Number.isFinite(referenceCid) ? referenceCid : 0,
             part: String(currentPage?.part || ""),
             duration: Number.isFinite(duration) ? duration : 0,
             partCount: stateMatchesRoute ? pages.length : 0
@@ -730,6 +751,52 @@
         const meta = resolveCurrentVideoMeta();
         const routeP = Math.max(1, Number(getRouteTid() || meta.p || 1));
         return meta.bvid ? `${meta.bvid}::p${routeP}` : "";
+    }
+
+    function getSubtitleMetadataIdentity(rawUrl) {
+        if (!rawUrl) return null;
+        try {
+            const parsed = new URL(rawUrl, location.href);
+            if (!/\/x\/v2\/subtitle\/web\/view$/i.test(parsed.pathname)) return null;
+            const cid = Number(parsed.searchParams.get("oid") || 0);
+            const aid = Number(parsed.searchParams.get("pid") || 0);
+            if (!Number.isFinite(cid) || !(cid > 0)) return null;
+            return {
+                cid,
+                aid: Number.isFinite(aid) && aid > 0 ? aid : 0
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function rememberSubtitleMetadataIdentity(rawUrl, requestMeta = null) {
+        const identity = getSubtitleMetadataIdentity(rawUrl);
+        if (!identity) return;
+        const routeBvid = String(requestMeta?.bvid || getBvidFromUrl(location.href) || "").trim();
+        if (!routeBvid) return;
+        const p = Math.max(1, Number(requestMeta?.p || getRouteTid() || 1));
+        const currentAid = Number(requestMeta?.aid || 0);
+        const referenceCid = Number(requestMeta?.referenceCid || 0);
+        const aidMatches = identity.aid > 0 && currentAid > 0 && identity.aid === currentAid;
+        const cidMatches = !(referenceCid > 0) || identity.cid === referenceCid;
+        const verified = aidMatches && cidMatches;
+        latestSubtitleIdentity = {
+            bvid: routeBvid,
+            p,
+            cid: identity.cid,
+            aid: identity.aid,
+            verified
+        };
+        emitLog("subtitle_identity_observed", {
+            bvid: routeBvid,
+            p,
+            cid: identity.cid,
+            aid: identity.aid,
+            verified,
+            reference_cid: referenceCid,
+            source: "subtitle_metadata"
+        });
     }
 
     function emitPlayInfo() {

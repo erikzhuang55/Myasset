@@ -7,6 +7,21 @@ import {
 } from "../utils/remoteConfig.js";
 
 describe("remote configuration", () => {
+  it("defaults to a bounded multi-model fallback chain", () => {
+    const fallback = normalizeRemoteConfigRow({ payload: {} }).modelFallback;
+    expect(fallback.maxAttempts).toBe(4);
+    expect(fallback.tasks.summary).toEqual([
+      "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      "Qwen/Qwen3-30B-A3B",
+      "Qwen/Qwen3-235B-A22B-Instruct-2507",
+      "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "deepseek-ai/DeepSeek-V4-Pro",
+    ]);
+    expect(normalizeRemoteConfigRow({
+      payload: { model_fallback: { max_attempts: 99 } },
+    }).modelFallback.maxAttempts).toBe(6);
+  });
+
   it("normalizes public feature and model configuration", () => {
     const config = normalizeRemoteConfigRow({
       config_key: "production",
@@ -16,6 +31,7 @@ describe("remote configuration", () => {
         feature_flags: { summary_empty_retry: false, modelscope_model_fallback: false },
         model_fallback: {
           enabled: true,
+          max_attempts: 5,
           tasks: { segments: ["model-segments", "model-segments"] },
         },
         providers: {
@@ -36,7 +52,7 @@ describe("remote configuration", () => {
     expect(config.featureFlags.modelscope_model_fallback).toBe(false);
     expect(config.modelFallback).toMatchObject({
       enabled: true,
-      maxAttempts: 1,
+      maxAttempts: 5,
       tasks: { segments: ["model-segments"] },
     });
     expect(config.providers.openai).toMatchObject({

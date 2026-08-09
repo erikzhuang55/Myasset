@@ -4,6 +4,7 @@ const DEFAULT_SILICONFLOW_ASR_BASE_URL = "https://api.siliconflow.cn/v1";
 const DEFAULT_MIMO_ASR_BASE_URL = "https://api.xiaomimimo.com/v1";
 const DEFAULT_MIMO_ASR_MODEL = "mimo-v2.5-asr";
 const SUMMARY_DRAFT_TTL_MS = 10 * 60 * 1000;
+const SUMMARY_DRAFT_STORAGE_PREFIX = "summaryDraft_";
 const state = {
     tabId: 0,
     activePage: "CC",
@@ -43,6 +44,7 @@ const state = {
     activeBvid: "",
     activePartKey: "",
     switchingToEmbedded: false,
+    summaryStreamDraft: null,
     summaryDraftExpiryTimer: null,
     summaryDraftExpiryAt: 0,
     announcementsUnread: false
@@ -341,6 +343,7 @@ async function refreshState({ quiet = false, hydrate = false, refreshFeedback = 
             state.chatGuideHidden = false;
             state.subtitleOptions = [];
             state.activeSubtitleId = "";
+            state.summaryStreamDraft = null;
         }
         state.activeBvid = nextBvid;
         state.activePartKey = nextPartKey;
@@ -843,7 +846,12 @@ function renderCC() {
 }
 
 function renderSummary() {
-    const summaryDraft = state.cache?.summaryDraft;
+    const streamDraft = state.summaryStreamDraft;
+    const streamDraftIsFresh = taskStatus("summary") === "processing"
+        && streamDraft && typeof streamDraft === "object"
+        && String(streamDraft.text || "").trim()
+        && Date.now() - Number(streamDraft.updatedAt || 0) < SUMMARY_DRAFT_TTL_MS;
+    const summaryDraft = streamDraftIsFresh ? streamDraft : state.cache?.summaryDraft;
     const freshDraft = taskStatus("summary") === "processing"
         && summaryDraft && typeof summaryDraft === "object"
         && String(summaryDraft.text || "").trim()
@@ -2094,12 +2102,40 @@ app.addEventListener("keydown", (event) => {
 });
 
 chrome.storage.onChanged.addListener((changes) => {
+    const summaryDraftKeys = Object.keys(changes || {}).filter((key) => key.startsWith(SUMMARY_DRAFT_STORAGE_PREFIX));
+    summaryDraftKeys.forEach((key) => {
+        const draft = changes[key]?.newValue;
+        const draftBvid = String(draft?.bvid || key.slice(SUMMARY_DRAFT_STORAGE_PREFIX.length)).trim().toLowerCase();
+        if (draft && draftBvid && draftBvid === String(state.activeBvid || "").trim().toLowerCase()) {
+            state.summaryStreamDraft = draft;
+        } else if (!draft && (!state.summaryStreamDraft?.bvid || draftBvid === String(state.summaryStreamDraft.bvid).toLowerCase())) {
+            state.summaryStreamDraft = null;
+        }
+    });
+    if (summaryDraftKeys.length) render();
     if (Object.keys(changes || {}).some((key) => key.startsWith("topAnnouncementDismissed:"))) {
         refreshAnnouncementUnreadState().catch(() => {});
     }
     if (Object.keys(changes || {}).some((key) => key === "settings" || key === "cloudReadDisabledBvids" || key.startsWith("cache_") || key.startsWith("tabState_"))) {
         refreshState({ quiet: true });
     }
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+    const action = String(message?.action || "");
+    const messageBvid = String(message?.bvid || message?.draft?.bvid || "").trim().toLowerCase();
+    const currentBvid = String(state.activeBvid || "").trim().toLowerCase();
+    if (!messageBvid || !currentBvid || messageBvid !== currentBvid) return false;
+    if (action === "SUMMARY_STREAM_UPDATE" && message?.draft) {
+        if (Number(message.draft.updatedAt || 0) >= Number(state.summaryStreamDraft?.updatedAt || 0)) {
+            state.summaryStreamDraft = message.draft;
+            render();
+        }
+    } else if (action === "SUMMARY_STREAM_CLEAR") {
+        state.summaryStreamDraft = null;
+        render();
+    }
+    return false;
 });
 
 chrome.tabs.onActivated.addListener(() => refreshState({ quiet: true }));

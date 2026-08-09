@@ -372,6 +372,7 @@ const SUBTITLE_OBSERVE_GRACE_MS = 3500;
 const STEP_PROGRESS_TIMEOUT_MS = 60000;
 const CLOUD_READ_TIMEOUT_MS = 2000;
 const SUMMARY_DRAFT_TTL_MS = 10 * 60 * 1000;
+const SUMMARY_DRAFT_STORAGE_PREFIX = "summaryDraft_";
 const FEEDBACK_SUBMITTED_STORAGE_KEY = "feedbackSubmitted";
 const FEEDBACK_PENDING_REPLY_TEXT = "感谢你的反馈！我会尽量在24小时内回复。";
 const BUILTIN_ANNOUNCEMENTS = Object.freeze([Object.freeze({
@@ -412,6 +413,7 @@ const appState = {
     videoSubtitleVideo: null,
     videoSubtitleSignature: "",
     subtitleCapturedBvid: "",
+    subtitleCacheSyncPending: false,
     injectBvid: "",
     injectCid: 0,
     injectPartCount: 0,
@@ -422,6 +424,7 @@ const appState = {
     chatPending: [],
     chatStreamingId: "",
     chatStreamTimer: null,
+    summaryStreamDraft: null,
     summaryDraftExpiryTimer: null,
     summaryDraftExpiryAt: 0,
     chatPort: null,
@@ -658,6 +661,20 @@ function getCurrentSubtitleStateRows() {
     return [];
 }
 
+function getVerifiedSubtitleCidForCurrentRoute(targetBvid = "") {
+    const target = normalizeBvidCase(targetBvid || getBvidFromUrl(location.href) || "");
+    const routeBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
+    const routeKey = getCurrentSubtitleRouteKey();
+    const rowsCid = Number(subtitleUiCoordinator.rowsCid || 0);
+    if (!target || !routeBvid || target !== routeBvid || !(rowsCid > 0)) return 0;
+    if (subtitleUiCoordinator.phase !== "ready"
+        || subtitleUiCoordinator.routeKey !== routeKey
+        || subtitleUiCoordinator.rowsRouteKey !== routeKey
+        || !Array.isArray(subtitleUiCoordinator.rows)
+        || subtitleUiCoordinator.rows.length === 0) return 0;
+    return rowsCid;
+}
+
 function getSubtitleRowsStateDigest(rows) {
     const list = Array.isArray(rows) ? rows : [];
     return makeShortDigest(list.map((row) => [
@@ -813,6 +830,9 @@ function commitSubtitleRows(rows, options = {}) {
     }
     subtitleUiCoordinator.phase = "ready";
     subtitleUiCoordinator.displaySource = source;
+    if (incomingBvid && incomingCid > 0 && (source === "inject" || source === "language_switch")) {
+        syncActiveCacheByBvid(incomingBvid).catch(() => {});
+    }
     logSubtitleDiagnostic("ui_phase_changed", {
         phase: "ready",
         source,
@@ -2085,6 +2105,7 @@ async function onInjectMessage(event) {
         appState.routeWatchBvid = routeBvid;
         appState.routeWatchKey = getCurrentRouteVideoKey();
         appState.injectBvid = routeBvid;
+        appState.injectBvidChangedAt = Date.now();
         appState.injectCid = Number.isFinite(routeCid) && routeCid > 0 ? routeCid : 0;
         appState.injectPartCount = Number.isFinite(routePartCount) && routePartCount > 0 ? routePartCount : 0;
         appState.tabState = {
@@ -2103,6 +2124,7 @@ async function onInjectMessage(event) {
             partCount: appState.injectPartCount
         }).catch(() => {});
         if (!preserveReadySubtitle) clearCCListImmediately();
+        beginSubtitleObservation(routeBvid);
         renderContent();
         waitForAlignedPlayInfo(routeBvid).catch(() => {});
         return;
@@ -2137,6 +2159,7 @@ async function onInjectMessage(event) {
         && (!subtitleUiCoordinator.routeKey || subtitleUiCoordinator.routeKey === payloadRouteKey);
     const pendingPayload = {
         bvid,
+        rawBvid: String(getBvidFromUrl(location.href) || event.data?.bvid || "").trim(),
         cid: Number.isFinite(cid) && cid > 0 ? cid : (appState.injectCid || 0),
         tid: getTidFromUrl(location.href),
         title: cleanBilibiliTitle(document.title),
@@ -2197,7 +2220,11 @@ async function onInjectMessage(event) {
             coordinatorRouteKey: subtitleUiCoordinator.routeKey
         });
     }
+    appState.subtitleCacheSyncPending = true;
+    if (["summary", "real"].includes(appState.activePage)) renderContent();
     await forwardSubtitlePayload(pendingPayload, "inject_message_forwarded");
+    appState.subtitleCacheSyncPending = false;
+    if (["summary", "real"].includes(appState.activePage)) renderContent();
     if (!languageSwitch) {
         applyOfficialSubtitleVariantToLocalCache({
             bvid,
@@ -2228,8 +2255,55 @@ async function onInjectMessage(event) {
     });
 }
 
+function renderSummaryStreamOnly() {
+    if (appState.activePage !== "summary") return;
+    const panel = panelShadowRoot ? panelShadowRoot.getElementById("page-summary") : null;
+    if (!panel) return;
+    renderSummary(panel);
+}
+
+function applySummaryStreamDraft(draft, fallbackBvid = "") {
+    if (!draft || typeof draft !== "object") return false;
+    const draftBvid = normalizeBvidCase(draft.bvid || fallbackBvid || "");
+    const currentBvid = normalizeBvidCase(resolveCurrentBvid() || getBvidFromUrl(location.href) || "");
+    const text = String(draft.text || "").trim();
+    const updatedAt = Number(draft.updatedAt || 0);
+    if (!draftBvid || !currentBvid || draftBvid !== currentBvid || !text || !updatedAt) return false;
+    const currentCid = Number(getCurrentRouteCid() || getVerifiedSubtitleCidForCurrentRoute(currentBvid) || 0);
+    const draftCid = Number(draft.cid || 0);
+    if (currentCid > 0 && draftCid > 0 && currentCid !== draftCid) return false;
+    if (Date.now() - updatedAt >= SUMMARY_DRAFT_TTL_MS) return false;
+    if (Number(appState.summaryStreamDraft?.updatedAt || 0) > updatedAt) return false;
+    appState.summaryStreamDraft = { ...draft, bvid: draftBvid, text, updatedAt };
+    renderSummaryStreamOnly();
+    return true;
+}
+
+function clearSummaryStreamDraft(message = {}) {
+    const targetBvid = normalizeBvidCase(message?.bvid || "");
+    const currentDraftBvid = normalizeBvidCase(appState.summaryStreamDraft?.bvid || "");
+    if (targetBvid && currentDraftBvid && targetBvid !== currentDraftBvid) return false;
+    if (!appState.summaryStreamDraft) return false;
+    appState.summaryStreamDraft = null;
+    renderSummaryStreamOnly();
+    return true;
+}
+
+function handleSummaryDraftStorageChanges(changes = {}) {
+    const keys = Object.keys(changes || {}).filter((key) => key.startsWith(SUMMARY_DRAFT_STORAGE_PREFIX));
+    if (!keys.length) return false;
+    keys.forEach((key) => {
+        const fallbackBvid = key.slice(SUMMARY_DRAFT_STORAGE_PREFIX.length);
+        const value = changes[key]?.newValue;
+        if (value) applySummaryStreamDraft(value, fallbackBvid);
+        else clearSummaryStreamDraft({ bvid: fallbackBvid });
+    });
+    return keys.length === Object.keys(changes || {}).length;
+}
+
 function onStorageChanged(changes, areaName) {
     if (areaName !== "local") return;
+    if (handleSummaryDraftStorageChanges(changes)) return;
     logContent.debug("storage_listener_trigger", { keys: Object.keys(changes || {}) });
     logAsrUiTrace("storage_changed", {
         keys: Object.keys(changes || {}),
@@ -2316,7 +2390,7 @@ function onStorageChanged(changes, areaName) {
                     cache: selectCacheDirectoryPart(
                         directory,
                         currentRoute || afterBvid || beforeBvid,
-                        getCurrentRouteCid()
+                        getCurrentRouteCid() || getVerifiedSubtitleCidForCurrentRoute(currentRoute || afterBvid || beforeBvid)
                     )
                 };
             })
@@ -4359,7 +4433,12 @@ function renderSummary(panel) {
     }
     const summaryStatus = getCurrentVideoTaskStatus("summary");
     const segmentsStatus = getCurrentVideoTaskStatus("segments");
-    const summaryDraft = appState.cache?.summaryDraft;
+    const streamDraft = appState.summaryStreamDraft;
+    const streamDraftIsFresh = summaryStatus === "processing"
+        && streamDraft && typeof streamDraft === "object"
+        && String(streamDraft.text || "").trim()
+        && Date.now() - Number(streamDraft.updatedAt || 0) < SUMMARY_DRAFT_TTL_MS;
+    const summaryDraft = streamDraftIsFresh ? streamDraft : appState.cache?.summaryDraft;
     const freshDraft = summaryStatus === "processing"
         && summaryDraft && typeof summaryDraft === "object"
         && String(summaryDraft.text || "").trim()
@@ -7223,6 +7302,8 @@ async function runTasks(tasks, options = {}) {
     }
 
     const taskId = buildTasksProgressTaskId(tasks);
+    const requestRouteKey = getCurrentRouteVideoKey();
+    const isRequestRouteCurrent = () => !requestRouteKey || getCurrentRouteVideoKey() === requestRouteKey;
     try {
         appState.visibleProgressCompletedTaskIds.delete(taskId);
         tasks.forEach((t) => appState.sessionGeneratedTasks.add(t));
@@ -7254,6 +7335,17 @@ async function runTasks(tasks, options = {}) {
             bvid: normalizeBvidCase(resolveCurrentBvid() || ""),
             taskContext
         });
+        if (!isRequestRouteCurrent()) {
+            logContent.info("stale_task_result_ignored", {
+                task: tasks.join(","),
+                bvid: normalizeBvidCase(currentBvid || ""),
+                detail: {
+                    request_route_key: requestRouteKey,
+                    current_route_key: getCurrentRouteVideoKey()
+                }
+            });
+            return;
+        }
         if (!res?.ok) {
             const runtimeError = new Error(res?.error || "任务失败");
             runtimeError.code = res?.code || "";
@@ -7268,6 +7360,19 @@ async function runTasks(tasks, options = {}) {
             expandPanelAfterSummaryCompletion();
         }
     } catch (error) {
+        if (!isRequestRouteCurrent()) {
+            logContent.info("stale_task_error_ignored", {
+                task: tasks.join(","),
+                bvid: normalizeBvidCase(currentBvid || ""),
+                code: error?.code || "",
+                detail: {
+                    request_route_key: requestRouteKey,
+                    current_route_key: getCurrentRouteVideoKey(),
+                    error_message: error?.message || "任务已结束"
+                }
+            });
+            return;
+        }
         if (!appState.visibleProgressCompletedTaskIds.has(taskId)) {
             finishAsymptoticPseudoProgress(taskId, true);
         }
@@ -7286,9 +7391,11 @@ async function runTasks(tasks, options = {}) {
         if (view?.presentation === "toast") showToast(view.message);
         else renderContent();
     } finally {
-        setLocalPendingTasks(tasks, false);
-        renderContent();
-        appState.visibleProgressCompletedTaskIds.delete(taskId);
+        if (isRequestRouteCurrent()) {
+            setLocalPendingTasks(tasks, false);
+            renderContent();
+            appState.visibleProgressCompletedTaskIds.delete(taskId);
+        }
     }
 }
 
@@ -7607,6 +7714,8 @@ function resetPageStateByBvidSwitch({ preserveReadySubtitle = false } = {}) {
     if (!preserveReadySubtitle) beginSubtitleUiCycle();
     appState.cache = null;
     appState.chatPending = [];
+    appState.localPending = { tasks: {}, transcription: false };
+    appState.panelErrors = {};
     appState.chatStreamingId = "";
     appState.chatActiveMessageId = "";
     appState.sessionGeneratedTasks = new Set();
@@ -7634,6 +7743,8 @@ function resetPageStateByBvidSwitch({ preserveReadySubtitle = false } = {}) {
     appState.subtitleOptionsBvid = "";
     appState.activeSubtitleId = "";
     appState.pendingSubtitle = null;
+    appState.subtitleCacheSyncPending = false;
+    appState.summaryStreamDraft = null;
     appState.timelineSearchTerm = "";
     if (appState.timelineSearchDebounceTimer) {
         clearTimeout(appState.timelineSearchDebounceTimer);
@@ -8061,7 +8172,7 @@ function renderCloudLoadingState(title, detail = "读取云端数据中...") {
 function getCurrentSubtitleDependencyState() {
     const input = {
         hasSubtitle: hasUsableSubtitleCache(appState.cache, resolveCurrentBvid()),
-        playerLoading: isSubtitleUiLoading(),
+        playerLoading: isSubtitleUiLoading() || appState.subtitleCacheSyncPending,
         cloudLoading: isCloudReadLoadingForCurrentVideo(),
         transcribing: isTranscriptionRunning()
     };
@@ -10329,16 +10440,17 @@ function isCacheForCurrentRouteVideo(cache, targetBvid = "") {
 
     const routeBvid = normalizeBvidCase(getBvidFromUrl(location.href) || "");
     const routeTid = getRoutePartId();
-    const routeCid = getCurrentRouteCid();
+    const routeCid = getCurrentRouteCid() || getVerifiedSubtitleCidForCurrentRoute(target);
     const cacheCid = Number(cache?.cid || 0);
+    const confirmedPartCount = getCurrentRoutePartCount() || Math.max(0, Math.floor(Number(cache?.partCount || 0)));
     if (routeBvid && cacheBvid && routeBvid !== cacheBvid) return false;
     if (!(cacheCid > 0)) {
         return !routeTid
-            && getCurrentRoutePartCount() === 1
+            && confirmedPartCount === 1
             && cache?.pendingSinglePart === true;
     }
     if (!(routeCid > 0)) {
-        const isConfirmedSinglePartVideo = !routeTid && getCurrentRoutePartCount() === 1;
+        const isConfirmedSinglePartVideo = !routeTid && confirmedPartCount === 1;
         return isConfirmedSinglePartVideo;
     }
     if (routeCid !== cacheCid) return false;
@@ -10355,10 +10467,17 @@ function selectCacheDirectoryPart(cache, targetBvid = "", targetCid = 0) {
     if (!bvid) return null;
     const pendingPartKey = `${bvid.toLowerCase()}::single-pending`;
     const pendingPart = cache.parts && typeof cache.parts === "object" ? cache.parts[pendingPartKey] : null;
-    const allowPendingSinglePart = !getRoutePartId() && getCurrentRoutePartCount() === 1;
+    const confirmedPartCount = getCurrentRoutePartCount() || Math.max(0, Math.floor(Number(cache?.partCount || pendingPart?.partCount || 0)));
+    const allowPendingSinglePart = !getRoutePartId() && confirmedPartCount === 1;
     if (!(cid > 0)) {
         if (allowPendingSinglePart && pendingPart && typeof pendingPart === "object") {
             return { ...cache, ...pendingPart, parts: cache.parts, subtitleVariants: cache.subtitleVariants };
+        }
+        const cachedCid = Number(cache?.cid || 0);
+        const cachedPartKey = `${bvid.toLowerCase()}::${cachedCid}`;
+        const cachedPart = cache.parts && typeof cache.parts === "object" ? cache.parts[cachedPartKey] : null;
+        if (allowPendingSinglePart && cachedCid > 0 && cachedPart && typeof cachedPart === "object") {
+            return { ...cache, ...cachedPart, parts: cache.parts, subtitleVariants: cache.subtitleVariants };
         }
         return null;
     }
@@ -11199,7 +11318,11 @@ async function syncActiveCacheByBvid(expectedBvid) {
         const res = await chrome.storage.local.get([`cache_${target}`]);
         if (normalizeBvidCase(appState.tabState?.activeBvid || "") !== target) return;
         const directory = res?.[`cache_${target}`] || null;
-        const nextCache = selectCacheDirectoryPart(directory, target, getCurrentRouteCid());
+        const nextCache = selectCacheDirectoryPart(
+            directory,
+            target,
+            getCurrentRouteCid() || getVerifiedSubtitleCidForCurrentRoute(target)
+        );
         const acceptedCache = nextCache
             && normalizeBvidCase(nextCache?.bvid || "") === target
             && isCacheForCurrentRouteVideo(nextCache, target)
@@ -11522,6 +11645,14 @@ function onSidePanelMessage(message, sender, sendResponse) {
 
 function onBackgroundMessage(message) {
     const action = String(message?.action || "");
+    if (action === "SUMMARY_STREAM_UPDATE") {
+        applySummaryStreamDraft(message?.draft, message?.bvid);
+        return false;
+    }
+    if (action === "SUMMARY_STREAM_CLEAR") {
+        clearSummaryStreamDraft(message);
+        return false;
+    }
     if (action === "REMOTE_CONFIG_UPDATED") {
         refreshRemoteConfigView().catch(() => {});
         return false;

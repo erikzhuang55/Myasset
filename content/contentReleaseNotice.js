@@ -4,6 +4,51 @@
   const STORAGE_KEY = "bilitato_last_seen_version";
 
   const RELEASE_NOTES = {
+    "1.6.4": {
+      title: "Bilitato 已更新至 v1.6.4",
+      displayVersion: "v1.6.4",
+      subtitle: "本次继续修复生成进度与分 P 切换问题，让总结和分段更稳定地完成。",
+      groups: [
+        {
+          tag: "优化",
+          items: [
+            {
+              title: "总结流式显示更流畅",
+              desc: "生成中的文字改为轻量更新，减少频繁保存完整缓存带来的页面重绘和进度延迟。",
+              highlight: true,
+            },
+            {
+              title: "后台同步不再阻塞完成状态",
+              desc: "本地总结和分段完成后立即结束前端进度，云端缓存、指标和埋点继续在后台处理。",
+            },
+            {
+              title: "ModelScope 自动降级更稳",
+              desc: "额度不足、模型繁忙或临时服务异常时，更合理地选择备用模型，同时严格限制在 ModelScope 模式内。",
+            },
+          ],
+        },
+        {
+          tag: "修复",
+          items: [
+            {
+              title: "修复进度条完成后不消失",
+              desc: "总结或分段已生成时会再次校准最终任务状态，避免分段仍残留为处理中。",
+              highlight: true,
+            },
+            {
+              title: "修复生成中切 P 出现旧错误",
+              desc: "切换分 P 后，旧分片迟到的成功、失败或停止结果不会再覆盖当前分片页面。",
+              highlight: true,
+            },
+            {
+              title: "修复字幕来源状态波动",
+              desc: "增强字幕身份与来源校验，减少分 P 切换期间字幕短暂消失或读取到旧状态的问题。",
+            },
+          ],
+        },
+      ],
+      privacy: "Bilitato 不会上传您的 API Key、Prompt 或与 AI 的聊天内容。云端缓存和匿名指标均在后台处理，不会阻塞本地结果展示。",
+    },
     "1.6.3": {
       title: "Bilitato 已更新至 v1.6.3",
       displayVersion: "v1.6.3",
@@ -1182,7 +1227,9 @@
 
   function buildReleasePageVersions(version) {
     const majorHistory = [];
-    if (version === "1.6.3") {
+    if (version === "1.6.4") {
+      majorHistory.push("1.6.4", "1.6.3", "1.6.2", "1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");
+    } else if (version === "1.6.3") {
       majorHistory.push("1.6.3", "1.6.2", "1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");
     } else if (version === "1.6.2") {
       majorHistory.push("1.6.2", "1.6.1", "1.6.0", "1.5.x", "1.4.x", "1.3.x", "1.2.x");

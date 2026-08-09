@@ -71,7 +71,7 @@ describe("native side panel", () => {
   });
 
   it("checks database driven update availability without frequent polling", () => {
-    expect(manifest.version).toBe("1.6.3");
+    expect(manifest.version).toBe("1.6.4");
     expect(background).toContain('msg.action === "CHECK_LATEST_VERSION"');
     expect(background).toContain('msg.action === "OPEN_EXTENSION_MANAGEMENT"');
     expect(background).toContain("VERSION_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000");
@@ -92,7 +92,12 @@ describe("native side panel", () => {
     expect(sidepanel).not.toContain("有可用版本更新 v${latest}");
   });
 
-  it("ships the 1.6.3 release notice pages", () => {
+  it("ships the 1.6.4 release notice pages", () => {
+    expect(releaseNotice).toContain('"1.6.4"');
+    expect(releaseNotice).toContain("Bilitato 已更新至 v1.6.4");
+    expect(releaseNotice).toContain("修复生成中切 P 出现旧错误");
+    expect(releaseNotice).toContain("修复进度条完成后不消失");
+    expect(releaseNotice).toContain('majorHistory.push("1.6.4", "1.6.3", "1.6.2"');
     expect(releaseNotice).toContain('"1.6.3"');
     expect(releaseNotice).toContain("Bilitato 已更新至 v1.6.3");
     expect(releaseNotice).toContain("修复分 P 字幕切换闪烁");

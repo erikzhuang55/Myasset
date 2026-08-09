@@ -583,6 +583,21 @@ function reportClientUsageEvent(payload = {}, settingsInput = null) {
     return { sent: false, reason: "queued" };
 }
 
+function queueBackgroundOperation(name, operation, detail = {}) {
+    void Promise.resolve()
+        .then(operation)
+        .catch((error) => {
+            logBackground.warn("background_operation_failed", {
+                task: String(name || "background"),
+                code: error?.code || "BACKGROUND_OPERATION_FAILED",
+                detail: {
+                    ...detail,
+                    error_message: error?.message || String(error)
+                }
+            });
+        });
+}
+
 function getUsageRecoveryState(taskContext = {}, component = "task") {
     if (!taskContext || typeof taskContext !== "object") return null;
     if (!taskContext.usageRecoveryState || typeof taskContext.usageRecoveryState !== "object") {
@@ -1185,6 +1200,9 @@ const cacheMemory = new Map();
 const VIDEO_CACHE_SCHEMA_VERSION = 3;
 const SINGLE_PART_PENDING_SUFFIX = "single-pending";
 const SUMMARY_DRAFT_TTL_MS = 10 * 60 * 1000;
+const SUMMARY_STREAM_NOTIFY_INTERVAL_MS = 120;
+const SUMMARY_DRAFT_PERSIST_INTERVAL_MS = 5000;
+const SUMMARY_DRAFT_STORAGE_PREFIX = "summaryDraft_";
 const recentAsrAudioFingerprints = new Map();
 let currentDebugMode = false;
 let remoteConfigMemory = { ...DEFAULT_REMOTE_CONFIG };
@@ -1655,7 +1673,7 @@ async function reportModelScopeFallbackInitial(settings, options, error, fallbac
     }, settings);
 }
 
-async function reportModelScopeFallbackFinished(settings, options, triggerError, resultError, result, fallbackModel, reason) {
+async function reportModelScopeFallbackFinished(settings, options, triggerError, resultError, result, fallbackModel, reason, extraMetadata = {}) {
     const taskContext = options?.taskContext;
     const component = getModelScopeFallbackTask(options);
     const bvid = normalizeBvid(options?.bvid || taskContext?.bvid || "");
@@ -1663,7 +1681,8 @@ async function reportModelScopeFallbackFinished(settings, options, triggerError,
     const metadata = {
         from_model: String(settings?.model || ""),
         to_model: fallbackModel,
-        trigger_reason: reason
+        trigger_reason: reason,
+        ...extraMetadata
     };
     if (taskContext) {
         await reportTaskRecoveryFinished({
@@ -1725,34 +1744,12 @@ async function tryModelScopeFallback(settings, options, triggerError, runFallbac
     if (options && typeof options === "object" && !options.provider429TaskId) {
         options.provider429TaskId = String(options?.taskContext?.usageTaskId || "").trim() || createUsageTaskId(component);
     }
-    const fallbackModel = selectModelScopeFallbackModel({
-        currentModel: settings?.model || "",
-        task: component,
-        availableModels: getModelScopeAvailableModels(settings),
-        fallbackConfig: remoteConfigMemory?.modelFallback,
-        ledger
-    });
-    if (!fallbackModel) {
-        logAI.warn("model_fallback_skipped", {
-            task: component,
-            provider: settings?.provider || "",
-            model: settings?.model || "",
-            code: resolveUsageErrorCode(triggerError),
-            detail: {
-                reason: ledger?.user?.remaining === 0 ? "user_quota_exhausted" : "no_eligible_model"
-            }
-        });
-        return null;
-    }
-    const fallbackSettings = {
-        ...settings,
-        model: fallbackModel,
-        providerModels: {
-            ...(settings?.providerModels || {}),
-            modelscope: fallbackModel
-        }
-    };
-    await reportModelScopeFallbackInitial(settings, options, triggerError, fallbackModel, classification.reason);
+    const maxAttempts = Math.min(6, Math.max(1, Math.floor(Number(remoteConfigMemory?.modelFallback?.maxAttempts || 1))));
+    const attemptedModels = new Set([String(settings?.model || "").trim().toLowerCase()].filter(Boolean));
+    const fallbackModelsTried = [];
+    let fallbackError = null;
+    let fallbackModel = "";
+    let initialFailureReported = false;
     if (["quota_exhausted", "model_quota_exhausted"].includes(classification.reason)) {
         try {
             await chrome.tabs.sendMessage(options?.tabId, {
@@ -1762,69 +1759,157 @@ async function tryModelScopeFallback(settings, options, triggerError, runFallbac
             });
         } catch (_) {}
     }
-    logAI.warn("model_fallback_started", {
-        task: component,
-        provider: "modelscope",
-        model: settings?.model || "",
-        code: resolveUsageErrorCode(triggerError),
-        detail: { fallback_model: fallbackModel, trigger_reason: classification.reason }
-    });
-    try {
-        const result = await runFallback(fallbackSettings);
-        if (result?.metrics) {
-            result.metrics = {
-                ...result.metrics,
-                modelFallback: true,
-                fallbackFromModel: String(settings?.model || ""),
-                fallbackTrigger: classification.reason
-            };
+
+    while (fallbackModelsTried.length < maxAttempts) {
+        fallbackModel = selectModelScopeFallbackModel({
+            currentModel: settings?.model || "",
+            task: component,
+            availableModels: getModelScopeAvailableModels(settings),
+            fallbackConfig: remoteConfigMemory?.modelFallback,
+            ledger,
+            excludedModels: [...attemptedModels]
+        });
+        if (!fallbackModel) break;
+
+        attemptedModels.add(fallbackModel.toLowerCase());
+        fallbackModelsTried.push(fallbackModel);
+        const attempt = fallbackModelsTried.length;
+        const fallbackSettings = {
+            ...settings,
+            model: fallbackModel,
+            providerModels: {
+                ...(settings?.providerModels || {}),
+                modelscope: fallbackModel
+            }
+        };
+        if (!initialFailureReported) {
+            await reportModelScopeFallbackInitial(settings, options, triggerError, fallbackModel, classification.reason);
+            initialFailureReported = true;
         }
-        if (options?.taskContext) {
-            options.taskContext.modelFallbackModels = {
-                ...(options.taskContext.modelFallbackModels || {}),
-                [component]: fallbackModel
-            };
-        }
-        await reportModelScopeFallbackFinished(settings, options, triggerError, null, result, fallbackModel, classification.reason);
-        logAI.info("model_fallback_succeeded", {
+        logAI.warn("model_fallback_started", {
             task: component,
             provider: "modelscope",
-            model: fallbackModel,
-            duration_ms: Number(result?.metrics?.latencyMs || 0),
-            detail: { from_model: settings?.model || "", trigger_reason: classification.reason }
+            model: settings?.model || "",
+            code: resolveUsageErrorCode(triggerError),
+            detail: {
+                fallback_model: fallbackModel,
+                trigger_reason: classification.reason,
+                attempt,
+                max_attempts: maxAttempts
+            }
         });
-        return result;
-    } catch (fallbackError) {
-        const fallbackRateLimitInfo = resolveRateLimitInfo(fallbackSettings, fallbackError?.responseHeaders, { allowObservedFallback: false });
-        const latestLedger = hasModelScopeRateLimitInfo(fallbackRateLimitInfo)
-            ? await rememberModelScopeRateLimit(fallbackSettings, fallbackRateLimitInfo)
-            : await getModelScopeQuotaLedger();
-        const fallbackClassification = classifyModelScopeFallbackError(fallbackError, latestLedger, {
-            currentModel: fallbackModel
-        });
-        if (fallbackClassification?.markUnavailable || fallbackClassification?.markQuotaExhausted) {
-            persistModelScopeQuotaLedger(markModelScopeModelUnavailable(
-                latestLedger,
+        try {
+            const result = await runFallback(fallbackSettings);
+            if (result?.metrics) {
+                result.metrics = {
+                    ...result.metrics,
+                    modelFallback: true,
+                    modelFallbackAttempts: attempt,
+                    fallbackFromModel: String(settings?.model || ""),
+                    fallbackTrigger: classification.reason
+                };
+            }
+            if (options?.taskContext) {
+                options.taskContext.modelFallbackModels = {
+                    ...(options.taskContext.modelFallbackModels || {}),
+                    [component]: fallbackModel
+                };
+            }
+            await reportModelScopeFallbackFinished(
+                settings,
+                options,
+                triggerError,
+                null,
+                result,
                 fallbackModel,
-                fallbackClassification.markQuotaExhausted ? "quota_exhausted" : fallbackClassification.reason
-            ));
+                classification.reason,
+                { fallback_attempts: attempt, fallback_models_tried: fallbackModelsTried.join(",") }
+            );
+            logAI.info("model_fallback_succeeded", {
+                task: component,
+                provider: "modelscope",
+                model: fallbackModel,
+                duration_ms: Number(result?.metrics?.latencyMs || 0),
+                detail: {
+                    from_model: settings?.model || "",
+                    trigger_reason: classification.reason,
+                    attempt,
+                    models_tried: fallbackModelsTried
+                }
+            });
+            return result;
+        } catch (error) {
+            fallbackError = error;
+            const fallbackRateLimitInfo = resolveRateLimitInfo(fallbackSettings, error?.responseHeaders, { allowObservedFallback: false });
+            const latestLedger = hasModelScopeRateLimitInfo(fallbackRateLimitInfo)
+                ? await rememberModelScopeRateLimit(fallbackSettings, fallbackRateLimitInfo)
+                : await getModelScopeQuotaLedger();
+            const fallbackClassification = classifyModelScopeFallbackError(error, latestLedger, {
+                currentModel: fallbackModel
+            });
+            if (fallbackClassification?.markUnavailable || fallbackClassification?.markQuotaExhausted) {
+                ledger = markModelScopeModelUnavailable(
+                    latestLedger,
+                    fallbackModel,
+                    fallbackClassification.markQuotaExhausted ? "quota_exhausted" : fallbackClassification.reason
+                );
+                persistModelScopeQuotaLedger(ledger);
+            } else {
+                ledger = latestLedger;
+            }
+            const canTryNextModel = ["quota_exhausted", "model_quota_exhausted", "model_unavailable"]
+                .includes(String(fallbackClassification?.reason || ""));
+            logAI.warn("model_fallback_failed", {
+                task: component,
+                provider: "modelscope",
+                model: fallbackModel,
+                code: resolveUsageErrorCode(error),
+                detail: {
+                    from_model: settings?.model || "",
+                    trigger_reason: classification.reason,
+                    fallback_reason: fallbackClassification?.reason || "unclassified",
+                    attempt,
+                    try_next_model: canTryNextModel && attempt < maxAttempts
+                }
+            });
+            if (canTryNextModel && attempt < maxAttempts) continue;
+            break;
         }
-        attachSentryContext(fallbackError, {
-            model_fallback_from: String(settings?.model || ""),
-            model_fallback_to: fallbackModel,
-            model_fallback_trigger: classification.reason,
-            model_fallback_original_code: resolveUsageErrorCode(triggerError)
-        });
-        await reportModelScopeFallbackFinished(settings, options, triggerError, fallbackError, null, fallbackModel, classification.reason);
-        logAI.warn("model_fallback_failed", {
-            task: component,
-            provider: "modelscope",
-            model: fallbackModel,
-            code: resolveUsageErrorCode(fallbackError),
-            detail: { from_model: settings?.model || "", trigger_reason: classification.reason }
-        });
-        throw fallbackError;
     }
+
+    if (!fallbackModelsTried.length) {
+        logAI.warn("model_fallback_skipped", {
+            task: component,
+            provider: settings?.provider || "",
+            model: settings?.model || "",
+            code: resolveUsageErrorCode(triggerError),
+            detail: { reason: "no_eligible_model" }
+        });
+        return null;
+    }
+
+    attachSentryContext(fallbackError, {
+        model_fallback_from: String(settings?.model || ""),
+        model_fallback_to: fallbackModel,
+        model_fallback_models_tried: fallbackModelsTried.join(","),
+        model_fallback_attempts: fallbackModelsTried.length,
+        model_fallback_trigger: classification.reason,
+        model_fallback_original_code: resolveUsageErrorCode(triggerError)
+    });
+    await reportModelScopeFallbackFinished(
+        settings,
+        options,
+        triggerError,
+        fallbackError,
+        null,
+        fallbackModel,
+        classification.reason,
+        {
+            fallback_attempts: fallbackModelsTried.length,
+            fallback_models_tried: fallbackModelsTried.join(",")
+        }
+    );
+    throw fallbackError;
 }
 
 function enableSidePanelActionClick() {
@@ -4377,6 +4462,120 @@ function startRetryCountdown(tabId, retryAfterSec, bvid = "") {
     }, 1000);
 }
 
+function selectBiliPagelistIdentity(pages, requestedPage = 1) {
+    const list = Array.isArray(pages) ? pages : [];
+    const pageNumber = Math.max(1, Math.floor(Number(requestedPage || 1)) || 1);
+    const page = list.find((item) => Number(item?.page || 0) === pageNumber) || list[pageNumber - 1] || null;
+    return {
+        cid: Number(page?.cid || 0),
+        partCount: list.length
+    };
+}
+
+async function resolveBiliPagelistIdentityInPage(tabId, rawBvid, requestedPage = 1) {
+    if (!tabId || !rawBvid) return null;
+    try {
+        const results = await chrome.scripting.executeScript({
+            target: { tabId },
+            world: "MAIN",
+            args: [rawBvid, requestedPage],
+            func: async (bvid, pageNumber) => {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+                try {
+                    const query = new URLSearchParams({ bvid, jsonp: "jsonp" });
+                    const response = await fetch(`https://api.bilibili.com/x/player/pagelist?${query.toString()}`, {
+                        credentials: "include",
+                        cache: "no-store",
+                        signal: controller.signal
+                    });
+                    if (!response.ok) return null;
+                    const body = await response.json();
+                    const pages = Array.isArray(body?.data) ? body.data : [];
+                    if (Number(body?.code || 0) !== 0 || !pages.length) return null;
+                    const p = Math.max(1, Math.floor(Number(pageNumber || 1)) || 1);
+                    const page = pages.find((item) => Number(item?.page || 0) === p) || pages[p - 1] || null;
+                    return { cid: Number(page?.cid || 0), partCount: pages.length };
+                } finally {
+                    clearTimeout(timeoutId);
+                }
+            }
+        });
+        const resolved = results?.[0]?.result;
+        return resolved && Number(resolved.cid || 0) > 0 ? resolved : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function resolveSubtitleCaptureIdentity(tabId, payload = {}) {
+    const currentCid = Number(payload?.cid || 0);
+    const currentPartCount = Math.max(0, Math.floor(Number(payload?.partCount || 0)));
+    if (currentCid > 0) {
+        return { cid: currentCid, partCount: currentPartCount };
+    }
+    let rawBvid = String(payload?.rawBvid || "").trim();
+    if (!rawBvid && tabId) {
+        try {
+            const results = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: () => String(location.href || "").match(/\/video\/(BV[0-9A-Za-z]+)/i)?.[1] || ""
+            });
+            rawBvid = String(results?.[0]?.result || "").trim();
+        } catch (_) {}
+    }
+    if (!rawBvid) return { cid: currentCid, partCount: currentPartCount };
+
+    const pageResolved = await resolveBiliPagelistIdentityInPage(
+        tabId,
+        rawBvid,
+        payload?.p || payload?.tid || 1
+    );
+    if (pageResolved) {
+        logBackground.info("subtitle_identity_resolved", {
+            tab_id: tabId,
+            bvid: normalizeBvid(rawBvid),
+            cid: pageResolved.cid,
+            part_count: pageResolved.partCount,
+            source: "pagelist_page"
+        });
+        return {
+            cid: pageResolved.cid || currentCid,
+            partCount: pageResolved.partCount || currentPartCount
+        };
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000);
+    try {
+        const url = `https://api.bilibili.com/x/player/pagelist?bvid=${encodeURIComponent(rawBvid)}&jsonp=jsonp`;
+        const response = await fetch(url, { credentials: "include", signal: controller.signal });
+        if (!response.ok) return { cid: currentCid, partCount: currentPartCount };
+        const body = await response.json();
+        if (Number(body?.code || 0) !== 0) return { cid: currentCid, partCount: currentPartCount };
+        const resolved = selectBiliPagelistIdentity(body?.data, payload?.p || payload?.tid || 1);
+        logBackground.info("subtitle_identity_resolved", {
+            tab_id: tabId,
+            bvid: normalizeBvid(rawBvid),
+            cid: resolved.cid,
+            part_count: resolved.partCount,
+            source: "pagelist_api"
+        });
+        return {
+            cid: resolved.cid || currentCid,
+            partCount: resolved.partCount || currentPartCount
+        };
+    } catch (error) {
+        logBackground.warn("subtitle_identity_resolve_failed", {
+            tab_id: tabId,
+            bvid: normalizeBvid(rawBvid),
+            error: error?.name === "AbortError" ? "timeout" : (error?.message || String(error))
+        });
+        return { cid: currentCid, partCount: currentPartCount };
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
 async function handleSubtitleCaptured(tabId, payload) {
     if (!tabId) return;
     const bvid = normalizeBvid(payload?.bvid);
@@ -4391,9 +4590,10 @@ async function handleSubtitleCaptured(tabId, payload) {
         });
         return;
     }
-    const cid = Number(payload.cid || 0);
+    const resolvedIdentity = await resolveSubtitleCaptureIdentity(tabId, payload);
+    const cid = Number(resolvedIdentity.cid || payload.cid || 0);
     const tid = payload.tid || null;
-    const partCount = Math.max(0, Math.floor(Number(payload?.partCount || 0)));
+    const partCount = Math.max(0, Math.floor(Number(resolvedIdentity.partCount || payload?.partCount || 0)));
     const subtitleSource = String(payload?.source || "official");
     const subtitleLanguage = String(payload?.subtitleLanguage || "").trim();
     const subtitleLanguageLabel = String(payload?.subtitleLanguageLabel || subtitleLanguage || "").trim();
@@ -4448,12 +4648,12 @@ async function handleSubtitleCaptured(tabId, payload) {
         });
         if (isAsrSubtitleSource(subtitleSource)) {
             const settings = await getResolvedSettings();
-            await persistCloudSubtitlePatch(bvid, settings, nextCache, {
+            queueBackgroundOperation("cloud_subtitle_cache", () => persistCloudSubtitlePatch(bvid, settings, nextCache, {
                 title: payload.title || "",
                 subtitleSource,
                 cid,
                 tid
-            });
+            }), { bvid, cid });
         }
         const nextPartCache = selectCachePart(nextCache, { bvid, cid, tid, partCount });
         if (nextPartCache) await pushSubtitleSyncToTab(tabId, bvid, nextPartCache, "duplicate");
@@ -4519,12 +4719,12 @@ async function handleSubtitleCaptured(tabId, payload) {
     const latestPartCache = selectCachePart(latestCache, { bvid, cid, tid, partCount });
     if (isAsrSubtitleSource(subtitleSource)) {
         const settings = await getResolvedSettings();
-        await persistCloudSubtitlePatch(bvid, settings, latestCache, {
+        queueBackgroundOperation("cloud_subtitle_cache", () => persistCloudSubtitlePatch(bvid, settings, latestCache, {
             title: payload.title || "",
             subtitleSource,
             cid,
             tid
-        });
+        }), { bvid, cid });
     }
     if (latestPartCache) await pushSubtitleSyncToTab(tabId, bvid, latestPartCache, "fresh");
 }
@@ -4846,7 +5046,12 @@ async function runSingleTask(tabId, bvid, task, force, settings, taskContext = {
         });
         await promotePendingSinglePartCacheForTab(bvid, tabId);
         const resultSettings = getSettingsForTaskResult(settings, usageTaskContext, task);
-        await persistCloudFeaturePatch(bvid, resultSettings, { [task]: result }, identity);
+        queueBackgroundOperation("cloud_feature_cache", () => persistCloudFeaturePatch(
+            bvid,
+            resultSettings,
+            { [task]: result },
+            identity
+        ), { bvid, feature: task });
         await reportClientUsageEvent({
             eventName: "task_success",
             featureName: task,
@@ -4980,6 +5185,7 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
         }, settings);
         throw error;
     }
+    await finalizeSummarySegmentsTaskState(tabId, bvid, results, usageTaskContext);
     const cloudPatch = {};
     if (results?.summary?.ok) cloudPatch.summary = results.summary.data;
     if (results?.segments?.ok) cloudPatch.segments = results.segments.data;
@@ -4987,15 +5193,25 @@ async function runSummarySegmentsTasks(tabId, bvid, force, settings, taskContext
         const summarySettings = getSettingsForTaskResult(settings, usageTaskContext, "summary");
         const segmentsSettings = getSettingsForTaskResult(settings, usageTaskContext, "segments");
         if (cloudPatch.summary && cloudPatch.segments && summarySettings.model !== segmentsSettings.model) {
-            await persistCloudFeaturePatch(bvid, summarySettings, { summary: cloudPatch.summary }, identity);
-            await persistCloudFeaturePatch(bvid, segmentsSettings, { segments: cloudPatch.segments }, identity);
+            queueBackgroundOperation("cloud_feature_cache", () => persistCloudFeaturePatch(
+                bvid,
+                summarySettings,
+                { summary: cloudPatch.summary },
+                identity
+            ), { bvid, feature: "summary" });
+            queueBackgroundOperation("cloud_feature_cache", () => persistCloudFeaturePatch(
+                bvid,
+                segmentsSettings,
+                { segments: cloudPatch.segments },
+                identity
+            ), { bvid, feature: "segments" });
         } else {
-            await persistCloudFeaturePatch(
+            queueBackgroundOperation("cloud_feature_cache", () => persistCloudFeaturePatch(
                 bvid,
                 cloudPatch.summary ? summarySettings : segmentsSettings,
                 cloudPatch,
                 identity
-            );
+            ), { bvid, feature: Object.keys(cloudPatch).join(",") });
         }
     }
     const summaryOk = !!results?.summary?.ok;
@@ -7005,6 +7221,28 @@ async function setTaskStatusMap(tabId, statusMap, lastError = "", errorMap = {},
     });
 }
 
+async function finalizeSummarySegmentsTaskState(tabId, bvid, results, partContext = {}) {
+    const statusMap = {};
+    const errorMap = {};
+    let lastError = "";
+    for (const task of ["summary", "segments"]) {
+        const result = results?.[task];
+        if (result?.ok) {
+            statusMap[task] = "done";
+            continue;
+        }
+        if (result?.error) {
+            statusMap[task] = resolveStatusByError(result.error);
+            errorMap[task] = result.error;
+            lastError = lastError || result.error.message || "任务失败";
+        }
+    }
+    if (Object.keys(statusMap).length) {
+        await setTaskStatusMap(tabId, statusMap, lastError, errorMap, resolvePartContext(bvid, partContext));
+        await flushTabStateNow(tabId);
+    }
+}
+
 async function applySummarySegmentsResults(tabId, bvid, results, options = {}) {
     const summaryResult = results?.summary;
     const segmentsResult = results?.segments;
@@ -7079,24 +7317,56 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
     const guided = settings.promptSettings?.guided || {};
     const customPrompts = settings.promptSettings?.custom || {};
     const results = createSummarySegmentsResult();
-    async function writeStreamingSummaryPartial(text, state, forceWrite = false) {
+    function writeStreamingSummaryPartial(text, state, forceWrite = false) {
         const value = sanitizeSummaryOutput(text);
         if (!value) return;
         const now = Date.now();
-        if (!forceWrite && now - Number(state.lastWriteAt || 0) < 350) return;
-        state.lastWriteAt = now;
-        await mergeCacheByBvid(bvid, {
+        if (value === state.lastText && !forceWrite) return;
+        state.lastText = value;
+        const draft = {
+            taskId: String(taskContext?.usageTaskId || taskContext?.sentryTaskId || ""),
+            attempt: 1,
+            text: value,
+            updatedAt: now,
+            bvid: normalizeBvid(bvid),
             cid: Number(taskContext.cid || 0),
-            tid: String(taskContext.tid || ""),
-            partCount: Number(taskContext.partCount || 0),
-            summaryDraft: {
-                taskId: String(taskContext?.usageTaskId || taskContext?.sentryTaskId || ""),
-                attempt: 1,
-                text: value,
-                updatedAt: now
-            },
-            updatedAt: now
-        });
+            tid: String(taskContext.tid || "")
+        };
+        if (forceWrite || now - Number(state.lastNotifyAt || 0) >= SUMMARY_STREAM_NOTIFY_INTERVAL_MS) {
+            state.lastNotifyAt = now;
+            const message = {
+                action: "SUMMARY_STREAM_UPDATE",
+                bvid: draft.bvid,
+                cid: draft.cid,
+                tid: draft.tid,
+                draft
+            };
+            void chrome.tabs.sendMessage(tabId, message).catch(() => {});
+            void chrome.runtime.sendMessage(message).catch(() => {});
+        }
+        if (!forceWrite && now - Number(state.lastPersistAt || 0) >= SUMMARY_DRAFT_PERSIST_INTERVAL_MS) {
+            state.lastPersistAt = now;
+            const key = `${SUMMARY_DRAFT_STORAGE_PREFIX}${draft.bvid}`;
+            void chrome.storage.local.set({ [key]: draft }).catch((error) => {
+                logCache.debug("summary_draft_persist_failed", {
+                    key,
+                    error: error?.message || String(error)
+                });
+            });
+        }
+    }
+    function clearStreamingSummaryPartial() {
+        const normalizedBvid = normalizeBvid(bvid);
+        if (!normalizedBvid) return;
+        const message = {
+            action: "SUMMARY_STREAM_CLEAR",
+            bvid: normalizedBvid,
+            cid: Number(taskContext.cid || 0),
+            tid: String(taskContext.tid || "")
+        };
+        void chrome.tabs.sendMessage(tabId, message).catch(() => {});
+        void chrome.runtime.sendMessage(message).catch(() => {});
+        void chrome.storage.local.remove(`${SUMMARY_DRAFT_STORAGE_PREFIX}${normalizedBvid}`).catch(() => {});
     }
     const summaryExists = !force && String(cache?.summary || "").trim();
     const segmentsExists = !force && Array.isArray(cache?.segments) && cache.segments.length > 0;
@@ -7143,17 +7413,13 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                     }
                 });
                 let streamedSummaryText = "";
-                let partialWritePromise = Promise.resolve();
-                const partialState = { lastWriteAt: 0 };
+                const partialState = { lastNotifyAt: 0, lastPersistAt: 0, lastText: "" };
                 let aiRes = await callAIWithTimeoutStream(settings, [{ role: "user", content: summaryPrompt }], TASK_TIMEOUT_MS, (delta) => {
                     const chunk = String(delta || "");
                     if (!chunk) return;
                     streamedSummaryText += chunk;
-                    partialWritePromise = partialWritePromise
-                        .catch(() => {})
-                        .then(() => writeStreamingSummaryPartial(streamedSummaryText, partialState, false));
+                    writeStreamingSummaryPartial(streamedSummaryText, partialState, false);
                 }, null, { tabId, taskContext, component: "summary", bvid });
-                await partialWritePromise.catch(() => {});
                 let summaryText = sanitizeSummaryOutput(aiRes.text || streamedSummaryText);
                 if (!summaryText || shouldDisableDeepSeekV4ThinkingForRetry(settings, aiRes)) {
                     const retried = await retryEmptySummaryOnce({
@@ -7170,9 +7436,10 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                     aiRes = retried.aiRes;
                     summaryText = retried.summaryText;
                 }
-                await writeStreamingSummaryPartial(summaryText, partialState, true);
+                writeStreamingSummaryPartial(summaryText, partialState, true);
                 results.summary = { ok: true, data: summaryText, error: null };
                 await applySummarySegmentsResults(tabId, bvid, { summary: results.summary }, { taskContext });
+                clearStreamingSummaryPartial();
                 logSummaryQualitySummary(bvid, summaryText, {
                     subtitleChars: summarySubtitleText.length,
                     promptChars: summaryPrompt.length,
@@ -7198,6 +7465,7 @@ async function runSummarySegmentsInQuality(tabId, bvid, force, settings, taskCon
                     }
                 });
             } catch (error) {
+                clearStreamingSummaryPartial();
                 results.summary = { ok: false, data: null, error };
                 await applySummarySegmentsResults(tabId, bvid, { summary: results.summary }, { taskContext });
                 logAI.error("ai_request_failed", buildFailureLog(error, {
@@ -9432,7 +9700,23 @@ async function setTaskStatus(tabId, tasks, status, lastError = "", partContext =
     });
 }
 
-async function appendMetrics(bvid, tabId, task, metrics, partContext = {}) {
+function appendMetrics(bvid, tabId, task, metrics, partContext = {}) {
+    const identity = resolvePartContext(bvid, partContext);
+    const safeMetrics = cloneData(metrics || {});
+    queueBackgroundOperation("cache_metrics", () => appendMetricsInBackground(
+        identity.bvid,
+        tabId,
+        task,
+        safeMetrics,
+        identity
+    ), {
+        bvid: identity.bvid,
+        feature: String(task || "")
+    });
+    return true;
+}
+
+async function appendMetricsInBackground(bvid, tabId, task, metrics, partContext = {}) {
     const rawCache = await getCache(bvid);
     const identity = resolvePartContext(bvid, partContext);
     const cache = getPartCacheForContext(rawCache, bvid, identity) || {};
@@ -9550,6 +9834,18 @@ function debounceFlushTabState(key, tabState, tabId) {
         logBackground.debug("storage_update", { key: `tabState_${tabId}` });
     }, 500);
     tabStateWriteTimers.set(key, timer);
+}
+
+async function flushTabStateNow(tabId) {
+    const key = `tabState_${tabId}`;
+    const timer = tabStateWriteTimers.get(key);
+    if (timer) clearTimeout(timer);
+    tabStateWriteTimers.delete(key);
+    const latest = tabStateCache.get(key);
+    if (!latest) return;
+    await chrome.storage.local.set({ [key]: latest });
+    logCache.debug("cache_write", { key, immediate: true });
+    logBackground.debug("storage_update", { key, immediate: true });
 }
 
 async function getCache(bvid) {
@@ -10616,7 +10912,22 @@ function shouldRetryUsageDailyLegacy(error) {
     return /Could not find the function|schema cache|PGRST202|parameter|v_bvid|v_title/i.test(text);
 }
 
-async function reportFeatureUsage(featureName, bvid, settings, metrics) {
+function reportFeatureUsage(featureName, bvid, settings, metrics) {
+    const normalizedBvid = normalizeBvid(bvid);
+    const safeMetrics = cloneData(metrics || {});
+    queueBackgroundOperation("usage_report", () => sendFeatureUsage(
+        featureName,
+        normalizedBvid,
+        settings,
+        safeMetrics
+    ), {
+        bvid: normalizedBvid,
+        feature: String(featureName || "")
+    });
+    return true;
+}
+
+async function sendFeatureUsage(featureName, bvid, settings, metrics) {
     if (!isSupabaseEnabled(settings)) return false;
     const tokenCount = Math.max(0, Number(metrics?.tokens || 0));
     const normalizedFeature = String(featureName || "").trim();
