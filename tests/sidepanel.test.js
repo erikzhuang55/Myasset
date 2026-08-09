@@ -28,6 +28,13 @@ describe("native side panel", () => {
     expect(manifest.host_permissions).not.toContain("https://api.bilibili.com/*");
   });
 
+  it("does not ship the unused locale directory that breaks Chrome 153 unpacked loading", () => {
+    expect(manifest.default_locale).toBeUndefined();
+    expect(manifest.name).not.toContain("__MSG_");
+    expect(buildScript).not.toContain('"_locales"');
+    expect(sourceBuildScript).not.toContain('"_locales"');
+  });
+
   it("includes side panel files in release packages", () => {
     expect(buildScript).toContain('"sidepanel.html"');
     expect(buildScript).toContain('"sidepanel.css"');
@@ -71,7 +78,7 @@ describe("native side panel", () => {
   });
 
   it("checks database driven update availability without frequent polling", () => {
-    expect(manifest.version).toBe("1.6.4");
+    expect(manifest.version).toBe("1.6.4.1");
     expect(background).toContain('msg.action === "CHECK_LATEST_VERSION"');
     expect(background).toContain('msg.action === "OPEN_EXTENSION_MANAGEMENT"');
     expect(background).toContain("VERSION_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000");
@@ -578,6 +585,21 @@ describe("native side panel", () => {
     expect(background).toContain('eventName: "transcribe_preflight_blocked"');
   });
 
+  it("refreshes the transcription entry immediately after an ASR key is saved", () => {
+    expect(sidepanel).toContain('if (state.activePage !== "settings") render();');
+    expect(sidepanel).toContain('state.activePage === "settings" && nav.dataset.nav !== "settings" && state.settingsSaveTimer');
+    expect(sidepanel).toContain('state.settings = changes.settings.newValue;');
+    expect(content).toContain('await (appState.pendingSettingsSave || saveSettingsFromPanel(true))');
+    expect(content).toContain('"settings-groq-api-key": "groqApiKey"');
+    expect(sidepanel).toContain('"setting-groq-key": "groqApiKey"');
+    expect(content).toContain('if (navId === "CC") await refreshAsrSettingsFromBackground();');
+    expect(content).toContain("const asrKeyRequirement = getAsrApiKeyRequirement(appState.settings || {});");
+    expect(content).toContain("asrKeyRequirement.missing\n    ].join(\"|\");");
+    expect(content).toContain('const asrKeyRequirement = await refreshAsrSettingsFromBackground();');
+    expect(sidepanel).toContain('if (nav.dataset.nav === "CC") await refreshAsrSettingsFromBackground();');
+    expect(content).toContain('if (appState.activePage !== "settings") renderContent();');
+  });
+
   it("caches feedback for six hours but refreshes once when the plugin opens", () => {
     expect(background).toContain("const FEEDBACK_CACHE_TTL_MS = 6 * 60 * 60 * 1000");
     expect(background).toContain("async function readCachedFeedbackState");
@@ -689,7 +711,7 @@ describe("native side panel", () => {
     expect(content).toContain('data-action="close-top-announcement"');
     expect(content).toContain('data-action="announcement-page"');
     expect(content).toContain('const pageSize = 3');
-    expect(content).toContain('selectedAnnouncement\n        ? [selectedAnnouncement]');
+    expect(content).toMatch(/selectedAnnouncement\r?\n\s*\? \[selectedAnnouncement\]/);
     expect(content).toContain('await markAnnouncementsRead([selectedKey])');
     expect(content).toContain('有最新公告，请及时查看');
     expect(content).toContain('announcement-unread-dot');

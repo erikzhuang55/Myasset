@@ -58,7 +58,6 @@ const files = [
 ];
 
 const directories = [
-  "_locales",
   "assets",
   "content",
   "utils",

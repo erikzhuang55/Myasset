@@ -45,7 +45,6 @@ const sourceFiles = [
 ];
 
 const sourceDirectories = [
-  "_locales",
   "assets",
   "content",
   "scripts",

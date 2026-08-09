@@ -397,6 +397,17 @@ function getAsrApiKeyRequirement(settings = {}) {
     return { provider, providerName, missing: !String(apiKey || "").trim() };
 }
 
+async function refreshAsrSettingsFromBackground() {
+    const response = await chrome.runtime.sendMessage({ action: "GET_SETTINGS" });
+    if (response?.ok && response.settings) appState.settings = response.settings;
+    const requirement = getAsrApiKeyRequirement(appState.settings || {});
+    logAsrUiTrace("asr_settings_refreshed", {
+        provider: requirement.provider,
+        key_configured: !requirement.missing
+    });
+    return requirement;
+}
+
 const appState = {
     tabId: null,
     activePage: "CC",
@@ -688,6 +699,7 @@ function getSubtitlePresentationSignature() {
     const rows = getCurrentSubtitleStateRows();
     const rowsMeta = getSubtitleDiagnosticRowsMeta(rows);
     const transcription = getTranscriptionState();
+    const asrKeyRequirement = getAsrApiKeyRequirement(appState.settings || {});
     return [
         getCurrentSubtitleRouteKey(),
         subtitleUiCoordinator.generation,
@@ -705,7 +717,9 @@ function getSubtitlePresentationSignature() {
         String(transcription.statusText || ""),
         !!appState.asrSession?.active,
         Number(appState.asrSession?.progress || 0),
-        String(appState.asrSession?.statusText || "")
+        String(appState.asrSession?.statusText || ""),
+        asrKeyRequirement.provider,
+        asrKeyRequirement.missing
     ].join("|");
 }
 
@@ -3336,7 +3350,7 @@ function bindPanelDelegatedEvents() {
     const panelRoot = panelShadowRoot ? panelShadowRoot.querySelector(".ai-summary-plugin-box") : null;
     if (!panelRoot || panelRoot.dataset.bound === "1") return;
     panelRoot.dataset.bound = "1";
-    panelRoot.addEventListener("click", (event) => {
+    panelRoot.addEventListener("click", async (event) => {
         const inCopyMenu = event.target.closest(".copy-menu-overlay");
         if (!inCopyMenu && !event.target.closest('[data-nav="copy"]')) {
             closeCopyMenu();
@@ -3401,6 +3415,11 @@ function bindPanelDelegatedEvents() {
             if (navId !== "settings" && (getFeedbackState().statusText || getFeedbackState().errorText)) {
                 setFeedbackState({ statusText: "", errorText: "" });
             }
+            if (appState.activePage === "settings" && navId !== "settings") {
+                const saved = await (appState.pendingSettingsSave || saveSettingsFromPanel(true));
+                if (saved === false) return;
+            }
+            if (navId === "CC") await refreshAsrSettingsFromBackground();
             appState.activePage = navId;
             reportUsageEvent({
                 eventName: "panel_opened",
@@ -6285,7 +6304,14 @@ function renderSettings(panel) {
         };
     };
 
-    const triggerAutoSave = () => saveSettingsFromPanel(true);
+    const triggerAutoSave = () => {
+        const pending = saveSettingsFromPanel(true);
+        appState.pendingSettingsSave = pending;
+        pending.finally(() => {
+            if (appState.pendingSettingsSave === pending) appState.pendingSettingsSave = null;
+        }).catch(() => {});
+        return pending;
+    };
     const debouncedSave = debounce(triggerAutoSave, 500);
 
     // Initialize all sliders
@@ -6365,12 +6391,25 @@ function renderSettings(panel) {
     };
 
     const inputs = panel.querySelectorAll("input, textarea");
+    const liveSettingFieldByInputId = {
+        "settings-api-key": "apiKey",
+        "settings-groq-api-key": "groqApiKey",
+        "settings-siliconflow-api-key": "siliconFlowApiKey",
+        "settings-mimo-api-key": "mimoApiKey"
+    };
     inputs.forEach(input => {
         if (input.type === "range") return;
         if (input.dataset.feedbackField === "true") return;
         if (input.dataset.manualSave === "true") return;
         if (input.dataset.secretInput === "true") {
             input.addEventListener("input", () => {
+                const settingField = liveSettingFieldByInputId[input.id];
+                if (settingField) {
+                    appState.settings = {
+                        ...(appState.settings || {}),
+                        [settingField]: String(input.value || "")
+                    };
+                }
                 validateSecretInput(input, false);
             });
         }
@@ -8729,6 +8768,7 @@ async function saveSettingsFromPanel(isAutoSave = false, options = {}) {
         appState.settings = res.settings || payload;
         applyThemeMode();
         appState.settingsPromptDraft = normalizePromptSettingsState(appState.settings?.promptSettings || payload.promptSettings);
+        if (appState.activePage !== "settings") renderContent();
         reportSettingsSavedUsageEvent(appState.settings || payload, isAutoSave ? "autosave" : "manual");
         
     if (isAutoSave) {
@@ -9413,7 +9453,7 @@ function hasNativeCCSubtitleDom() {
 }
 
 async function startTranscriptionFromCapsule() {
-    const asrKeyRequirement = getAsrApiKeyRequirement(appState.settings || {});
+    const asrKeyRequirement = await refreshAsrSettingsFromBackground();
     if (asrKeyRequirement.missing) {
         showToast(`请先填写${asrKeyRequirement.providerName}的API Key，再开始转录`);
         return;

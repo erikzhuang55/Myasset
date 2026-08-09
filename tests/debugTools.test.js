@@ -66,7 +66,7 @@ describe("developer tools panel", () => {
     expect(background).toContain("debugForceProvider429Retries: true");
     expect(background).toContain("if (isDebugSimulation)");
     expect(background).toContain("await reportProvider429RetryAttempt(settings, options, event)");
-    expect(background).toContain("return;\n            }\n            await reportProvider429Recovered");
+    expect(background).toMatch(/return;\r?\n\s*}\r?\n\s*await reportProvider429Recovered/);
   });
 
   it("wraps retry test actions instead of overflowing the debug card", () => {
@@ -88,9 +88,9 @@ describe("developer tools panel", () => {
   });
 
   it("keeps summary retries on the original request transport", () => {
-    expect(background).toContain('mode: "single",\n                requestStream: false');
-    expect(background).toContain('mode: "quality",\n                        requestStream: true');
-    expect(background).toContain('mode: "efficiency",\n                    requestStream: true');
+    expect(background).toMatch(/mode: "single",\r?\n\s*requestStream: false/);
+    expect(background).toMatch(/mode: "quality",\r?\n\s*requestStream: true/);
+    expect(background).toMatch(/mode: "efficiency",\r?\n\s*requestStream: true/);
     expect(background).toContain("const aiRes = requestStream");
     expect(background).toContain("? await callAIWithTimeoutStream(requestSettings, messages");
     expect(background).toContain(": await callAIWithTimeout(requestSettings, messages");

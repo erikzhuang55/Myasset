@@ -70,7 +70,7 @@ describe("product analytics instrumentation", () => {
   });
 
   it("reports summary success only after a non-empty result", () => {
-    expect(background).toContain('if (task !== "summary") {\n        await reportFeatureUsage(task, bvid, settings, aiRes.metrics);');
+    expect(background).toMatch(/if \(task !== "summary"\) \{\r?\n\s*await reportFeatureUsage\(task, bvid, settings, aiRes\.metrics\);/);
     expect(background).toMatch(/if \(task === "summary"\)[\s\S]*?if \(!summaryText \|\| shouldDisableDeepSeekV4ThinkingForRetry\(settings, aiRes\)\)[\s\S]*?await reportFeatureUsage\(task, bvid, settings, aiRes\.metrics\);[\s\S]*?return summaryText;/);
   });
 

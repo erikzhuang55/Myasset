@@ -397,6 +397,12 @@ async function runtimeMessage(payload) {
     return result;
 }
 
+async function refreshAsrSettingsFromBackground() {
+    const result = await runtimeMessage({ action: "GET_SETTINGS" });
+    if (result.settings) state.settings = result.settings;
+    return getAsrApiKeyRequirement(state.settings || {});
+}
+
 async function contentAction(command, extra = {}) {
     if (!state.tabId) throw new Error("未找到当前视频标签页");
     const result = await chrome.tabs.sendMessage(state.tabId, {
@@ -1598,6 +1604,7 @@ async function saveSettings({ silent = false, requestGroqPermission = false } = 
     state.settings = result.settings || payload;
     state.renderSignature = "";
     applyThemeMode();
+    if (state.activePage !== "settings") render();
     const status = document.getElementById("settings-save-status");
     if (status) {
         status.textContent = "已保存";
@@ -1610,6 +1617,7 @@ async function saveSettings({ silent = false, requestGroqPermission = false } = 
 function scheduleSettingsSave() {
     clearTimeout(state.settingsSaveTimer);
     state.settingsSaveTimer = setTimeout(() => {
+        state.settingsSaveTimer = null;
         saveSettings({ silent: true }).catch((error) => showToast(error?.message || "保存失败"));
     }, 500);
 }
@@ -1936,10 +1944,21 @@ async function updateCloudCacheReadPref(scope, disabled, options = {}) {
     if (!options.silent) showToast("缓存设置已保存");
 }
 
-app.addEventListener("click", (event) => {
+app.addEventListener("click", async (event) => {
     hideUiTooltip();
     const nav = event.target.closest("[data-nav]");
     if (nav) {
+        if (state.activePage === "settings" && nav.dataset.nav !== "settings" && state.settingsSaveTimer) {
+            clearTimeout(state.settingsSaveTimer);
+            state.settingsSaveTimer = null;
+            try {
+                await saveSettings({ silent: true });
+            } catch (error) {
+                showToast(error?.message || "保存失败");
+                return;
+            }
+        }
+        if (nav.dataset.nav === "CC") await refreshAsrSettingsFromBackground();
         if (nav.dataset.nav === "copy" || nav.dataset.nav === "export") {
             showActionMenu(nav.dataset.nav, nav);
             return;
@@ -1984,6 +2003,19 @@ app.addEventListener("focusout", (event) => {
 });
 
 app.addEventListener("input", (event) => {
+    const liveSettingFieldByInputId = {
+        "setting-api-key": "apiKey",
+        "setting-groq-key": "groqApiKey",
+        "setting-siliconflow-key": "siliconFlowApiKey",
+        "setting-mimo-key": "mimoApiKey"
+    };
+    const liveSettingField = liveSettingFieldByInputId[event.target.id];
+    if (liveSettingField) {
+        state.settings = {
+            ...(state.settings || {}),
+            [liveSettingField]: String(event.target.value || "")
+        };
+    }
     if (event.target.id === "chat-input") {
         state.chatDraft = event.target.value;
         if (state.chatDraft.trim()) {
@@ -2115,6 +2147,11 @@ chrome.storage.onChanged.addListener((changes) => {
     if (summaryDraftKeys.length) render();
     if (Object.keys(changes || {}).some((key) => key.startsWith("topAnnouncementDismissed:"))) {
         refreshAnnouncementUnreadState().catch(() => {});
+    }
+    if (changes.settings?.newValue) {
+        state.settings = changes.settings.newValue;
+        state.renderSignature = "";
+        if (state.activePage !== "settings") render();
     }
     if (Object.keys(changes || {}).some((key) => key === "settings" || key === "cloudReadDisabledBvids" || key.startsWith("cache_") || key.startsWith("tabState_"))) {
         refreshState({ quiet: true });

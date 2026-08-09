@@ -2,8 +2,7 @@
   "manifest_version": 3,
   "name": "Bilitato - AI陪你看B站", 
   "description": "AI帮你高效看B站视频！下载字幕，总结内容，划分章节，识别广告，还可以直接提问视频内容！支持无字幕视频、自定义大模型API和Prompt！",
-    "version": "1.6.4",
-  "default_locale": "zh_CN",
+    "version": "1.6.4.1",
   "icons": {
     "16": "assets/icons/icon16.png",
     "32": "assets/icons/icon32.png",
